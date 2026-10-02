@@ -62,6 +62,25 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
 }
 
 void NativeDense::set_layer_range(int lb, int le) { g_layer_lb = lb; g_layer_le = le; }
+
+bool NativeDense::served_bytes(const std::vector<std::string>& shards, bool include_ple_key,
+                               std::map<std::string, uint64_t>& out, std::string& err) {
+    try {
+        for (const auto& path : shards) {
+            strata::GgufFile gguf(path);
+            for (const auto& tensor : gguf.tensors())
+                if (eligible(tensor, include_ple_key) && strata::kernels::native_mmvq_supported(tensor.type) &&
+                    tensor.shape.size() == 2)
+                    out[tensor.name] = strata::kernels::native_mmvq_weight_bytes(tensor.type, (int) tensor.shape[0],
+                                                                                 (int) tensor.shape[1]);
+        }
+        return true;
+    } catch (const std::exception& error) {
+        err = std::string("native dense: ") + error.what();
+        return false;
+    }
+}
+
 bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set<std::string>& skip,
                                            std::string& err) {
     const std::string key = "blk.1.ple_key.weight";
@@ -78,7 +97,8 @@ NativeDense::~NativeDense() {
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi) {
+                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi,
+                       const std::set<std::string>* skip) {
     auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
         if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
         const long l = std::strtol(name.c_str() + 4, nullptr, 10);
@@ -164,6 +184,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 auto& ref = found->second;
                 if (ref.native_data) { err = "native dense: override already attached"; return false; }
                 if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
+                if (skip != nullptr && skip->count(tensor.name)) continue;   // POOL: another PC's layer
                 // #326: the pack keeps an unquantized (--compat-bf16) key, which the PLE reads from the arena
                 if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;
                 if (!ref.quantized() || tensor.shape.size() != 2 ||

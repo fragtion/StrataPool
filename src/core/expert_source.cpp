@@ -2532,11 +2532,12 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
 // `unbuffered` (Windows, experts_unbuffered): each chunk's 4 KiB-aligned window is read with FILE_FLAG_NO_BUFFERING into
 // an aligned buffer and scattered into the blobs - no copy through the file cache when the drive is read anyway.
 LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
-                            int threads, bool unbuffered) {
+                            int threads, bool unbuffered, int64_t lb = 0, int64_t le = -1) {
     LoadStats st;
-    st.layers = (uint64_t) lay.n_layers;
+    if (le < 0) le = lay.n_layers;
+    st.layers = (uint64_t) (le - lb);
     const auto t0 = std::chrono::steady_clock::now();
-    std::atomic<int64_t> next{0};
+    std::atomic<int64_t> next{lb};   // POOL: only the layers [lb, le)
     std::atomic<bool> bad{false};
 #if defined(_WIN32)
     if (unbuffered) {
@@ -2561,7 +2562,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
             if (buf == nullptr) fail("cannot allocate a read buffer");
             for (;;) {
                 const int64_t l = next.fetch_add(1);
-                if (l >= lay.n_layers || bad) break;
+                if (l >= le || bad) break;
                 const auto& fm = lay.fmt[(size_t) l];
                 const uint64_t blob = lay.bytes[(size_t) l];
                 const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
@@ -2639,7 +2640,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
         std::vector<uint8_t> buf;
         for (;;) {
             const int64_t l = next.fetch_add(1);
-            if (l >= lay.n_layers || bad) break;
+            if (l >= le || bad) break;
             const auto& fm = lay.fmt[(size_t) l];
             const uint64_t blob = lay.bytes[(size_t) l];
             const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
@@ -2681,7 +2682,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
         st.error = "short read or unreadable shard while reading the experts from the GGUF";
         return st;
     }
-    st.bytes = lay.total;
+    st.bytes = (le == lay.n_layers ? lay.total : lay.layer_offset(le)) - lay.layer_offset(lb);
     st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     return st;
 }
@@ -2700,7 +2701,14 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         return false;
     }
     const int64_t blob = (int64_t) lay.max_blob;
-    const uint64_t want = lay.total;
+    const uint64_t total = lay.total;
+    // POOL: a node of a pool holds only its own layers' experts
+    const int64_t rlb = std::max<int64_t>(0, range_lb_);
+    const int64_t rle = range_le_ < 0 || range_le_ > n_layers ? n_layers : range_le_;
+    if (rlb >= rle) { err = "ArenaExpertSource: the layer range is empty"; return false; }
+    const uint64_t off0 = lay.layer_offset(rlb);
+    const uint64_t off1 = rle == n_layers ? total : lay.layer_offset(rle);
+    const uint64_t want = off1 - off0;
 
     // plan v0.3 P6: no experts.bin in a native pack -> the experts come straight from the GGUF
     const bool from_gguf = !std::ifstream(path, std::ios::binary) && lay.native && !lay.gguf_off.empty() && !gguf_.empty();
@@ -2715,13 +2723,13 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         std::ifstream f(path, std::ios::binary | std::ios::ate);
         if (!f) { err = "ArenaExpertSource: cannot open " + path; return false; }
         const uint64_t got = (uint64_t) f.tellg();
-        if (got != want && got != want + (uint64_t) blob) {   // + one blob: STRATA_ARENA_MMAP's padded file
+        if (got != total && got != total + (uint64_t) blob) {   // + one blob: STRATA_ARENA_MMAP's padded file
             char buf[400];
             std::snprintf(buf, sizeof buf,
                           "ArenaExpertSource: %s is %llu B but %lld layers x %lld experts (blobs up to %lld B) "
                           "make %llu B - this is not the pack this geometry came from",
                           path.c_str(), (unsigned long long) got, (long long) n_layers, (long long) n_expert,
-                          (long long) blob, (unsigned long long) want);
+                          (long long) blob, (unsigned long long) total);
             err = buf;
             return false;
         }
@@ -2737,7 +2745,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     static const bool arena_mmap = false;   // POSIX mmap/madvise: Linux only for now
 #else
     static const bool arena_mmap = [] { const char* v = std::getenv("STRATA_ARENA_MMAP"); return v && v[0] == '1'; }();
-    if (arena_mmap) {
+    if (arena_mmap && rlb == 0 && rle == n_layers) {   // POOL: a node's range is not the pack's file
         const uint64_t file_bytes = want + (uint64_t) blob;
         uint64_t have = 0;
         {
@@ -2804,9 +2812,9 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // one layer per registration slice, so no expert straddles two registrations.  The arena is one blob
     // longer than the file: a copy of a whole VRAM slot (the largest blob) may then start at any expert.
     std::vector<uint64_t> bounds, loff, lbytes;
-    for (int64_t l = 0; l < n_layers; ++l) {
-        bounds.push_back(lay.layer_offset(l));
-        loff.push_back(lay.layer_offset(l));
+    for (int64_t l = rlb; l < rle; ++l) {
+        bounds.push_back(lay.layer_offset(l) - off0);   // the registration slices, relative to the range
+        loff.push_back(lay.layer_offset(l));            // where the layer sits in the file
         lbytes.push_back(lay.blob_bytes(l) * (uint64_t) n_expert);
     }
     bounds.push_back(want);
@@ -2820,11 +2828,14 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
               (why.empty() ? std::string{} : ": " + why);
         return false;
     }
+    // the loaders write each layer at its layout offset: hand them the range's base biased back by the offset of its
+    // first layer, so layer rlb lands at the start of this (range-sized) arena (POOL)
+    uint8_t* const biased = (uint8_t*) ((uintptr_t) a->data() - (uintptr_t) off0);
     // #285: unbuffered when the drive is read anyway and the file cache could not keep the experts for the next
     // start either (a 64 GB PC); otherwise the buffered readers, which a warm restart serves from the cache
     std::vector<std::string> files;
     if (from_gguf) {
-        for (int64_t l = 0; l < n_layers; ++l)
+        for (int64_t l = rlb; l < rle; ++l)
             for (int r = 0; r < 3; ++r) {
                 const std::string f = expert_gguf_file(gguf_, lay, l, r);
                 if (std::find(files.begin(), files.end(), f) == files.end()) files.push_back(f);
@@ -2837,11 +2848,11 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     const int readers = unbuffered ? std::max(threads, 16) : threads;   // 16 keep a PCIe 5 drive's queue full
     LoadStats st;
     if (from_gguf) {
-        st = load_experts_gguf(gguf_, a->data(), lay, readers, unbuffered);
+        st = load_experts_gguf(gguf_, biased, lay, readers, unbuffered, rlb, rle);
     } else {
-        if (unbuffered) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20);
+        if (unbuffered) st = load_experts_direct(path, biased, loff, lbytes, readers, /*chunk=*/8u << 20);
         if (!unbuffered || (!st.ok && st.error.empty()))   // unaligned ranges: the buffered reader
-            st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20);
+            st = load_experts_ranges(path, biased, loff, lbytes, threads, /*chunk=*/8u << 20);
     }
     std::fprintf(stderr, "strata generate: expert arena read %s (%s)\n", unbuffered ? "unbuffered" : "through the file cache",
                  why.c_str());
@@ -2858,14 +2869,15 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // the first start: write experts.bin for the mapped starts after this one - only when the drive has room for it
     // and 2 GiB more (a full drive fails other writes too); otherwise this start says so and runs pinned as before
     std::error_code space_ec;
-    const uint64_t free_disk = arena_mmap && from_gguf ? (uint64_t) std::filesystem::space(
+    const bool mmap_write = arena_mmap && rlb == 0 && rle == n_layers;   // POOL: never a range's part
+    const uint64_t free_disk = mmap_write && from_gguf ? (uint64_t) std::filesystem::space(
         std::filesystem::path(path).parent_path(), space_ec).available : 0;
     const bool room = !space_ec && free_disk >= want + (uint64_t) blob + (2ull << 30);
-    if (arena_mmap && from_gguf && !room)
+    if (mmap_write && from_gguf && !room)
         std::fprintf(stderr, "strata generate: STRATA_ARENA_MMAP: NOT writing %s - %.1f GiB free on that drive, it needs "
                              "%.1f GiB plus 2 GiB to spare; this start keeps the arena in RAM\n", path.c_str(),
                      (double) free_disk / 1073741824.0, (double) (want + (uint64_t) blob) / 1073741824.0);
-    if (arena_mmap && from_gguf && room) {
+    if (mmap_write && from_gguf && room) {
         const std::string tmp = path + ".tmp";
         std::FILE* f = std::fopen(tmp.c_str(), "wb");
         bool ok = f != nullptr && std::fwrite(a->data(), 1, (size_t) want, f) == (size_t) want;
@@ -2880,7 +2892,11 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
                      ok ? "wrote" : "could NOT write", path.c_str());
     }
     arena_ = a;
-    base_ = a->data();
+    range_off_ = off0;
+    range_lb_ = rlb;
+    range_le_ = rle;
+    held_bytes_ = want;
+    base_ = biased;                                  // blob(): base_ + the layout offset, as before
     pinned_bytes_ = a->registered_bytes;
     // plan v0.3 P6: device aliases of the mapped registration, for the PCIe share of the misses
     dev_slice_.clear();
@@ -2889,7 +2905,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         std::vector<uint64_t> starts = a->slice_bytes > 0 ? a->slice_starts : std::vector<uint64_t>{0};
         for (uint64_t off : starts) {
             void* d = nullptr;
-            if (cudaHostGetDevicePointer(&d, (void*) (base_ + off), 0) != cudaSuccess) {
+            if (cudaHostGetDevicePointer(&d, (void*) (a->data() + off), 0) != cudaSuccess) {
                 (void) cudaGetLastError();
                 dev_slice_.clear();
                 break;
@@ -2957,23 +2973,24 @@ uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
 }
 
 bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
-    if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return false;
+    if (base_ == nullptr || layer < range_lb_ || layer >= range_le_ || expert < 0 || expert >= n_expert_) return false;
     const auto& lay = strata::kernels::cpu::expert_layout();
-    return lay.blob_offset(layer, expert) + lay.blob_bytes(layer) <= pinned_bytes_;
+    return lay.blob_offset(layer, expert) - range_off_ + lay.blob_bytes(layer) <= pinned_bytes_;
 }
 
 const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) const {
     if (dev_slice_.empty() || !pinned(layer, expert)) return nullptr;
     const auto& lay = strata::kernels::cpu::expert_layout();
-    if (slice_bytes_ == 0) return dev_slice_[0] + lay.blob_offset(layer, expert);
-    // one registration slice per layer
-    if ((size_t) layer >= dev_slice_.size()) return nullptr;
-    return dev_slice_[(size_t) layer] + (uint64_t) expert * lay.blob_bytes(layer);
+    if (slice_bytes_ == 0) return dev_slice_[0] + (lay.blob_offset(layer, expert) - range_off_);
+    // one registration slice per layer (of the range)
+    const int64_t s = layer - range_lb_;
+    if (s < 0 || (size_t) s >= dev_slice_.size()) return nullptr;
+    return dev_slice_[(size_t) s] + (uint64_t) expert * lay.blob_bytes(layer);
 }
 
 const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     if (base_ == nullptr) return nullptr;
-    if (layer < 0 || expert < 0 || expert >= n_expert_) return nullptr;
+    if (layer < range_lb_ || layer >= range_le_ || expert < 0 || expert >= n_expert_) return nullptr;
     const int64_t idx = layer * n_expert_ + expert;
     if (idx < 0 || idx >= blobs_) return nullptr;
     ++reads_;
