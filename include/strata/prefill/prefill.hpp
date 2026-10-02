@@ -161,6 +161,17 @@ public:
     /// the size where the measured share stops paying.  Opt-in: STRATA_PREFILL_HELP=1 (not bit-identical to the default).  Both stages must have
     /// run `init`.
     bool set_stage_helper(Prefill* helper, std::string& err);
+    /// POOL coordinator: the layers after this stage run on other PCs.  Called (on a thread, like a local next
+    /// stage, so this stage reads chunk c + 1 meanwhile) with the chunk's rows on the host (pinned, T x hc*n_embd),
+    /// its tokens, T and its first position; it sends them to the workers, gets the final rows back and does what
+    /// `on_chunk` does on a last stage.  Set before `init`, instead of a `next` stage.
+    std::function<bool(const float* rows_host, const int64_t* tokens, int64_t T, int64_t pos0, std::string& err)>
+        remote_next;
+    /// POOL worker: this stage's input rows for the next `run` (host, pinned, T x hc*n_embd).
+    void set_hand_in(const float* rows_host) { hand_in_ = rows_host; }
+    /// POOL worker: a stage that may end before the last layer but has no next stage - its rows go to
+    /// `on_chunk` (and from there back over the network).  Set before `init`.
+    void set_headless(bool on) { headless_ = on; }
 
 private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
@@ -175,6 +186,7 @@ private:
     Prefill* helper_ = nullptr;         ///< set_stage_helper
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens
+    bool headless_ = false;             ///< POOL worker: rows to on_chunk even before the last layer
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
 
     std::string next_err_;

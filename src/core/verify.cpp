@@ -404,7 +404,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     if (le_ < 0) le_ = g.n_layers;
     if (lb_ < 0 || lb_ >= le_ || le_ > g.n_layers || (lb_ > 0 && hand_in_ == nullptr) ||
-        (le_ < g.n_layers && hand_out_ == nullptr)) {
+        ((le_ < g.n_layers || headless_) && hand_out_ == nullptr)) {
         err = "verify: the stage's layer range or its hand-off buffers are wrong";
         return false;
     }
@@ -1332,7 +1332,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (!post(l, grp)) return false;
             if (l + 1 < le_ && !pre(l + 1, grp)) return false;
         }
-    if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
+    if (le_ < g.n_layers || headless_) {   // a layer split's earlier stage (or a pool worker): hand on, no head
         float* hout = hand_out_ + (size_t) hrow0 * HB;
         copy_from_mapped(hout, R_, (int64_t) T * HC * N, cs);
         copy_from_mapped(hout + (size_t) T * HC * N, bo_, (int64_t) T * N, cs);
@@ -1839,8 +1839,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
-    if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
+    if (le_ < g.n_layers || headless_) {   // a layer split's earlier stage: the hand-off is written (synced above)
         ++windows;
+        if (link_ != nullptr) {             // POOL: the rest of the model is on other PCs
+            progress_at("verify window: the pool's workers", (int64_t) T);
+            return link_->run(T, tokens, pos0, out, err);
+        }
         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
@@ -2039,6 +2043,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
             ss_->ple_prev[1] = last_tokens_[t];
         }
     ms_commit += ms_since(t0);
+    if (link_ != nullptr) return link_->commit(n_keep, err);   // POOL: the workers' stages
     return next_ == nullptr || next_->commit(n_keep, err);
 }
 
