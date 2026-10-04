@@ -230,14 +230,20 @@ def pool_env(pc: PoolConfig, env: dict) -> dict:
     return env
 
 
+# the engine's layer-split flags (the role adds its own).  Not every --pool-* flag: --pool-workers and --pool-affinity
+# are Strata's own, for its CPU expert pool, and stay as the config has them.
+POOL_FLAGS = ("--pool-peers", "--pool-split", "--pool-listen", "--pool-secret", "--pool-wire", "--pool-draft-wire",
+              "--pool-timeout-s", "--pool-wait-s")
+
+
 def strip_pool_args(args: list[str]) -> list[str]:
-    """The engine arguments without any --pool-* (the role adds its own)."""
+    """The engine arguments without the layer split's flags (POOL_FLAGS)."""
     out, skip = [], False
     for x in args:
         if skip:
             skip = False
             continue
-        if x.startswith("--pool-"):
+        if x.split("=", 1)[0] in POOL_FLAGS:
             skip = "=" not in x
             continue
         out.append(x)
