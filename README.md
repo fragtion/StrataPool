@@ -1,3 +1,21 @@
+<h1 align="center">StrataPool</h1>
+
+<p align="center"><b>Strata, pooled: several PCs on your network as one</b></p>
+
+> **StrataPool** is a fork of [Strata](https://github.com/Niko1221/Strata) by Niko1221, kept in step with its releases.
+> It adds a **Pool** tab with two ways to use more than one PC:
+>
+> - **Share requests**: every PC runs the whole model; a chat runs on the PC that holds its conversation, else on an
+>   idle one. Two chats (or an agent's subtasks) run on two PCs at once, and a PC that goes away is simply skipped.
+> - **Split layers**: the PCs divide one model's layers, each holding its layers' experts in its own RAM and VRAM and
+>   its share of the context, so the pool caches more experts and fits what one PC cannot.
+>
+> Neither adds up the PCs' speed for one chat: see **[docs/POOL.md](docs/POOL.md)** for what each does.
+> Everything below is Strata's own README and applies unchanged, with one difference: StrataPool compiles its engine at
+> the first `START-HERE.bat` (10-20 minutes, once), because Strata's ready-made engines do not include the layer split.
+
+---
+
 <h1 align="center">Strata</h1>
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)

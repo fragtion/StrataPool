@@ -98,8 +98,11 @@ LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMI
 # "https://github.com/<you>/Strata/releases/latest/download/" (or pass --prebuilt / set STRATA_PREBUILT_URL).
 # With the default, the release of this checkout's own version (PREBUILT_TAG_URL, CMakeLists.txt's version) is
 # tried first and the latest release is the fallback (#214): an older checkout keeps the engine it shipped with.
-PREBUILT_URL = "https://github.com/Niko1221/Strata/releases/latest/download/"
-PREBUILT_TAG_URL = "https://github.com/Niko1221/Strata/releases/download/v{version}/"
+# STRATAPOOL: Strata's ready-made engines have no layer split (the Pool tab's Split mode), so StrataPool compiles its
+# engine (once, 10-20 minutes; setup installs the compiler and the CUDA toolkit itself).  --prebuilt URL still works
+# for a StrataPool build published somewhere.
+PREBUILT_URL = ""
+PREBUILT_TAG_URL = ""
 PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
@@ -2321,6 +2324,9 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
         meta = json.loads(info.read_text(encoding="utf-8"))
         ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
         if meta.get("source") == "local":              # compiled here: build_engine checks its source and cards
+            return None
+        if b"--pool-listen" not in (eng / EXE).read_bytes():   # STRATAPOOL: a plain Strata engine (no layer split)
+            warn("the engine in engine/ is a plain Strata build without the pool's layer split: compiling StrataPool's")
             return None
         have = [int(a) for a in meta.get("archs", [])]
         miss = [int(x) for x in gpu.get("archs", [gpu["arch"]])
