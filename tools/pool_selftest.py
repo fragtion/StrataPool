@@ -56,7 +56,9 @@ def base_args(cfg: dict, ctx: int, cache: int, chunk: int) -> list[str]:
     for flag in ("--conversation-cache-mib", "--conversation-cache-slots", "--conversation-cache-min-free-mib",
                  "--kv-resident", "--layer-split", "--split-device"):
         a = with_arg(a, flag, None)
-    a = [x for x in a if not x.startswith("--pool-")]
+    for flag in ("--pool-peers", "--pool-split", "--pool-listen", "--pool-secret", "--pool-wire", "--pool-draft-wire",
+                 "--pool-timeout-s", "--pool-wait-s"):   # the layer split's (not --pool-workers / --pool-affinity)
+        a = with_arg(a, flag, None)
     a = with_arg(a, "--max-context", str(ctx))
     a = with_arg(a, "--expert-cache", str(cache))
     a = with_arg(a, "--prefill", str(chunk))

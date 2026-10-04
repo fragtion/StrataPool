@@ -127,6 +127,9 @@ class Config(unittest.TestCase):
                                                 "--pool-wire", "f16", "--pool-draft-wire", "f16"])
         self.assertEqual(worker_args(pc), ["--pool-listen", "0.0.0.0:7701"])
         self.assertEqual(strip_pool_args(["--x", "1", "--pool-peers", "a", "--pool-wire=f16", "--y"]), ["--x", "1", "--y"])
+        # Strata's own CPU-pool flags stay
+        self.assertEqual(strip_pool_args(["--pool-affinity", "auto", "--pool-workers", "15", "--pool-listen", "0.0.0.0:7701"]),
+                         ["--pool-affinity", "auto", "--pool-workers", "15"])
 
     def test_problems(self):
         pc = PoolConfig(None, {"role": "worker"})
