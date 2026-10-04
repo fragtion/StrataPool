@@ -146,8 +146,14 @@ class Engine(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         (self.root / "engine").mkdir()
+        # STRATAPOOL compiles its own engine (PREBUILT_URL is empty): the download mechanism is tested with Strata's
+        # release URLs, as a published StrataPool build would use it (--prebuilt)
         self.patches = [mock.patch.object(setup, "ROOT", self.root),
-                        mock.patch.object(setup, "source_version", lambda: "0.1.31")]
+                        mock.patch.object(setup, "source_version", lambda: "0.1.31"),
+                        mock.patch.object(setup, "PREBUILT_URL",
+                                          "https://github.com/Niko1221/Strata/releases/latest/download/"),
+                        mock.patch.object(setup, "PREBUILT_TAG_URL",
+                                          "https://github.com/Niko1221/Strata/releases/download/v{version}/")]
         for p in self.patches:
             p.start()
 
@@ -216,10 +222,19 @@ class Engine(unittest.TestCase):
                 self.assertFalse(z.exists())
                 self.assertFalse(z.with_name(z.name + ".done").exists())
 
-    def test_an_installed_engine_is_kept(self):
+    def test_a_plain_strata_engine_is_compiled_again(self):
+        """STRATAPOOL: an installed engine without the layer split (Strata's own) is not kept."""
         (self.root / "engine" / "BUILD.json").write_text(json.dumps(
             {"version": ".".join(map(str, setup.MIN_ENGINE)), "archs": [89]}))
         (self.root / "engine" / setup.EXE).write_bytes(b"old")
+        eng, out = quiet(setup.get_prebuilt, "", {"arch": 89}, "gpu")
+        self.assertIsNone(eng)
+        self.assertIn("without the pool's layer split", out)
+
+    def test_an_installed_engine_is_kept(self):
+        (self.root / "engine" / "BUILD.json").write_text(json.dumps(
+            {"version": ".".join(map(str, setup.MIN_ENGINE)), "archs": [89]}))
+        (self.root / "engine" / setup.EXE).write_bytes(b"old --pool-listen")   # STRATAPOOL: one with the layer split
 
         def urlopen(req, timeout=None):
             raise AssertionError("asked the network for an installed engine")
@@ -227,7 +242,7 @@ class Engine(unittest.TestCase):
         with mock.patch.object(setup.urllib.request, "urlopen", urlopen):
             eng, out = quiet(setup.get_prebuilt, setup.PREBUILT_URL, {"arch": 89}, "gpu")
         self.assertEqual(eng, self.root / "engine")
-        self.assertEqual((self.root / "engine" / setup.EXE).read_bytes(), b"old")
+        self.assertEqual((self.root / "engine" / setup.EXE).read_bytes(), b"old --pool-listen")
 
 
 class Requirements(unittest.TestCase):

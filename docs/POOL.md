@@ -1,6 +1,6 @@
-# Pool: several PCs as one
+# StrataPool: several PCs as one
 
-Strata's pool has two ways to use more than one PC. Pick one in the **Pool** tab, on each PC.
+StrataPool has two ways to use more than one PC. Pick one in the **Pool** tab, on each PC.
 
 | | **Share requests** (routing) | **Split layers** (coordinator + workers) |
 | --- | --- | --- |
@@ -87,14 +87,14 @@ every token.
 - A wired network is best. At 1 Gbit/s a decode window adds about 3-5 ms (two crossings of ~300 KB plus latency).
   A 6,144-token prompt chunk is ~250 MB each way in exact mode, about 2 s at 1 Gbit/s, and it overlaps with the
   coordinator's own work. Wi-Fi works, but slower.
-- An engine with the pool on each PC: one built from this version of Strata or later. An older engine says so in the
-  Pool tab; `START-HERE.bat --build` compiles this checkout's engine (10-20 minutes, once). Share requests (routing)
-  works with any engine: only the server takes part.
+- StrataPool's engine on each PC. `START-HERE.bat` compiles it the first time (10-20 minutes, once; it installs the
+  compiler and the CUDA toolkit itself): Strata's ready-made engines do not include the layer split. An engine
+  without it says so in the Pool tab. Share requests (routing) works with any engine: only the server takes part.
 
 ### Setting it up
 
-1. **On every PC:** install Strata with the same model (`START-HERE.bat`). Then run `POOL-FIREWALL.bat` as
-   administrator, once. It opens TCP
+1. **On every PC:** install StrataPool with the same model (`START-HERE.bat`; it finds the model files an existing
+   Strata install keeps in `Strata-data`). Then run `POOL-FIREWALL.bat` as administrator, once. It opens TCP
    7701 (the engines), UDP 7702 (the PCs finding each other) and TCP 8080 (the app) on private networks.
 2. **On the worker PC:** open the app, go to **Pool**, choose **Worker**, and click **Apply**. The chat on that PC
    turns off and its GPU waits for a coordinator.
