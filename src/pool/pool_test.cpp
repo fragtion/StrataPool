@@ -396,6 +396,63 @@ static void test_rank_for_range() {
     CHECK(std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end());
 }
 
+static void test_split_kv_and_failures() {
+    SplitModel m;
+    m.n_layers = 48;
+    for (int r = 0; r < 12288; ++r) m.profile.push_back({(int32_t) (r % 48), (int32_t) (r / 48)});
+    m.slot_bytes = [](int64_t) { return (int64_t) 1 << 20; };
+    m.layer_arena_bytes.assign(48, (int64_t) 1 << 30);                     // 1 GiB of experts per layer
+    m.session_bytes = [](int64_t lb, int64_t le) { return (le - lb) * ((int64_t) 8 << 20); };
+    for (int64_t l = 0; l < 48; ++l) m.layer_kv.push_back(l % 4 == 3 ? 1 : 0);   // a QSA layer every 4th
+    NodeCap a{"desktop", (int64_t) 4 << 30, (int64_t) 40 << 30, 0.5};
+    NodeCap b{"laptop", (int64_t) 3 << 30, (int64_t) 20 << 30, 0.4};
+    b.kv_host_layer = (int64_t) 1 << 28;                                   // 0.25 GiB per QSA layer per session
+    // one session: [28, 48) = 20 GiB of experts + 5 x 0.25 GiB of K/V does not fit 20 GiB; [29, 48) does
+    const SplitPlan one = auto_split(m, {a, b});
+    CHECK(one.ok && one.at[0] >= 29 && one.node_kv[1] > 0 && one.node_arena[1] + one.node_kv[1] <= b.ram_room);
+    // three sessions (--batch 2): [31, 48) = 17 + 5 x 0.75 > 20; [32, 48) = 16 + 4 x 0.75 = 19 fits
+    m.kv_copies = 3;
+    const SplitPlan three = auto_split(m, {a, b});
+    CHECK(three.ok && three.at[0] == 32);
+    const SplitPlan at28 = evaluate_split(m, {a, b}, {28});
+    CHECK(!at28.ok && at28.why.find("K/V") != std::string::npos);
+    // plenty of RAM but a pin limit (Windows: about half of it): the same arithmetic against that
+    NodeCap pb = b;
+    pb.ram_room = (int64_t) 40 << 30;
+    pb.pin_room = (int64_t) 15 << 30;
+    const SplitPlan pin = auto_split(m, {a, pb});
+    CHECK(pin.ok && pin.node_arena[1] + pin.node_kv[1] <= pb.pin_room);
+    const SplitPlan pin30 = evaluate_split(m, {a, pb}, {30});
+    CHECK(!pin30.ok && pin30.why.find("pin") != std::string::npos);
+    // a split the laptop failed to load: nothing that gives it as much or more
+    SplitCalib f;
+    f.add_failed({35});
+    f.add_failed({35});
+    CHECK(f.failed.size() == 1 && f.excludes({35}, 48) && f.excludes({33}, 48) && !f.excludes({36}, 48));
+    m.failures = &f;
+    const SplitPlan after = auto_split(m, {a, b});
+    CHECK(after.ok && after.at[0] >= 36);
+    // nothing left: says why
+    SplitCalib all;
+    all.add_failed({47});
+    m.failures = &all;
+    const SplitPlan none = auto_split(m, {a, b});
+    CHECK(!none.ok && none.why.find("failed to load") != std::string::npos);
+    m.failures = nullptr;
+    // three nodes: a worker whose range contains its failed one is excluded
+    SplitCalib f3;
+    f3.add_failed({16, 32});
+    CHECK(f3.excludes({16, 33}, 48) && f3.excludes({17, 32}, 48) && !f3.excludes({17, 33}, 48));
+    // the file keeps failed splits, also in an entry without timings yet
+    const std::string path = "strata-pool-test-failed.txt";
+    std::remove(path.c_str());
+    std::string err;
+    SplitCalib r;
+    CHECK(save_calib(path, "pool F", f, err) && load_calib(path, "pool F", r) && r.failed.size() == 1 &&
+          r.failed[0] == "35" && !r.usable(2) && r.excludes({30}, 48));
+    std::remove(path.c_str());
+}
+
 int main() {
     if (!net_init()) { std::fprintf(stderr, "no sockets\n"); return 1; }
     test_hashes();
@@ -406,6 +463,7 @@ int main() {
     test_split();
     test_rank_for_range();
     test_measured_split();
+    test_split_kv_and_failures();
     if (failures) { std::fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
     std::printf("strata-pool-test: all checks passed\n");
     return 0;

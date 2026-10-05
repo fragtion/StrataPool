@@ -25,19 +25,37 @@ SplitPlan evaluate_split(const SplitModel& m, const std::vector<NodeCap>& nodes,
     }
     p.node_slots.assign((size_t) ns, 0);
     p.node_arena.assign((size_t) ns, 0);
+    p.node_kv.assign((size_t) ns, 0);
     std::vector<int64_t> room((size_t) ns), used((size_t) ns, 0);
     for (int i = 0; i < ns; ++i) {
         const int64_t lb = lb_of(i), le = le_of(i);
-        int64_t arena = 0;
-        for (int64_t l = lb; l < le; ++l)
-            arena += (size_t) l < m.layer_arena_bytes.size() ? m.layer_arena_bytes[(size_t) l] : 0;
-        p.node_arena[(size_t) i] = arena;
         const NodeCap& n = nodes[(size_t) i];
-        if (n.ram_room > 0 && arena > n.ram_room) {
-            char b[256];
-            std::snprintf(b, sizeof b, "%s's RAM cannot hold the experts of layers %lld-%lld (%.1f GiB, %.1f GiB free)",
-                          n.name.c_str(), (long long) lb, (long long) (le - 1), (double) arena / 1073741824.0,
-                          (double) n.ram_room / 1073741824.0);
+        int64_t arena = 0, kv = 0;
+        for (int64_t l = lb; l < le; ++l) {
+            arena += (size_t) l < m.layer_arena_bytes.size() ? m.layer_arena_bytes[(size_t) l] : 0;
+            if ((size_t) l < m.layer_kv.size() && m.layer_kv[(size_t) l]) kv += n.kv_host_layer;
+        }
+        kv *= std::max<int64_t>(m.kv_copies, 1);   // the main session's copy and each batch slot's
+        p.node_arena[(size_t) i] = arena;
+        p.node_kv[(size_t) i] = kv;
+        if (n.ram_room > 0 && arena + kv > n.ram_room) {
+            char b[320];
+            if (kv > 0)
+                std::snprintf(b, sizeof b, "%s's RAM cannot hold the experts and the K/V copies of layers %lld-%lld "
+                              "(%.1f + %.1f GiB, %.1f GiB free)", n.name.c_str(), (long long) lb, (long long) (le - 1),
+                              (double) arena / 1073741824.0, (double) kv / 1073741824.0, (double) n.ram_room / 1073741824.0);
+            else
+                std::snprintf(b, sizeof b, "%s's RAM cannot hold the experts of layers %lld-%lld (%.1f GiB, %.1f GiB free)",
+                              n.name.c_str(), (long long) lb, (long long) (le - 1), (double) arena / 1073741824.0,
+                              (double) n.ram_room / 1073741824.0);
+            p.why = b;
+            return p;
+        }
+        if (n.pin_room > 0 && arena + kv > n.pin_room) {
+            char b[320];
+            std::snprintf(b, sizeof b, "%s cannot pin the experts and the K/V copies of layers %lld-%lld (%.1f + %.1f GiB; "
+                          "it may pin about %.1f GiB)", n.name.c_str(), (long long) lb, (long long) (le - 1),
+                          (double) arena / 1073741824.0, (double) kv / 1073741824.0, (double) n.pin_room / 1073741824.0);
             p.why = b;
             return p;
         }
@@ -88,6 +106,28 @@ bool SplitCalib::usable(size_t nodes) const {
     for (const double s : scale)
         if (!(s > 0.0) || !std::isfinite(s)) return false;
     return std::isfinite(fixed_ms) && std::isfinite(net_ms) && fixed_ms >= 0 && net_ms >= 0;
+}
+
+bool SplitCalib::excludes(const std::vector<int64_t>& at, int64_t n_layers) const {
+    // worker i (node i + 1) runs [at[i], at[i + 1]) - the last one up to n_layers.  A placement that gives some
+    // worker a range containing the one it failed to load needs at least as much memory there
+    for (const std::string& s : failed) {
+        std::vector<int64_t> f;
+        if (!parse_split(s, f) || f.size() != at.size()) continue;
+        for (size_t i = 0; i < at.size(); ++i) {
+            const int64_t le = i + 1 < at.size() ? at[i + 1] : n_layers, fle = i + 1 < f.size() ? f[i + 1] : n_layers;
+            if (at[i] <= f[i] && le >= fle) return true;
+        }
+    }
+    return false;
+}
+
+void SplitCalib::add_failed(const std::vector<int64_t>& at) {
+    if (at.empty()) return;
+    std::string k;
+    for (size_t i = 0; i < at.size(); ++i) k += (i ? "," : "") + std::to_string(at[i]);
+    if (std::find(failed.begin(), failed.end(), k) == failed.end()) failed.push_back(k);
+    if (failed.size() > 8) failed.erase(failed.begin());
 }
 
 bool SplitCalib::near(const std::vector<int64_t>& at) const {
@@ -141,6 +181,10 @@ std::string SplitCalib::encode() const {
         out += " seen=";
         for (size_t i = 0; i < seen.size(); ++i) out += (i ? ";" : "") + seen[i];
     }
+    if (!failed.empty()) {
+        out += " failed=";
+        for (size_t i = 0; i < failed.size(); ++i) out += (i ? ";" : "") + failed[i];
+    }
     return out;
 }
 
@@ -158,12 +202,13 @@ bool SplitCalib::decode(const std::string& text) {
         if (k == "windows") windows = std::atoll(v.c_str());
         else if (k == "fixed_ms") fixed_ms = std::atof(v.c_str());
         else if (k == "net_ms") net_ms = std::atof(v.c_str());
-        else if (k == "seen") {
+        else if (k == "seen" || k == "failed") {
+            std::vector<std::string>& to = k == "seen" ? seen : failed;
             size_t c = 0;
             while (c < v.size()) {
                 size_t d = v.find(';', c);
                 if (d == std::string::npos) d = v.size();
-                if (d > c) seen.push_back(v.substr(c, d - c));
+                if (d > c) to.push_back(v.substr(c, d - c));
                 c = d + 1;
             }
         } else if (k == "scale") {
@@ -176,7 +221,7 @@ bool SplitCalib::decode(const std::string& text) {
             }
         }
     }
-    return !scale.empty();
+    return !scale.empty() || !failed.empty();
 }
 
 bool load_calib(const std::string& path, const std::string& key, SplitCalib& c) {
@@ -249,6 +294,11 @@ SplitPlan auto_split(const SplitModel& m, const std::vector<NodeCap>& nodes) {
     const bool trust = m.calib != nullptr && m.calib->usable(nodes.size());
     auto consider = [&](const std::vector<int64_t>& at) {
         if (trust && !m.calib->near(at)) return;
+        if (m.failures != nullptr && m.failures->excludes(at, L)) {
+            last_why = "the splits that fit give a worker as much as one it failed to load (" +
+                       m.failures->failed.back() + "; delete pool-split-measured.txt to try them again)";
+            return;
+        }
         SplitPlan p = evaluate_split(m, nodes, at);
         if (!p.ok) { last_why = p.why; return; }
         // ties (within 0.1%): the placement whose busiest node holds the fewest layers above its share

@@ -22,6 +22,12 @@ struct NodeCap {
     int64_t vram_room = 0;   ///< bytes free for the session of its range + its expert cache
     int64_t ram_room = 0;    ///< bytes its RAM can give the expert arena of its range (<= 0: no limit)
     double layer_ms = 0.5;   ///< GPU time per layer per window (from SMs x clock)
+    /// --kv-resident streaming: the pinned RAM one QSA layer's K/V copy takes on this node (0: its K/V stays in VRAM).
+    /// Each session of its range (the main one and one per batch slot) holds such a copy beside the experts.
+    int64_t kv_host_layer = 0;
+    /// the most its experts and those K/V copies may pin together (0: no limit).  Windows pins about half of the
+    /// RAM in all; a worker's whole arena is pinned, so this is what runs out first there.
+    int64_t pin_room = 0;
 };
 
 /// What the pool measured with a split (the coordinator, after each request): per node how its layers' time compared
@@ -40,6 +46,11 @@ struct SplitCalib {
     bool near(const std::vector<int64_t>& at) const;
     double fixed_ms = 0, net_ms = 0;
     int64_t windows = 0;
+    /// splits a worker failed to load (it ran out of memory on the way): the automatic split no longer gives any
+    /// worker as much as or more than it had in one of them (`excludes`).  Delete the file to try them again.
+    std::vector<std::string> failed;
+    bool excludes(const std::vector<int64_t>& at, int64_t n_layers) const;
+    void add_failed(const std::vector<int64_t>& at);
     bool usable(size_t nodes) const;
     /// one request's numbers: per node its measured and its predicted ms per window (the prediction for the split it
     /// ran with), the coordinator's time outside its layers and the network's, over `w` windows
@@ -59,10 +70,13 @@ struct SplitModel {
     std::function<int64_t(int64_t layer)> slot_bytes;     ///< VRAM per cached expert of a layer
     std::vector<int64_t> layer_arena_bytes;               ///< RAM for all experts of a layer
     std::function<int64_t(int64_t lb, int64_t le)> session_bytes;
+    std::vector<uint8_t> layer_kv;   ///< 1 for a layer whose K/V a node keeps a pinned copy of (NodeCap::kv_host_layer)
+    int64_t kv_copies = 1;           ///< sessions per node that each hold that copy (1 + --batch)
     double miss_ms = 190.0;   ///< one unit of routed mass on the CPU pool, per window
     double hop_ms = 1.5;      ///< one network crossing per window (constant per extra node)
     int64_t first_min = 2;    ///< the coordinator keeps at least layers 0 and 1 (the PLE runs at layer 1)
     const SplitCalib* calib = nullptr;   ///< measured timings of this pool: used when `usable` for these nodes
+    const SplitCalib* failures = nullptr;   ///< its `failed` splits are skipped by auto_split (usable or not)
 };
 
 struct SplitPlan {
@@ -73,7 +87,8 @@ struct SplitPlan {
     double mass = 0;                 ///< the routed mass the caches hold (0..1)
     int64_t held = 0;                ///< profiled pairs cached across the pool
     std::vector<int64_t> node_slots; ///< predicted cached experts per node
-    std::vector<int64_t> node_arena; ///< RAM bytes of each node's range
+    std::vector<int64_t> node_arena; ///< RAM bytes of each node's range (its experts)
+    std::vector<int64_t> node_kv;    ///< pinned RAM of each node's K/V copies (all its sessions)
     std::vector<double> node_pred;   ///< the built-in model's ms per window for each node's range
     std::vector<double> node_ms;     ///< ... as predicted for this plan (scaled by the measurements when `measured`)
     bool measured = false;           ///< `ms` rests on this pool's measured timings
