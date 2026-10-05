@@ -697,6 +697,9 @@ void PoolLink::report_request(double decode_ms) {
         }
         const double net = ms_net / w;
         const double here = decode_ms / w - net;
+        // (a request of a window or two right after its prompt: the workers' refill of what the prompt borrowed
+        // lands in the wait, so the split says nothing then)
+        if (here < 0) all = false;
         if (all) {
             std::fprintf(stderr, "strata pool: %lld windows, %.1f ms each = this PC %.1f ms + the workers' layers %.1f ms + "
                                  "the network %.1f ms (%.0f KiB a window, %.1f ms round trip)%s\n",
@@ -721,6 +724,9 @@ void PoolLink::report_request(double decode_ms) {
                         std::fprintf(stderr, "strata pool: the split's timings were not saved: %s\n", e.c_str());
                 }
             }
+        } else if (here < 0) {
+            std::fprintf(stderr, "strata pool: %lld windows, %.1f ms each (right after a prompt: the workers' refill is in "
+                                 "the wait)%s\n", (long long) windows, decode_ms / w, per.c_str());
         } else {
             std::fprintf(stderr, "strata pool: %lld windows, %.1f ms each = this PC %.1f ms + the workers and the network "
                                  "%.1f ms%s\n", (long long) windows, decode_ms / w, here, net, per.c_str());
