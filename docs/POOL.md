@@ -176,8 +176,9 @@ saves between requests (every `expert_profile_save_every` minutes, 10 by default
 
 ## Several chats at once in a split
 
-**Chats at once** in the Pool tab (coordinator, 1 by default) gives the split 2 or 3 batch slots (Strata's
-`--batch`, docs/BATCHING.md). A chat alone still runs as before, with drafts. When a second one arrives, both continue
+**Several chats at once** in the Pool tab (coordinator, off by default) gives the split one batch slot per PC
+(Strata's `--batch`, docs/BATCHING.md; fewer when they do not fit). More would only share the same speed among more
+chats: with two PCs, two chats already keep both busy. A chat alone still runs as before, with drafts. When a second one arrives, both continue
 in slots: one word per step each, without drafts, and the steps are pipelined across the PCs. While the laptop runs
 chat A's layers, the desktop runs chat B's, so neither PC waits for the other.
 
@@ -194,6 +195,7 @@ What it costs:
 - A slot's conversation is not kept when its reply ends (as with `--batch-groups` on one PC), and a request left
   alone in a slot finishes there (one word per step) rather than going back to the drafted path.
 - The PCs' slot counts must match: the coordinator uses as many as every worker could carve.
+- Leave it off if you run one chat at a time: the slots then cost speed and memory for nothing.
 - For two chats at once, *Share requests* runs each at one PC's full speed (each PC holds the whole model). The
   split's slots suit a pool that only works as a split (a model too big for one PC, or one fast PC with a slower
   helper).

@@ -205,6 +205,8 @@ main { flex: 1; min-height: 0; display: flex; }
                 line-height: 1.5; background: var(--st-warn-tint); color: var(--st-warn-text);
                 border-left: 3px solid var(--st-warn); }
 .pool-explain ul { margin: 6px 0 0; padding-left: 18px; }
+.pool-note { display: block; margin-top: 6px; padding: 8px 12px; border-radius: var(--st-r-md); line-height: 1.5;
+             background: var(--st-warn-tint); color: var(--st-warn-text); border-left: 3px solid var(--st-warn); }
 .pool-explain li + li { margin-top: 4px; }
 .pool-notice { padding: 12px 14px; border-radius: var(--st-r-md); font-size: var(--st-fs-sm); line-height: 1.5;
                background: var(--st-info-tint); color: var(--st-info-text); }

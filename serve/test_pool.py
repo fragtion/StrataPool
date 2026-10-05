@@ -126,13 +126,16 @@ class Config(unittest.TestCase):
         self.assertEqual(coordinator_args(pc), ["--pool-peers", "a:7701,c:7701", "--pool-split", "auto",
                                                 "--pool-wire", "f16", "--pool-draft-wire", "f16"])
         self.assertEqual(worker_args(pc), ["--pool-listen", "0.0.0.0:7701"])
-        # chats at once: the split's batch slots (the worker's count comes from its coordinator)
-        two = PoolConfig(None, {"role": "coordinator", "peers": ["a"], "chats": "2"})
+        # several chats at once: one batch slot per PC (the worker's count comes from its coordinator)
+        self.assertNotIn("--batch", coordinator_args(pc))           # off by default
+        two = PoolConfig(None, {"role": "coordinator", "peers": ["a"], "several_chats": True})
         self.assertEqual(coordinator_args(two)[-2:], ["--batch", "2"])
+        three = PoolConfig(None, {"role": "coordinator", "peers": ["a", "b"], "several_chats": "on"})
+        self.assertEqual(coordinator_args(three)[-2:], ["--batch", "3"])
         self.assertEqual(worker_args(two), ["--pool-listen", "0.0.0.0:7701"])
-        for bad in (0, 5, "x", True):
+        for bad in (2, "maybe", None):
             with self.assertRaises(ValueError, msg=str(bad)):
-                PoolConfig.clean({"chats": bad})
+                PoolConfig.clean({"several_chats": bad})
         self.assertEqual(strip_pool_args(["--x", "1", "--pool-peers", "a", "--pool-wire=f16", "--y"]), ["--x", "1", "--y"])
         # Strata's own CPU-pool flags stay
         self.assertEqual(strip_pool_args(["--pool-affinity", "auto", "--pool-workers", "15", "--pool-listen", "0.0.0.0:7701"]),
