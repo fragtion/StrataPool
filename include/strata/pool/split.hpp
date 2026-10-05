@@ -24,6 +24,30 @@ struct NodeCap {
     double layer_ms = 0.5;   ///< GPU time per layer per window (from SMs x clock)
 };
 
+/// What the pool measured with a split (the coordinator, after each request): per node how its layers' time compared
+/// with the model's prediction for them (`scale`), and the window's parts no split moves - the coordinator's own work
+/// outside its layers (head, sampling, drafter, the serve loop: `fixed_ms`) and the network (`net_ms`).  The
+/// automatic split then predicts node i's time as scale[i] x the model's prediction for its range, plus those two.
+/// Kept per pool (`key`: the model, its settings and the nodes' names, in order) in a small text file.
+struct SplitCalib {
+    static constexpr int64_t kMinWindows = 200;   ///< below this the built-in model is used
+    static constexpr int64_t kMemory = 4000;      ///< the past counts at most this many windows
+    std::vector<double> scale;
+    double fixed_ms = 0, net_ms = 0;
+    int64_t windows = 0;
+    bool usable(size_t nodes) const;
+    /// one request's numbers: per node its measured and its predicted ms per window (the prediction for the split it
+    /// ran with), the coordinator's time outside its layers and the network's, over `w` windows
+    void add(const std::vector<double>& measured, const std::vector<double>& predicted, double fixed, double net,
+             int64_t w);
+    std::string encode() const;
+    bool decode(const std::string& text);
+};
+/// The entry for `key` in `path` (false: none, or no file)
+bool load_calib(const std::string& path, const std::string& key, SplitCalib& c);
+/// Writes (replaces) the entry for `key`, keeping the file's other pools.  An empty path writes nothing.
+bool save_calib(const std::string& path, const std::string& key, const SplitCalib& c, std::string& err);
+
 struct SplitModel {
     int64_t n_layers = 48;
     std::vector<std::pair<int32_t, int32_t>> profile;     ///< (layer, expert), hottest first
@@ -33,6 +57,7 @@ struct SplitModel {
     double miss_ms = 190.0;   ///< one unit of routed mass on the CPU pool, per window
     double hop_ms = 1.5;      ///< one network crossing per window (constant per extra node)
     int64_t first_min = 2;    ///< the coordinator keeps at least layers 0 and 1 (the PLE runs at layer 1)
+    const SplitCalib* calib = nullptr;   ///< measured timings of this pool: used when `usable` for these nodes
 };
 
 struct SplitPlan {
@@ -44,6 +69,9 @@ struct SplitPlan {
     int64_t held = 0;                ///< profiled pairs cached across the pool
     std::vector<int64_t> node_slots; ///< predicted cached experts per node
     std::vector<int64_t> node_arena; ///< RAM bytes of each node's range
+    std::vector<double> node_pred;   ///< the built-in model's ms per window for each node's range
+    std::vector<double> node_ms;     ///< ... as predicted for this plan (scaled by the measurements when `measured`)
+    bool measured = false;           ///< `ms` rests on this pool's measured timings
 };
 
 /// The best placement over `nodes` (coordinator first).  Every placement for 2 or 3 nodes; beyond that, layers in
@@ -56,5 +84,16 @@ SplitPlan evaluate_split(const SplitModel& m, const std::vector<NodeCap>& nodes,
 
 /// "18" / "16,32" -> the split points; false on anything else.
 bool parse_split(const std::string& s, std::vector<int64_t>& at);
+
+/// The learned expert ranking a pool node saves (--expert-profile-save).  A node only learns about its own layers
+/// [lb, le): `learned` ranks those first (its VRAM held only them) and every other layer after them.  Saved as it is,
+/// the next start of that PC as one whole model (or with another split) would fill its cache with this range first.
+/// Instead the result keeps `prior`'s order and only re-ranks the pairs of [lb, le) among the places `prior` gave
+/// them: the hottest learned pair of the range takes the range's best place in `prior`, and so on.  Pairs of other
+/// layers keep their places.  Any pair `prior` lacks follows at the end, in `learned`'s order.  An empty `prior`, or a
+/// range covering every layer, returns `learned` unchanged.
+std::vector<std::pair<int32_t, int32_t>> rank_for_range(const std::vector<std::pair<int32_t, int32_t>>& learned,
+                                                        const std::vector<std::pair<int32_t, int32_t>>& prior,
+                                                        int64_t lb, int64_t le, int64_t n_layers, int64_t n_expert);
 
 }  // namespace strata::pool

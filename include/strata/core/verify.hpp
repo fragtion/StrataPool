@@ -69,6 +69,8 @@ public:
     virtual void set_sampling(const strata::kernels::SamplerParams& sp) = 0;
     virtual void set_history(const int32_t* history, int history_len) = 0;
     virtual void set_head_sampling(bool on) = 0;
+    /// POOL: how long this window took here before the hand-off (the earlier stage's own layers), just before `run`
+    virtual void stage_ms(double ms) { (void) ms; }
 };
 
 class Verifier {

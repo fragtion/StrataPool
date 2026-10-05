@@ -510,6 +510,15 @@ bool PoolLink::end_request(std::string& err) {
     return true;
 }
 
+void PoolLink::set_calibration(const std::string& path, const std::string& key, const std::vector<double>& node_pred,
+                               const SplitCalib& loaded) {
+    std::lock_guard<std::mutex> lk(mu_);
+    calib_path_ = path;
+    calib_key_ = key;
+    calib_pred_ = node_pred;
+    calib_ = loaded;
+}
+
 void PoolLink::report_request(double decode_ms) {
     std::lock_guard<std::mutex> lk(mu_);
     uint64_t bytes = 0;
@@ -540,6 +549,22 @@ void PoolLink::report_request(double decode_ms) {
                          (long long) windows, decode_ms / w, here, layers_ms, net - layers_ms,
                          (double) (bytes - req_bytes0_) / w / 1024.0, workers_.empty() ? 0.0 : workers_[0].ms_rtt,
                          per.c_str());
+            // the measured split: this PC's own layers against the rest of its window (head, sampling, the drafter,
+            // the serve loop - what no split moves), each worker's layers, the network
+            const double mine = ms_here_layers / w;
+            if (mine > 0 && mine <= here) {
+                std::fprintf(stderr, "strata pool:   this PC: its layers %.1f ms + the head, sampling and the drafter %.1f ms\n",
+                             mine, here - mine);
+                if (!calib_key_.empty() && calib_pred_.size() == workers_.size() + 1) {
+                    std::vector<double> measured{mine};
+                    for (const WorkerInfo& wi : workers_)
+                        measured.push_back(wi.req.f64("ms_verify", 0) / (double) std::max<int64_t>(wi.req.i64("windows", 0), 1));
+                    calib_.add(measured, calib_pred_, here - mine, net - layers_ms, windows);
+                    std::string e;
+                    if (!save_calib(calib_path_, calib_key_, calib_, e))
+                        std::fprintf(stderr, "strata pool: the split's timings were not saved: %s\n", e.c_str());
+                }
+            }
         } else {
             std::fprintf(stderr, "strata pool: %lld windows, %.1f ms each = this PC %.1f ms + the workers and the network "
                                  "%.1f ms%s\n", (long long) windows, decode_ms / w, here, net, per.c_str());
@@ -548,7 +573,7 @@ void PoolLink::report_request(double decode_ms) {
     if (ms_prefill_net > 0)
         std::fprintf(stderr, "strata pool: prompt chunks waited %.0f ms on the workers\n", ms_prefill_net);
     windows = 0;
-    ms_net = ms_prefill_net = 0;
+    ms_net = ms_prefill_net = ms_here_layers = 0;
     req_bytes0_ = bytes;
 }
 

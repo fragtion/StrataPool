@@ -2933,10 +2933,31 @@ int main(int argc, char** argv) {
             n.layer_ms = per_layer_ms(w.hello.i64("sms", 0), w.hello.i64("khz", 1800000));
             nodes.push_back(n);
         }
+        // the measured split: what this pool measured with earlier splits (SplitCalib), per model, settings and nodes.
+        // STRATA_POOL_CALIB=<file> keeps it elsewhere, =0 turns it off; the default is a file in the engine's folder.
+        std::string calib_path = "pool-split-measured.txt";
+        if (const char* v = std::getenv("STRATA_POOL_CALIB")) calib_path = (std::string(v) == "0") ? "" : v;
+        std::string calib_key = "model=" + pool_fp.pack + " layers=" + std::to_string(g.n_layers) +
+                                " ctx=" + std::to_string(o.max_context) + " kv=" + o.kv + " spec=" + std::to_string(o.spec) +
+                                " nodes=" + pool_node_name();
+        for (const strata::pool::WorkerInfo& w : pool_link.workers())
+            calib_key += "," + w.hello.str("name", w.addr) + "@" + w.addr;
+        for (char& c : calib_key)
+            if (c == '\t' || c == '\n' || c == '\r') c = ' ';
+        strata::pool::SplitCalib calib;
+        if (!calib_path.empty() && strata::pool::load_calib(calib_path, calib_key, calib) && calib.usable(nodes.size())) {
+            sm.calib = &calib;
+            std::string sc;
+            for (size_t i = 0; i < calib.scale.size(); ++i) sc += (i ? ", " : "") + std::to_string(calib.scale[i]).substr(0, 4);
+            std::fprintf(stderr, "strata pool: the split uses this pool's measured timings (%lld windows: this PC's head, "
+                                 "sampling and drafter %.1f ms, the network %.1f ms, each node's layers x %s of the "
+                                 "estimate)\n", (long long) calib.windows, calib.fixed_ms, calib.net_ms, sc.c_str());
+        }
         strata::pool::SplitPlan plan;
         if (o.pool_split == "auto") {
             // workers that still hold a range from this coordinator's last start keep it when it still fits (a
-            // reload of a worker's share costs minutes; the search would land within a layer of it anyway)
+            // reload of a worker's share costs minutes; the search would land within a layer of it anyway) - unless
+            // the measured timings say another split is clearly faster (3%: then the reload pays for itself)
             bool adopt = true;
             std::vector<int64_t> at;
             for (size_t i = 0; i < pool_link.workers().size() && adopt; ++i) {
@@ -2949,7 +2970,16 @@ int main(int argc, char** argv) {
             }
             if (adopt) {
                 plan = strata::pool::evaluate_split(sm, nodes, at);
-                if (plan.ok)
+                if (plan.ok && plan.measured) {
+                    const strata::pool::SplitPlan best = strata::pool::auto_split(sm, nodes);
+                    if (best.ok && best.at != plan.at && best.ms < plan.ms * 0.97) {
+                        std::fprintf(stderr, "strata pool: the measured timings predict %.1f ms per window with split %lld "
+                                             "against %.1f ms with the loaded %lld: the workers load the new range\n",
+                                     best.ms, (long long) best.at[0], plan.ms, (long long) plan.at[0]);
+                        plan = best;
+                    }
+                }
+                if (plan.ok && plan.at == at)
                     std::fprintf(stderr, "strata pool: the workers keep the layers they have loaded\n");
             }
             if (!plan.ok) plan = strata::pool::auto_split(sm, nodes);
@@ -2969,7 +2999,8 @@ int main(int argc, char** argv) {
         pool_at = plan.at;
         std::string ks;
         for (size_t i = 0; i < pool_at.size(); ++i) ks += (i ? "," : "") + std::to_string(pool_at[i]);
-        std::fprintf(stderr, "strata pool: split %s - this PC runs layers 0-%lld, predicted %.1f ms per decode window; "
+        std::fprintf(stderr, plan.measured ? "strata pool: split %s - this PC runs layers 0-%lld, predicted %.1f ms per decode window (measured); "
+                                           : "strata pool: split %s - this PC runs layers 0-%lld, predicted %.1f ms per decode window; "
                              "the pool's GPUs hold ~%lld of %zu profiled experts (~%.1f%% of the routed mass)\n",
                      ks.c_str(), (long long) (pool_at[0] - 1), plan.ms, (long long) plan.held, sm.profile.size(),
                      100.0 * plan.mass);
@@ -2997,6 +3028,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata pool: %s\n", err.c_str());
             return 1;
         }
+        // each request's timings refine the measured split for the next start (the model's own prediction per node
+        // for this placement is what they are compared with)
+        if (!calib_path.empty()) pool_link.set_calibration(calib_path, calib_key, plan.node_pred, calib);
         node_le = pool_at[0];
         std::printf("POOL SPLIT %s\n", ks.c_str());
         std::fflush(stdout);
@@ -7618,8 +7652,11 @@ int main(int argc, char** argv) {
             if (astate == AState::SwapIn)   // --adapt-async: the same for a round past its step 2
                 for (const ASwap& w : aswaps) resident[(size_t) w.layer * g.n_expert + w.in] = 1;
             std::string e;
-            const auto ranked = strata::core::rank_learned_profile(g.n_layers, g.n_expert, resident, heat,
-                                                                   profile_loaded);
+            auto ranked = strata::core::rank_learned_profile(g.n_layers, g.n_expert, resident, heat, profile_loaded);
+            // POOL: this PC learned only its own layers; the rest keeps the order it started from, so the file stays
+            // a whole-model ranking (the next start may be alone, or with another split)
+            if (pool_any && (node_lb > 0 || node_le < g.n_layers))
+                ranked = strata::pool::rank_for_range(ranked, profile_loaded, node_lb, node_le, g.n_layers, g.n_expert);
             if (strata::core::write_expert_profile(o.expert_profile_save, g.n_layers, g.n_expert, ranked, e))
                 std::fprintf(stderr, "strata serve: expert profile saved to %s (%s)\n", o.expert_profile_save.c_str(),
                              why);
@@ -7909,6 +7946,11 @@ int main(int argc, char** argv) {
                         w_windows = w_tokens = w_prefill = 0;
                         w_ms_verify = w_ms_prefill = 0;
                         if (!pool_ch.send(strata::pool::Msg::Ack, st, e)) { why = "the coordinator went away"; break; }
+                        // #477 on a worker: what its cache learned about its layers, kept across restarts (the
+                        // server stops a worker without a QUIT, so between requests is the time to write it)
+                        if (!heat.empty() && o.expert_profile_save_min > 0 &&
+                            Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
+                            save_profile("periodic");
                     } else if (t == strata::pool::Msg::Stats) {
                         strata::pool::KV k;
                         k.set("requests", w_requests);
@@ -7924,6 +7966,7 @@ int main(int argc, char** argv) {
                 }
                 busy.reset();
                 pool_ch.close();
+                save_profile("the coordinator's session ended");   // #477 (nothing without --expert-profile-save)
                 if (fatal) {
                     std::printf("POOL FAILED\n");
                     std::fflush(stdout);

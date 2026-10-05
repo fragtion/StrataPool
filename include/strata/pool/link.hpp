@@ -12,6 +12,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/pool/protocol.hpp"
+#include "strata/pool/split.hpp"
 
 #include <cstdint>
 #include <mutex>
@@ -79,6 +80,7 @@ public:
     void set_sampling(const strata::kernels::SamplerParams& sp) override { sampling_ = sp; }
     void set_history(const int32_t* history, int history_len) override { hist_d_ = history; hist_len_ = history_len; }
     void set_head_sampling(bool on) override { head_sampling_ = on; }
+    void stage_ms(double ms) override { ms_here_layers += ms; }
 
     /// The rest of a prompt chunk: `rows` (host, T x hc*n_embd float32) through every worker; `*out` then points at
     /// the final rows (host, float32, valid until the next call) for the draft layer.  `segment` is the length of the
@@ -104,6 +106,12 @@ public:
     /// After end_request: one log line per request that splits a window's time into this PC, each worker's layers
     /// and the network (from the workers' own timings), then resets the counters.  `decode_ms`: the request's decode.
     void report_request(double decode_ms);
+    /// The measured split (SplitCalib): the file and this pool's key, the built-in model's ms per window for each
+    /// node's range as configured, and what the file held at the start.  report_request then adds each request's
+    /// numbers and writes the file.  Without it nothing is kept.
+    void set_calibration(const std::string& path, const std::string& key, const std::vector<double>& node_pred,
+                         const SplitCalib& loaded);
+    double ms_here_layers = 0;  ///< this PC's own layers (the verifier's stage_ms), summed over the windows
     double ms_net = 0;          ///< wall time spent waiting on workers (verify windows)
     double ms_prefill_net = 0;  ///< ... (prompt chunks)
     int64_t windows = 0;
@@ -123,6 +131,9 @@ private:
     KV common_;
     uint64_t ckpt_seq_ = 0;
     uint64_t req_bytes0_ = 0;   ///< bytes on all channels when the request's counters were last reset
+    std::string calib_path_, calib_key_;
+    std::vector<double> calib_pred_;
+    SplitCalib calib_;
 
     // the window and the head (device)
     const core::WeightTable* wt_ = nullptr;
