@@ -6834,9 +6834,7 @@ int main(int argc, char** argv) {
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
-                                       // (a pool's pipelined slot keeps no conversation: the server leaves a lone
-                                       // request in its slot rather than read its history again on the solo path)
-                                       " slot_cache=" + std::to_string(o.prompt_cache > 0 && !pool_coord ? 1 : 0)).c_str() : "");
+                                       " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0)).c_str() : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -7263,7 +7261,10 @@ int main(int argc, char** argv) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", gi * GS + t, (long long) sl.produced, fin, ms);
                         sl.active = false;
-                        sl.cached = false;   // the pipeline's pad rows: a pipelined slot is not reused as a cache
+                        // the pipeline's pad rows: a pipelined slot is not reused as a cache - except in groups of one
+                        // slot (a pool's), which have no pad rows: then it keeps its conversation as batch_step's do
+                        // (a request left alone goes back to the drafted path, a next turn continues from it)
+                        sl.cached = GS == 1 && o.prompt_cache > 0 && !sl.img;
                     } else {
                         sl.x = y;
                         sl.p += 1;
@@ -7611,7 +7612,8 @@ int main(int argc, char** argv) {
                         slot_ck = nullptr;
                     }
                     for (const ConvCheckpoint& c : sl.checks)
-                        if ((int64_t) c.ids.size() > std::max(resume, slot_tokens) && starts_with(c.ids, c.imgs)) {
+                        // (POOL: a slot's turn checkpoint holds this PC's layers only: the workers have none)
+                        if (!pool_coord && (int64_t) c.ids.size() > std::max(resume, slot_tokens) && starts_with(c.ids, c.imgs)) {
                             slot_source = b;
                             slot_tokens = (int64_t) c.ids.size();
                             slot_ck = &c;
