@@ -148,33 +148,25 @@ def images_of(messages: list[dict]) -> list[str]:
 # a user quoting "</think>" used to hand the model a real end-of-reasoning token.  Before the template is rendered
 # they are swapped for these private-use characters, and the server encodes the spans they mark as ordinary text.
 THINK_TAGS = {"<think>": "\U000F0E01", "</think>": "\U000F0E02"}
-# #554: the vision markers the same way.  They are special tokens only where the template writes them for an image
-# item; the same strings in a message's text (an agent reading chat_template.jinja, a tool result quoting it) became
-# the same special ids, so text with <|vision_start|><|image_pad|> before a picture took that picture's embeddings
-VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", "<|vision_end|>": "\U000F0E05",
-               "<|video_pad|>": "\U000F0E06"}
-LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS}
-THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
-CONTROL_MARK0 = 0xF0E10      # the control tokens' marks start here, clear of the two sets above
+CONTROL_MARK0 = 0xF0E10      # the control tokens' marks start here, clear of the think tags' two
 
 
 def literal_tags(controls) -> dict[str, str]:
-    """LITERAL_TAGS plus a mark for each control token's text (`controls`: the tokenizer's CONTROL literals,
+    """THINK_TAGS plus a mark for each control token's text (`controls`: the tokenizer's CONTROL literals,
     <|im_start|>, <|im_end|>, <|endoftext|>, ...).  The rendered prompt is encoded with those literals parsed, so one
-    written inside a message - a file an agent reads, a pasted chat template - opened or ended a turn there.  Longest
-    first, as the tokenizer matches them: a literal inside a longer one is not marked before it."""
-    tags = {**LITERAL_TAGS, **{c: chr(CONTROL_MARK0 + k) for k, c in enumerate(c for c in controls
-                                                                                if c not in LITERAL_TAGS)}}
+    written inside a message - a file an agent reads, a pasted chat template - opened or ended a turn there.
+    Longest first, as the tokenizer matches them: a literal inside a longer one is not marked before it."""
+    tags = {**THINK_TAGS, **{c: chr(CONTROL_MARK0 + k) for k, c in enumerate(controls)}}
     return dict(sorted(tags.items(), key=lambda t: -len(t[0])))
 
 
-def _mark(text: str, tags: dict[str, str] = LITERAL_TAGS) -> str:
+def _mark(text: str, tags: dict[str, str]) -> str:
     for tag, mark in tags.items():
         text = text.replace(tag, mark)
     return text
 
 
-def _mark_deep(v, tags: dict[str, str] = LITERAL_TAGS):
+def _mark_deep(v, tags):
     if isinstance(v, str):
         return _mark(v, tags)
     if isinstance(v, dict):
@@ -184,7 +176,7 @@ def _mark_deep(v, tags: dict[str, str] = LITERAL_TAGS):
     return v
 
 
-def _has_tag(v, tags: dict[str, str] = LITERAL_TAGS) -> bool:
+def _has_tag(v, tags) -> bool:
     if isinstance(v, str):
         return any(tag in v for tag in tags)
     if isinstance(v, dict):
@@ -194,12 +186,12 @@ def _has_tag(v, tags: dict[str, str] = LITERAL_TAGS) -> bool:
     return False
 
 
-def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: dict[str, str] = LITERAL_TAGS):
-    """#537: (messages, tools) with every literal <think> / </think> (#554: and vision marker) in their text swapped for
-    LITERAL_TAGS' marks (or `tags`': literal_tags() adds the control tokens' texts), and
-    whether there was one (None: no change, the same objects back - a prompt without them renders as it always did).
-    An assistant message whose content opens with a whole <think>...</think> block (clients that send the reasoning
-    inline) keeps that one block as the model's markers, as before."""
+def mark_literals(messages: list[dict], tools: list[dict] | None, tags: dict[str, str]):
+    """#537: (messages, tools) with every literal of `tags` (<think> / </think>, and with literal_tags() the control
+    tokens' texts) in their text swapped for its mark, and whether there was one (None: no change, the same objects
+    back - a prompt without them renders as it always did).  An assistant message whose content opens with a whole
+    <think>...</think> block (clients that send the reasoning inline) keeps that one block as the model's markers,
+    as before."""
     if not _has_tag(messages, tags) and not _has_tag(tools, tags):
         return messages, tools, False
     out = []
@@ -218,16 +210,12 @@ def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: di
     return out, _mark_deep(tools, tags), True
 
 
-_THINK_MARK_RE = re.compile("|".join(THINK_MARKS))
-
-
-def unmark_think_literals(prompt: str, tags: dict[str, str] = LITERAL_TAGS) -> tuple[str, list[tuple[int, int]]]:
-    """The rendered prompt with THINK_TAGS' marks turned back into the tags' text, and the (start, end) spans of those
-    tags in it: the server encodes them as ordinary text (the tokenizer's encode_plain_spans)."""
-    marks = THINK_MARKS if tags is LITERAL_TAGS else {v: k for k, v in tags.items()}
-    mark_re = _THINK_MARK_RE if tags is LITERAL_TAGS else re.compile("|".join(map(re.escape, marks)))
+def unmark_literals(prompt: str, tags: dict[str, str]) -> tuple[str, list[tuple[int, int]]]:
+    """The rendered prompt with the marks turned back into their literals' text, and the (start, end) spans of those
+    literals in it: the server encodes them as ordinary text (the tokenizer's `plain` spans)."""
+    marks = {v: k for k, v in tags.items()}
     out, spans, pos, n = [], [], 0, 0
-    for m in mark_re.finditer(prompt):
+    for m in re.finditer("[" + "".join(marks) + "]", prompt):
         out.append(prompt[pos:m.start()])
         n += m.start() - pos
         tag = marks[m.group(0)]

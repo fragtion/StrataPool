@@ -56,8 +56,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
-                            tool_choice_of, unmark_think_literals)
+                            images_of, literal_tags, mark_literals, openai_to_messages, unmark_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.winjob import contain  # noqa: E402
@@ -2148,7 +2147,7 @@ class Service:
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
-        self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
+        self.literals = literal_tags(tokenizer.control_tokens)
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -2704,11 +2703,11 @@ class Service:
         message's text is encoded as the text it is, not as the model's reasoning markers (the template's own are).
         A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
         the control tokens the template writes are control tokens."""
-        marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
+        marked, marked_tools, changed = mark_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         if not changed:
             return self.tok.encode(prompt, parse_special=True)
-        prompt, plain = unmark_think_literals(prompt, self.literals)
+        prompt, plain = unmark_literals(prompt, self.literals)
         return self.tok.encode(prompt, parse_special=True, plain=plain)
 
     def _note_unreadable_tool_images(self, messages):
