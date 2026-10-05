@@ -5,6 +5,7 @@
 #include "strata/pool/worker.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -37,7 +38,8 @@ struct FakeWorker {
     std::thread t;
     std::string secret;
     float add;
-    std::atomic<int> commits{0}, resets{0}, prefills{0}, sessions{0};
+    std::atomic<int> commits{0}, resets{0}, prefills{0}, sessions{0}, batches{0}, slot_loads{0}, slot_stores{0};
+    std::atomic<int> last_base{-1}, last_slot{-1};
     std::set<uint64_t> ckpts;
     std::mutex mu;
     bool reload_first = false;     // answer the first CONFIG with "reload" (it had another range)
@@ -102,6 +104,25 @@ struct FakeWorker {
                         if (ck) { std::lock_guard<std::mutex> g(mu); ckpts.insert(ck); }
                         ++prefills;
                         ch.send(Msg::PrefillRows, out, e);
+                    } else if (t == Msg::BatchVerify) {
+                        // i32 base, i32 S, i32 tokens[S], i64 pos[S], rows: back with `add` on every value
+                        int32_t base = 0, S = 0;
+                        std::memcpy(&base, p.data(), 4);
+                        std::memcpy(&S, p.data() + 4, 4);
+                        const size_t off = 8 + (size_t) S * 12;
+                        std::vector<float> r((p.size() - off) / 4);
+                        std::memcpy(r.data(), p.data() + off, r.size() * 4);
+                        for (float& v : r) v += add;
+                        batches++;
+                        last_base = base;
+                        ch.send(Msg::BatchRows, r.data(), r.size() * 4, nullptr, 0, e);
+                    } else if (t == Msg::SlotLoad || t == Msg::SlotStore) {
+                        int32_t slot = 0;
+                        std::memcpy(&slot, p.data(), 4);
+                        if (t == Msg::SlotLoad) slot_loads++;
+                        else slot_stores++;
+                        last_slot = slot;
+                        ch.send(Msg::Ack, e);
                     } else if (t == Msg::Commit) {
                         ++commits;
                         ch.send(Msg::Ack, e);
@@ -176,6 +197,34 @@ static void test_two_workers(Wire wire) {
     CHECK(link.ckpt_retain({99}, err));
     CHECK(!link.ckpt_restore(7, err) && err.find("no checkpoint 7") != std::string::npos);
     err.clear();
+    // a pipelined batch group (slots 1-2) through both workers, without the head; slot copies on both (the fake
+    // workers read and write f32 rows)
+    if (wire == Wire::F32) {
+        const int64_t hb = 5;
+        std::vector<float> hand(8 * hb, 0.0f);
+        for (int i = 0; i < 2 * hb; ++i) hand[(size_t) (hb + i)] = (float) i;   // rows 1..2
+        link.set_batch_host(hand.data(), hb, false);
+        const int32_t bt[2] = {11, 12};
+        const int64_t bp[2] = {100, 200};
+        CHECK(link.batch_send(0, 1, 2, bt, bp, err));
+        CHECK(!link.batch_send(0, 1, 2, bt, bp, err));          // one group at a time per worker
+        int r = 0;
+        for (int spin = 0; spin < 2000 && (r = link.batch_poll(0, err)) == 0; ++spin)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(r == 1);
+        CHECK(link.batch_send(1, 1, 2, bt, bp, err));
+        for (int spin = 0; spin < 2000 && (r = link.batch_poll(1, err)) == 0; ++spin)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(r == 1);
+        const std::vector<float>& back = link.last_batch_rows();
+        CHECK(back.size() == (size_t) (2 * hb));
+        bool exact = back.size() == (size_t) (2 * hb);
+        for (size_t i = 0; exact && i < back.size(); ++i) exact = std::fabs(back[i] - ((float) i + 1.0f + 10.0f)) < 1e-2f;
+        CHECK(exact);                                            // worker a added 1, worker b 10
+        CHECK(a.batches == 1 && b.batches == 1 && a.last_base == 1 && b.last_base == 1);
+        CHECK(link.slot_copy(true, 1, {5, 6, 7}, err) && link.slot_copy(false, 1, {5, 6, 7}, err));
+        CHECK(a.slot_loads == 1 && b.slot_stores == 1 && b.last_slot == 1);
+    }
     CHECK(link.end_request(err));
     CHECK(link.workers()[0].req.i64("windows") == 4 && link.workers()[1].req.f64("ms_verify") == 10.0);
     link.windows = 4;

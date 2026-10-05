@@ -52,6 +52,11 @@ enum class Msg : uint16_t {
     EndRequest = 19, // a request ended: refill lent slots, log     (lazy ACK)
     Stats = 20,      // -> StatsReply (key=value)
     StatsReply = 21,
+    // batch slots (several conversations at once, the windows pipelined across the pool)
+    BatchVerify = 22,// i32 base, i32 S, i32 tokens[S], i64 pos[S], rows[S x handoff] (slots base..base+S-1)
+    BatchRows = 23,  // rows[S x handoff]
+    SlotLoad = 24,   // i32 slot, i64 n, i32 last2[2]: the main session's first n tokens -> the slot   (lazy ACK)
+    SlotStore = 25,  // i32 slot, i64 n, i32 last2[2]: the slot's first n tokens -> the main session (lazy ACK)
     Ack = 30,
     Err = 31,        // message=<text>
     Bye = 40,        // the coordinator is leaving; the worker keeps its load for the next one
@@ -122,6 +127,8 @@ public:
     Channel() = default;
     explicit Channel(Socket s) : s_(std::move(s)) {}
     bool valid() const { return s_.valid(); }
+    /// a frame (or the peer's close) is waiting to be read: recv will not block for long
+    bool readable(std::string& err) { return s_.readable(0, err); }
     Socket& socket() { return s_; }
     const std::string& peer() const { return s_.peer(); }
     void close() { s_.close(); }

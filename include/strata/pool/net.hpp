@@ -34,6 +34,9 @@ public:
     bool recv_all(void* p, size_t n, std::string& err);
     /// Both directions' timeout in seconds (0 = none).
     void set_timeout(double seconds);
+    /// Something to read (or the peer closed) within `timeout_s` (0: right now, without waiting).  False with `err`
+    /// set on an error, false with `err` empty when nothing arrived.
+    bool readable(double timeout_s, std::string& err);
     /// "a.b.c.d:port" of the other end (set by connect/accept)
     const std::string& peer() const { return peer_; }
     void set_peer(std::string p) { peer_ = std::move(p); }

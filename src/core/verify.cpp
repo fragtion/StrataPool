@@ -2145,7 +2145,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     const cudaError_t qc = cudaStreamQuery(copy_);   // no host function of this window may raise flag B in the next
     if (qc == cudaErrorNotReady) return 0;
     if (prof_on_) collect_profile();
-    if (last_stage()) {
+    if (last_stage() && !headless_) {   // (a POOL worker's last layer hands its rows on: the head is elsewhere)
         if (!sample_rows(S, err)) { b_running_ = false; return -1; }
         for (int t = 0; t < S; ++t) b_out_[t] = ((volatile int32_t*) h_out_)[t];
     }

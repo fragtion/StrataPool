@@ -40,6 +40,10 @@ const char* msg_name(Msg m) {
     case Msg::EndRequest: return "END_REQUEST";
     case Msg::Stats: return "STATS";
     case Msg::StatsReply: return "STATS_REPLY";
+    case Msg::BatchVerify: return "BATCH_VERIFY";
+    case Msg::BatchRows: return "BATCH_ROWS";
+    case Msg::SlotLoad: return "SLOT_LOAD";
+    case Msg::SlotStore: return "SLOT_STORE";
     case Msg::Ack: return "ACK";
     case Msg::Err: return "ERR";
     case Msg::Bye: return "BYE";

@@ -172,6 +172,30 @@ layers' experts and keeps the order it started with for every other layer. The s
 whole model: the same PC can start alone, share requests, or take another split without a lopsided cache. A worker
 saves between requests (every `expert_profile_save_every` minutes, 10 by default) and when its coordinator leaves.
 
+## Several chats at once in a split
+
+**Chats at once** in the Pool tab (coordinator, 1 by default) gives the split 2 or 3 batch slots (Strata's
+`--batch`, docs/BATCHING.md). A chat alone still runs as before, with drafts. When a second one arrives, both continue
+in slots: one word per step each, without drafts, and the steps are pipelined across the PCs. While the laptop runs
+chat A's layers, the desktop runs chat B's, so neither PC waits for the other.
+
+Measured on the desktop (RTX 3060) + laptop (RTX 5060 Laptop) pool, split 33, one chat with drafts off (the cost of
+one slot's step): 31.8 ms a step = desktop 21.9 ms + laptop 8.2 ms + network 1.6 ms. Pipelined, two chats should get
+about one word per desktop step between them, about 45 words/s in total against 37 for one chat with drafts. That
+is an estimate from those numbers, not yet a measurement of the pipeline.
+
+What it costs:
+
+- Every slot has its own state on every PC (its layers' KV and recurrent state), in VRAM the expert cache would
+  otherwise use, so a chat alone runs a little slower than with one slot. With KV streaming (`--kv-resident`) each
+  slot's whole context also takes pinned RAM.
+- A slot's conversation is not kept when its reply ends (as with `--batch-groups` on one PC), and a request left
+  alone in a slot finishes there (one word per step) rather than going back to the drafted path.
+- The PCs' slot counts must match: the coordinator uses as many as every worker could carve.
+- For two chats at once, *Share requests* runs each at one PC's full speed (each PC holds the whole model). The
+  split's slots suit a pool that only works as a split (a model too big for one PC, or one fast PC with a slower
+  helper).
+
 ## Which PCs make good workers
 
 The pool runs its layers one after the other, so a token waits for every PC's part in turn. A worker helps when its
@@ -199,10 +223,6 @@ out of the pool. The automatic split would give it as few layers as it can.
 - **Conversation parking** (whole-chat snapshots in RAM). The per-chat checkpoints (`--prompt-cache`) work across
   the pool: each worker keeps its own layers' part.
 - **Several GPUs in one pool PC.** Each pool PC uses one GPU, and the pool is the split.
-- **Batch slots** (`"parallel"`, `--batch`). Two chats at once through one split would let the PCs work on
-  different chats at the same moment, but a batch window carries no drafts, and the coordinator's own part (its
-  layers plus the head and the drafter) is about three quarters of a window. The overlap would hide only the
-  workers' part. For two chats at once, *Share requests* runs each at one PC's full speed.
 
 ## Engine flags
 

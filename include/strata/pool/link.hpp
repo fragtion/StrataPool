@@ -14,6 +14,7 @@
 #include "strata/pool/protocol.hpp"
 #include "strata/pool/split.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -89,6 +90,29 @@ public:
     bool prefill(const float* rows, const int64_t* tokens, int64_t T, int64_t p0, int64_t segment, uint64_t ckpt,
                  const float** out, std::string& err);
 
+    // ---- batch slots (several conversations at once): each worker is one stage of the pipeline that
+    // --batch-groups runs (generate.cpp's pump).  A group's window: this PC's verifier runs its layers (batch_launch),
+    // then batch_send(0) / batch_poll(0) on the first worker, ... and the last worker's batch_poll runs the head and
+    // the picks here (batch_out).  Rows of the group [base, base + S) are rows [base, base + S) of the hand-off.
+    static constexpr int kMaxBatchRows = 8;
+    bool batch_send(size_t w, int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err);
+    /// 1 = worker w's rows are back (the last worker's: the picks are in batch_out), 0 = not yet, -1 = an error
+    int batch_poll(size_t w, std::string& err);
+    const int32_t* batch_out() const { return batch_out_; }
+    /// a slot's sampling for its batch rows (greedy until set; penalties are not applied in batch windows)
+    void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp);
+    /// every worker copies its main session's first ids.size() tokens into slot `slot` (load) or the slot's back
+    /// into its main session (!load), as this PC does for its own layers; returns when all are done
+    bool slot_copy(bool load, int slot, const std::vector<int32_t>& ids, std::string& err);
+    /// the slot sessions every worker carved (READY's batch_slots; 0 when one has none)
+    int64_t batch_slots() const;
+    /// tests: the hand-off rows (hb floats each) without a device side; `head` false leaves the last worker's rows in
+    /// last_batch_rows() instead of running the head
+    void set_batch_host(const float* hand, int64_t hb, bool head) { hand_host_ = hand; hb_ = hb; batch_head_ = head; }
+    const std::vector<float>& last_batch_rows() const { return batch_.back().rows; }
+    double ms_batch_net = 0;    ///< batch groups: from the send to a worker to its rows back, summed
+    int64_t batch_windows = 0;  ///< batch groups through the head here
+
     /// the prompt rows' width and longest chunk without a device side (init_device sets both; the tests use this)
     void set_rows_geometry(int64_t d, int64_t max_chunk);
 
@@ -131,6 +155,19 @@ private:
     KV common_;
     uint64_t ckpt_seq_ = 0;
     uint64_t req_bytes0_ = 0;   ///< bytes on all channels when the request's counters were last reset
+    struct BatchStage {
+        bool busy = false;
+        int base = 0, S = 0;
+        int64_t pos[kMaxBatchRows] = {};
+        std::chrono::steady_clock::time_point t0;
+        std::vector<uint8_t> enc, in;
+        std::vector<float> rows;   ///< the worker's reply, decoded (the next worker's input)
+    };
+    std::vector<BatchStage> batch_;
+    int32_t batch_out_[kMaxBatchRows] = {};
+    bool batch_head_ = true;
+    std::vector<strata::kernels::SamplerParams> slot_sp_;
+    bool head_logits(int T, std::string& err);
     std::string calib_path_, calib_key_;
     std::vector<double> calib_pred_;
     SplitCalib calib_;
