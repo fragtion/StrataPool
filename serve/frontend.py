@@ -453,6 +453,22 @@ CALL_END = "</tool_call>"
 PARAM_END = "</parameter>"
 FUNC_START = "<function="
 FUNC_END = "</function>"
+FUNC_START = "<function="
+FENCES = ("```", "~~~")
+
+
+def _lines(state: tuple[bool, str], text: str) -> tuple[bool, str]:
+    """Follow the reasoning text line by line: (inside a ``` or ~~~ fence, the start of the current line so far)."""
+    fence, line = state
+    parts = text.split("\n")
+    for k, part in enumerate(parts):
+        if len(line) < 16:
+            line = (line + part)[:16]
+        if k < len(parts) - 1:              # the line ended
+            if line.lstrip().startswith(FENCES):
+                fence = not fence
+            line = ""
+    return fence, line
 
 
 def param_end(text: str, final: bool = False) -> int:
@@ -608,6 +624,11 @@ class OutputParser:
         self.refused = 0             # declared calls kept as reasoning text (quoted, or the turn was cut)
         self.fence, self.line, self.ticks = "", "", 0
         self._reset_scan()
+        # A tool call written inside the thinking, without </think> first (seen with Qwen3.8-Flash-Next): ends the
+        # thinking implicitly (vLLM PR #35687 does the same).  Only a real call does - see _implicit_call.
+        self.implicit_ends = 0       # how many times this reply did that (the server logs and counts them)
+        self.implicit_open = False   # the call being read began inside the thinking
+        self.rstate = (False, "")    # _lines() of the reasoning already emitted
 
     def _track(self, text: str) -> str:
         """Follow the reasoning text that has gone out: the open code fence, the current line, and the backticks of
@@ -774,6 +795,31 @@ class OutputParser:
                     best = max(best, n)
         return best
 
+    def _implicit_call(self) -> tuple[int, bool]:
+        """Where a tool call starts inside the reasoning in self.buf: (position of its <tool_call>, whether it is
+        sure), or (-1, False).  The criterion, so that a call the model only writes ABOUT stays reasoning:
+          * <tool_call> at the start of a line (right after a newline, or as the first text of the thinking): one
+            quoted in a sentence or in `backticks` is not;
+          * not inside a ``` or ~~~ code block of the reasoning;
+          * followed, after only whitespace, by <function= (the start of a real call's body).
+        Not sure (False): the text after it is still only whitespace or part of <function= - hold it back."""
+        state, done, at = self.rstate, 0, self.buf.find(CALL_START)
+        while at >= 0:
+            state = _lines(state, self.buf[done:at])
+            done = at
+            if state == (False, ""):                    # a line start, outside a code block
+                rest = self.buf[at + len(CALL_START):].lstrip(" \t\r\n")
+                if rest.startswith(FUNC_START):
+                    return at, True
+                if FUNC_START.startswith(rest):          # also "": nothing after it yet
+                    return at, False
+            at = self.buf.find(CALL_START, at + 1)
+        return -1, False
+
+    def _reasoning(self, text: str) -> Event:
+        self.rstate = _lines(self.rstate, text)
+        return Event("reasoning", text)
+
     def feed(self, delta: str) -> list[Event]:
         self.buf += delta
         out: list[Event] = []
@@ -830,25 +876,25 @@ class OutputParser:
                         out += self._release(False)
                     continue
                 i = self.buf.find(THINK_END)
-                tool = self.buf.find(CALL_START) if self.schemas else -1
-                if tool >= 0 and (i < 0 or tool < i):
-                    if tool:
-                        out.append(Event("reasoning", self._track(self.buf[:tool])))
-                    if self._opener_ok():
-                        self.buf = self.buf[tool:]
-                        self.state = "rcall"
-                    else:                            # mid-sentence, in a fence or in inline code: a quote
-                        out.append(Event("reasoning", self._track(CALL_START)))
-                        self.buf = self.buf[tool + len(CALL_START):]
+                c, sure = self._implicit_call()
+                if c >= 0 and (i < 0 or c < i):
+                    if c:
+                        out.append(self._reasoning(self.buf[:c]))
+                    self.buf = self.buf[c:]
+                    if not sure:
+                        return out
+                    self.buf = self.buf[len(CALL_START):]
+                    self.state, self.implicit_open = "call", True
+                    self.implicit_ends += 1
                     continue
                 if i < 0:
-                    keep = self._hold(self.buf, (THINK_END, CALL_START) if self.schemas else (THINK_END,))
+                    keep = self._hold(self.buf, (THINK_END, CALL_START))
                     if len(self.buf) > keep:
-                        out.append(Event("reasoning", self._track(self.buf[:len(self.buf) - keep])))
+                        out.append(self._reasoning(self.buf[:len(self.buf) - keep]))
                         self.buf = self.buf[len(self.buf) - keep:]
                     return out
                 if i:
-                    out.append(Event("reasoning", self._track(self.buf[:i])))
+                    out.append(self._reasoning(self.buf[:i]))
                 self.buf = self.buf[i + len(THINK_END):]
                 self.state, self.lead = "content", True
                 self.fence, self.line, self.ticks = "", "", 0     # the answer's own text starts here
@@ -920,7 +966,7 @@ class OutputParser:
                     call.id = self.scall.id
                 out.append(Event("tool_call", call=call))
                 self._reset_scan()
-                self.state, self.lead = "content", True
+                self.state, self.lead, self.implicit_open = "content", True, False
 
     def finish(self, reason: str | None = None) -> list[Event]:
         """End of generation: flush whatever is held (an unterminated tool call is returned as content; one that was
@@ -938,8 +984,9 @@ class OutputParser:
             self._reset_scan()
             return out
         if self.buf:
-            # an unfinished call inside the reasoning (#804) is reasoning text, never a call
-            kind = {"reasoning": "reasoning", "rcall": "reasoning", "content": "content"}.get(self.state, "content")
+            kind = {"reasoning": "reasoning", "content": "content"}.get(self.state, "content")
+            if self.state == "call" and self.implicit_open:     # an implicit call never finished: still thinking
+                kind = "reasoning"
             text = self.buf if self.state != "call" else CALL_START + self.buf
             out.append(Event(kind, text))
             self.buf = ""
