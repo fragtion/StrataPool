@@ -555,6 +555,15 @@ void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0;
 int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
+uint64_t qsa_kv_host_layer_bytes(const ModelGeometry& g, int64_t max_cells, int64_t kv_resident) {
+    if (kv_resident <= 0 || kv_resident >= max_cells || g_kv_hybrid) return 0;   // as kv_plan: all of it in VRAM
+    const QsaShapes s = qsa_shapes(g);
+    const int64_t pages = (max_cells + s.page_size - 1) / s.page_size;
+    const int64_t r = (std::max(kv_resident, qsa_kv_resident_min()) + s.page_size - 1) / s.page_size;
+    if (r >= pages) return 0;
+    const int fmt = g_kv_q4 ? strata::kernels::kKvQ4 : g_kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
+    return (uint64_t) pages * strata::kernels::kv_block_bytes(s, fmt) + 4 * 256;
+}
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);

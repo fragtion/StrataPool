@@ -146,6 +146,12 @@ VRAM, and their part of the context (KV and state). A worker leaves out the embe
 coordinator leaves out the workers' layers. So the VRAM that the other layers' dense weights would take goes to
 experts instead, and the pool as a whole caches more of them than any one PC.
 
+With `--kv-resident` (KV streaming) each PC also keeps a full copy of its layers' K/V in pinned RAM, one per session:
+the main one, plus one per chat slot when **Several chats at once** is on. The automatic split counts those copies
+next to the experts when it checks a PC's RAM. On Windows it also keeps a PC's experts and K/V copies under about half
+its RAM, less 2 GiB, because that is roughly what Windows lets a program pin (a 32 GB laptop failed at about 14 GiB
+and ran at 12.7). Set `STRATA_POOL_PIN_GIB=<n>` in a PC's config `env` to give its own limit, or `=0` for none.
+
 ## The split learns from its timings
 
 After each request the coordinator's log splits a decode window into its parts:
@@ -162,7 +168,9 @@ context, the KV format, the window, and the PCs' names. After 200 windows, the n
 the measured numbers instead of the estimate. One split's numbers cannot tell a PC's own layer time from what its
 cache misses cost, so the search moves at most 3 layers from a split it measured; each split it tries is measured in
 turn. It moves workers that still hold their layers only when the measured numbers say the new split is at least 5%
-faster (they reload once, a minute or two). Delete the file to
+faster (they reload once, a minute or two). If a worker cannot load a split the measured numbers chose (it ran
+out of memory on the way), the file notes it (`failed=`), and later automatic splits give that worker less than it
+had there. Delete the file to
 start again from the estimate, or set `STRATA_POOL_CALIB=0` in the config's `env` to turn it off
 (`STRATA_POOL_CALIB=<file>` keeps it elsewhere).
 

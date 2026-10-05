@@ -2416,6 +2416,19 @@ int main(int argc, char** argv) {
     pool_fp.pack = std::filesystem::path(o.pack).filename().string();
     pool_fp.engine = STRATA_VERSION;
     // a worker's HELLO: the model it has, what its GPU and RAM can take, and what it has loaded already
+    // what a pool node may pin for its experts and K/V copies (the split search's limit; 0: none).  Windows pins
+    // about half of the RAM in all - a 32 GB laptop failed at ~14 GiB of experts + K/V and ran at ~12.7 - less ~2 GiB
+    // for the other pinned buffers (the prompt rows, the staging ring).  STRATA_POOL_PIN_GIB=<n> sets it, =0 no limit.
+    auto pool_pin_room = [](int64_t ram_total) -> int64_t {
+        if (const char* v = std::getenv("STRATA_POOL_PIN_GIB"); v != nullptr && *v)
+            return std::atof(v) > 0 ? (int64_t) (std::atof(v) * 1073741824.0) : 0;
+#ifdef _WIN32
+        return ram_total > 0 ? std::max<int64_t>(ram_total / 2 - ((int64_t) 2 << 30), (int64_t) 1 << 30) : 0;
+#else
+        (void) ram_total;
+        return 0;
+#endif
+    };
     auto pool_hello = [&]() -> strata::pool::KV {
         strata::pool::KV h = pool_fp.to_kv();
         h.set("proto", (int64_t) strata::pool::kProtocol);
@@ -2441,6 +2454,8 @@ int main(int argc, char** argv) {
         h.set("ram_total", (int64_t) rt);
         h.set("ram_avail", (int64_t) first_avail);
         h.set("reserve_mib", (int64_t) o.vram_reserve_mib);
+        h.set("kv_resident", o.kv_resident);   // its own --kv-resident: the pinned K/V copies its range will take
+        h.set("pin_room", pool_pin_room((int64_t) rt));
         if (!pool_loaded.empty()) {
             h.set("loaded", (int64_t) 1);
             for (const char* k : {"lb", "le", "max_context", "kv", "spec", "batch"}) h.set(std::string("loaded_") + k, pool_cfg.str(k));
@@ -2556,6 +2571,8 @@ int main(int argc, char** argv) {
     // ---- POOL: the coordinator places the split - the multi-GPU search's cost model across PCs, with each
     // node's RAM holding only its own range's experts, and a network hop per stage boundary
     std::vector<int64_t> pool_at;
+    std::string pool_untried_path, pool_untried_key;   // set when the split is a measured one no request ran with
+    strata::pool::SplitCalib pool_untried_calib;
     if (pool_coord) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         strata::pool::SplitModel sm;
@@ -2580,6 +2597,10 @@ int main(int argc, char** argv) {
             // its own session, and one per batch slot (--batch: each PC carves them for its range)
             return (int64_t) strata::core::session_bytes(g, o.max_context, K, lb, le) * (1 + std::max(o.batch, 0)) + d;
         };
+        // --kv-resident: each of those sessions also keeps its QSA layers' whole K/V in pinned RAM (KV streaming),
+        // beside the node's experts - with --batch 2 that is three copies (the laptop that ran out at split 28)
+        for (int64_t l = 0; l < g.n_layers; ++l) sm.layer_kv.push_back(strata::core::is_qsa_layer(g, l) ? 1 : 0);
+        sm.kv_copies = 1 + std::max(o.batch, 0);
         if (const char* v = std::getenv("STRATA_SPLIT_MISS_MS")) sm.miss_ms = std::atof(v);
         if (const char* v = std::getenv("STRATA_POOL_HOP_MS")) sm.hop_ms = std::atof(v);
         auto per_layer_ms = [](int64_t sms, int64_t khz) {
@@ -2604,6 +2625,8 @@ int main(int argc, char** argv) {
             if (cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, 0) != cudaSuccess || khz <= 0) khz = 1800000;
             cudaGetLastError();
             me.layer_ms = per_layer_ms(sms, khz);
+            me.kv_host_layer = (int64_t) strata::core::qsa_kv_host_layer_bytes(g, o.max_context, o.kv_resident);
+            me.pin_room = pool_pin_room((int64_t) rt);
             nodes.push_back(me);
         }
         for (const strata::pool::WorkerInfo& w : pool_link.workers()) {
@@ -2614,6 +2637,10 @@ int main(int argc, char** argv) {
             const int64_t ra = w.hello.i64("ram_avail", 0);
             n.ram_room = ra > 0 ? std::max<int64_t>(ra - headroom, 1) : 0;
             n.layer_ms = per_layer_ms(w.hello.i64("sms", 0), w.hello.i64("khz", 1800000));
+            // (a worker older than this field: priced as streaming like this PC - the safer guess)
+            n.kv_host_layer = o.kv == "k8v4" ? 0 : (int64_t) strata::core::qsa_kv_host_layer_bytes(
+                g, o.max_context, w.hello.i64("kv_resident", o.kv_resident));
+            n.pin_room = w.hello.i64("pin_room", 0);
             nodes.push_back(n);
         }
         // the measured split: what this pool measured with earlier splits (SplitCalib), per model, settings and nodes.
@@ -2629,7 +2656,14 @@ int main(int argc, char** argv) {
         for (char& c : calib_key)
             if (c == '\t' || c == '\n' || c == '\r') c = ' ';
         strata::pool::SplitCalib calib;
-        if (!calib_path.empty() && strata::pool::load_calib(calib_path, calib_key, calib) && calib.usable(nodes.size())) {
+        if (!calib_path.empty()) strata::pool::load_calib(calib_path, calib_key, calib);
+        sm.failures = &calib;   // splits a worker could not load: skipped whether or not the timings are usable yet
+        if (!calib.failed.empty())
+            std::fprintf(stderr, "strata pool: a worker could not load split%s %s before: the automatic split gives "
+                                 "it less than that (delete %s to try again)\n", calib.failed.size() > 1 ? "s" : "",
+                         [&] { std::string t; for (const std::string& f : calib.failed) t += (t.empty() ? "" : ", ") + f;
+                               return t; }().c_str(), calib_path.c_str());
+        if (calib.usable(nodes.size())) {
             sm.calib = &calib;
             std::string sc;
             for (size_t i = 0; i < calib.scale.size(); ++i) sc += (i ? ", " : "") + std::to_string(calib.scale[i]).substr(0, 4);
@@ -2688,11 +2722,15 @@ int main(int argc, char** argv) {
                              "the pool's GPUs hold ~%lld of %zu profiled experts (~%.1f%% of the routed mass)\n",
                      ks.c_str(), (long long) (pool_at[0] - 1), plan.ms, plan.measured ? " (measured)" : "",
                      (long long) plan.held, sm.profile.size(), 100.0 * plan.mass);
-        for (size_t i = 0; i < nodes.size(); ++i)
-            std::fprintf(stderr, "strata pool:   %-22s layers %2lld-%2lld, ~%lld experts in VRAM, %.1f GiB of experts in RAM\n",
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            char kvs[64] = "";
+            if (plan.node_kv[i] > 0)
+                std::snprintf(kvs, sizeof kvs, " + %.1f GiB of pinned K/V", (double) plan.node_kv[i] / 1073741824.0);
+            std::fprintf(stderr, "strata pool:   %-22s layers %2lld-%2lld, ~%lld experts in VRAM, %.1f GiB of experts in RAM%s\n",
                          nodes[i].name.c_str(), (long long) (i == 0 ? 0 : pool_at[i - 1]),
                          (long long) ((i + 1 < nodes.size() ? pool_at[i] : g.n_layers) - 1),
-                         (long long) plan.node_slots[i], (double) plan.node_arena[i] / 1073741824.0);
+                         (long long) plan.node_slots[i], (double) plan.node_arena[i] / 1073741824.0, kvs);
+        }
         strata::pool::KV common;
         common.set("max_context", o.max_context);
         common.set("kv", o.kv);
@@ -2716,6 +2754,17 @@ int main(int argc, char** argv) {
         // each request's timings refine the measured split for the next start (the model's own prediction per node
         // for this placement is what they are compared with)
         if (!calib_path.empty()) pool_link.set_calibration(calib_path, calib_key, plan.node_pred, calib);
+        // a split the measured timings chose and no request ran with yet: if a worker cannot load it (its RAM runs
+        // out on the way), the next start must not choose it again (below, after wait_ready)
+        if (o.pool_split == "auto" && plan.measured && !calib_path.empty()) {
+            std::string k;
+            for (size_t i = 0; i < pool_at.size(); ++i) k += (i ? "," : "") + std::to_string(pool_at[i]);
+            if (std::find(calib.seen.begin(), calib.seen.end(), k) == calib.seen.end()) {
+                pool_untried_path = calib_path;
+                pool_untried_key = calib_key;
+                pool_untried_calib = calib;
+            }
+        }
         node_le = pool_at[0];
         std::printf("POOL SPLIT %s\n", ks.c_str());
         std::fflush(stdout);
@@ -5141,6 +5190,13 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata pool: waiting for the workers to finish loading their layers ...\n");
             if (!pool_link.wait_ready(o.pool_wait_s, err)) {
                 std::fprintf(stderr, "strata pool: %s\n", err.c_str());
+                if (!pool_untried_path.empty() && err.find("did not get ready") != std::string::npos) {
+                    pool_untried_calib.add_failed(pool_at);
+                    std::string se;
+                    if (strata::pool::save_calib(pool_untried_path, pool_untried_key, pool_untried_calib, se))
+                        std::fprintf(stderr, "strata pool: noted in %s: the next start gives the workers less than "
+                                             "this split\n", pool_untried_path.c_str());
+                }
                 return 1;
             }
             pool_chunk_cap = pool_link.max_chunk();
