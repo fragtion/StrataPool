@@ -70,6 +70,78 @@ struct RowCache {
     }
 };
 
+/// Page-granular cache: keyed by 4 KiB page, holding the whole page.
+///
+/// This replaces the row cache for the reason above - a row cache throws away 44 of every 45 rows it pays
+/// to read. Memory is still expressed in ROWS by the CLI, so a configured budget reserves the same bytes;
+/// what those bytes buy is pages instead of individual rows.
+///
+/// `find_row` returns a pointer INTO the cached page, or nullptr when any page the row touches is absent.
+/// A row can straddle a boundary, and a partial hit is not offered: the caller memcpy's row_bytes straight
+/// out of the pointer, so a half-resident row would be a silently wrong answer rather than a miss.
+struct PageCache {
+    uint64_t sets = 0;
+    std::vector<uint32_t> keys;     ///< sets * WAYS, EMPTY = vacant
+    std::vector<uint8_t> data;      ///< sets * WAYS * PAGE
+    std::vector<uint8_t> next;
+    uint64_t used = 0;
+    uint32_t row_bytes = ROW_BYTES;
+    uint64_t table_offset = 0;
+
+    void init(uint64_t pages, uint32_t rb, uint64_t toff) {
+        sets = pages / WAYS;
+        row_bytes = rb;
+        table_offset = toff;
+        keys.assign(sets * WAYS, EMPTY);
+        data.assign(sets * WAYS * PAGE, 0);
+        next.assign(sets, 0);
+        used = 0;
+    }
+    static uint64_t mix(uint64_t r) {
+        uint64_t x = r * 0x9E3779B97F4A7C15ull;
+        return x ^ (x >> 29);
+    }
+    const uint8_t* page(uint64_t p) const {
+        if (sets == 0) return nullptr;
+        const uint64_t s = mix(p) % sets;
+        for (uint32_t w = 0; w < WAYS; ++w)
+            if (keys[s * WAYS + w] == p) return &data[(size_t)(s * WAYS + w) * PAGE];
+        return nullptr;
+    }
+    /// A pointer to the row, or nullptr if the row cannot be served from cache.
+    ///
+    /// A row that SPANS a page boundary is deliberately never served from here, even when both of its
+    /// pages are resident. The two pages live in unrelated slots of a set-associative cache, so they are
+    /// not adjacent in memory, and the caller memcpy's row_bytes straight out of the pointer we return:
+    /// returning the first page's base plus the in-page offset would hand back the head of the row from
+    /// the right page and its tail from unrelated memory. That is silent corruption rather than a miss.
+    ///
+    /// The cost is small and bounded: a row straddles when its 90 bytes cross a 4096 boundary, which is
+    /// 90/4096 = 2.2% of rows. Those rows simply always re-read, which is what happened before this cache
+    /// existed. Correctness is not worth trading for 2% of rows.
+    const uint8_t* find_row(uint32_t row) const {
+        if (sets == 0) return nullptr;
+        const uint64_t at = table_offset + (uint64_t) row * row_bytes;
+        const uint64_t first = at / PAGE;
+        const uint64_t last = (at + row_bytes - 1) / PAGE;
+        if (last != first) return nullptr;             // straddles: would need two adjacent slots
+        const uint8_t* base = page(first);
+        if (!base) return nullptr;
+        return base + size_t(at - first * PAGE);
+    }
+    void insert_page(uint64_t p, const uint8_t* bytes) {
+        if (sets == 0) return;
+        const uint64_t s = mix(p) % sets;
+        for (uint32_t w = 0; w < WAYS; ++w)
+            if (keys[s * WAYS + w] == p) return;
+        const uint32_t w = next[s];
+        next[s] = (uint8_t) ((w + 1) % WAYS);
+        if (keys[s * WAYS + w] == EMPTY) ++used;
+        keys[s * WAYS + w] = (uint32_t) p;
+        std::memcpy(&data[(size_t)(s * WAYS + w) * PAGE], bytes, PAGE);
+    }
+};
+
 struct Use {
     uint32_t row;
     uint32_t in_page;      // byte offset of the row inside the read buffer
@@ -108,7 +180,7 @@ struct PleReader::Impl {
     std::deque<Job> queue;                // not yet submitted
     std::unordered_map<uint32_t, TicketState> tickets;
     uint32_t next_ticket = 1;
-    RowCache cache;
+    PageCache cache;
     ReaderStats stats;
     size_t ring_pos = 0;
     double delay_us = 0;
@@ -238,10 +310,12 @@ struct PleReader::Impl {
                 return false;
             }
         }
-        for (const Use& u : j.uses) {
-            std::memcpy(u.dst, buf + u.in_page, row_bytes);
-            cache.insert(u.row, buf + u.in_page);
-        }
+        for (const Use& u : j.uses) std::memcpy(u.dst, buf + u.in_page, row_bytes);
+        // Retain every page the read touched, not just the rows that were asked for. j.offset is an
+        // ALIGNED FILE offset and c.bytes is PAGE or 2*PAGE, so this walks the pages the job covered -
+        // which is what makes a later request for a DIFFERENT row of the same page a hit.
+        for (uint32_t off = 0; off < c.bytes; off += PAGE)
+            cache.insert_page((j.offset + off) / PAGE, buf + off);
         auto it = tickets.find(j.ticket);
         if (it != tickets.end() && it->second.pending > 0) --it->second.pending;
         j.uses.clear();
@@ -352,7 +426,11 @@ bool PleReader::open(const std::string& path, uint64_t table_offset, uint64_t n_
     impl_->inflight.assign(max_inflight, Job{});
     impl_->free_slots.clear();
     for (uint32_t s = max_inflight; s-- > 0;) impl_->free_slots.push_back(s);
-    impl_->cache.init(cache_rows, row_bytes);
+    // The budget is in ROWS (--ple-row-cache), but the cache is now page-granular, so convert. Same bytes
+    // reserved, different thing bought: ~23k pages holding ~1.05M rows, instead of ~1M rows reached one
+    // 4 KiB read at a time.
+    const uint64_t cache_pages = cache_rows * row_bytes / PAGE;
+    impl_->cache.init(cache_pages, row_bytes, table_offset);
     impl_->error.clear();
     impl_->keep_us = 0;
     impl_->last_issue_us = impl_->last_read_us = 0;
@@ -408,7 +486,9 @@ void PleReader::close() {
     m.delayed.clear();
     m.inflight.clear();
     m.free_slots.clear();
-    m.cache.init(0);
+    // m.row_bytes, not the bare name: close() is a member function, so `row_bytes` resolves to the class's
+    // `row_bytes()` member function rather than the opened reader's per-table row width.
+    m.cache.init(0, m.row_bytes, m.table_offset);
     m.threaded = false;
     m.stop = false;
     m.keep_us = 0;
@@ -438,7 +518,7 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
             std::memset(dst, 0, rb);
             continue;
         }
-        if (const uint8_t* hit = m.cache.find(rows[i])) {
+        if (const uint8_t* hit = m.cache.find_row(rows[i])) {
             std::memcpy(dst, hit, rb);
             ++m.stats.cache_hits;
             continue;
