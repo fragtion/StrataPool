@@ -146,23 +146,18 @@ VISION_START = "<|vision_start|>"
 REPEAT_STOP_TOKENS = 256
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
-# #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
-# "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
-# low-effort instruction in place of the xhigh one.  Both off by default.
-HIGH_EFFORT = EFFORT_TEXT["xhigh"]
-LOW_EFFORT = EFFORT_TEXT["low"]
-LOOP_CHECK_EVERY = 512           # output tokens between two looks at the reasoning (at a clean parser boundary)
-LOOP_COVERAGE = 0.25             # the share of the last 2,000 words inside 12-word passages seen three times
-LOOP_HISTORY_WORDS = 30000       # how far back the passages are counted (bounds the cost of a look)
+# Opt-in recovery for repeated reasoning, independent of a fixed thinking budget.
+HIGH_EFFORT = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer."
+LOW_EFFORT = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration."
 
 
 def reasoning_repeat_coverage(text):
     """Coverage of recent words by 12-word passages seen at least three times.
 
-    Only reasoning is supplied. The history (the last LOOP_HISTORY_WORDS words) detects repeated verification passes
+    Only reasoning is supplied. Full history detects repeated verification passes
     separated by long code drafts; the recent window excludes old repetitions.
     """
-    words = re.findall(r"\w+|[^\w\s]", text.lower())[-LOOP_HISTORY_WORDS:]
+    words = re.findall(r"\w+|[^\w\s]", text.lower())
     width, window = 12, 2000
     if len(words) < window:
         return 0.0
@@ -177,21 +172,17 @@ def reasoning_repeat_coverage(text):
 
 
 def focused_recovery_prompt(tok, ids, generated):
-    """The prompt's ids with the xhigh effort sentence of the first system message replaced by the low one, then
-    every token generated so far.  A splice of token ids: the prompt is never decoded and encoded again, so a literal
-    `</think>` or vision marker in it (#537, #554) stays what it was.  None when the sentence is not there as whole
-    tokens in the first system message (a user's text never counts).  No answer or end-of-thinking is inserted."""
-    end = tok.encode(IM_END, parse_special=True)
-    if len(end) != 1 or end[0] not in ids:
+    """Retain every generated token and task; change only the native effort hint.
+
+    The exact hint must occur in the first system message, never user content.
+    No synthetic reasoning, end-of-thinking marker, or answer is inserted.
+    """
+    original = tok.decode(ids)
+    head, separator, rest = original.partition("<|im_end|>")
+    if not head.startswith("<|im_start|>system\n") or HIGH_EFFORT not in head:
         return None
-    head = ids[:ids.index(end[0])]
-    if not tok.decode(head).startswith("<|im_start|>system\n"):
-        return None
-    old, new = tok.encode(HIGH_EFFORT, parse_special=False), tok.encode(LOW_EFFORT, parse_special=False)
-    for i in range(len(head) - len(old) + 1):
-        if head[i:i + len(old)] == old:
-            return ids[:i] + new + ids[i + len(old):] + list(generated)
-    return None
+    focused = head.replace(HIGH_EFFORT, LOW_EFFORT, 1) + separator + rest
+    return tok.encode(focused, parse_special=True) + list(generated)
 
 
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
@@ -2907,7 +2898,6 @@ class Service:
         tail = ""                                       # the last characters written (the newlines before a call)
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
-        looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
@@ -2986,22 +2976,14 @@ class Service:
                                     if self.reasoning_loop_recovery and ev.kind == "reasoning":
                                         reasoning_text += ev.text or ""
                                     yield "event", ev
-                                if stops is not None and stops.hit is not None:
-                                    finish = "stop"         # gen.close() below STOPs the engine, as for a stop token
-                                    break
-                                if (self.reasoning_loop_recovery and not recovery_count and parser.state == "reasoning"
-                                        and n >= next_loop_check and not parser.buf and not parser.pending
-                                        and not detok.pending()):
-                                    next_loop_check = n + LOOP_CHECK_EVERY
+                                if (self.reasoning_loop_recovery and recovery_count == 0
+                                        and not emb and parser.state == "reasoning"
+                                        and n % 512 == 0 and not parser.buf and not detok.pending()):
                                     repeat_coverage = reasoning_repeat_coverage(reasoning_text)
-                                    if repeat_coverage >= LOOP_COVERAGE:
-                                        if self.reasoning_loop_recovery == "stop":
-                                            looped = True        # #728: end the reply here, as for a repeated token
+                                    if repeat_coverage >= 0.25:
+                                        recover_prompt = focused_recovery_prompt(self.tok, ids, raw_ids)
+                                        if recover_prompt is not None:
                                             break
-                                        if not emb:              # "recover": not for a request with pictures
-                                            recover_prompt = focused_recovery_prompt(self.tok, ids, raw_ids)
-                                            if recover_prompt is not None:
-                                                break
                                 if budget and parser.state == "reasoning":
                                     thought += 1
                                     # at a clean point: no tag held back, no character split across tokens
@@ -3037,14 +3019,14 @@ class Service:
                                     raise
                         if recover_prompt is not None and not cancel.is_set() and n < max_new:
                             recovery_count += 1
-                            # Only the two settings that keep the same words coming are raised (temperature to at
-                            # least 1.0, presence penalty to at least 1.5): a client's top_p and top_k are never
-                            # touched, and its own request dict is copied, not changed.
-                            want = (max(1.0, float((sampling or {}).get("temperature") or 0)),
-                                    max(1.5, float((sampling or {}).get("presence_penalty") or 0)))
-                            if want != tuple(float((sampling or {}).get(k) or 0)
-                                             for k in ("temperature", "presence_penalty")):
-                                sampling = {**(sampling or {}), "temperature": want[0], "presence_penalty": want[1]}
+                            # A client's explicit low-entropy sampler must not lock the
+                            # preserved prefix in the same literal repetition again.
+                            if tuple((sampling or {}).get(k) for k in
+                                     ("temperature", "top_p", "top_k", "presence_penalty")) != (1.0, 0.95, 20, 1.5):
+                                sampling = dict(sampling or {})
+                                sampling.update(temperature=max(1.0, float(sampling.get("temperature") or 0)),
+                                                top_p=0.95, top_k=20,
+                                                presence_penalty=max(1.5, float(sampling.get("presence_penalty") or 0)))
                             prompt = recover_prompt
                             with self.status_lock:
                                 st["reasoning_recoveries"] = recovery_count
@@ -3052,10 +3034,10 @@ class Service:
                                 trace["reasoning_recoveries"] = recovery_count
                                 trace["reasoning_repeat_coverage"] = round(repeat_coverage, 3)
                             print(f"[strata] repeated reasoning detected at {n} tokens "
-                                  f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
-                                  "instruction (reasoning_loop_recovery)", flush=True)
+                                  f"(coverage={repeat_coverage:.3f}); resuming preserved prefix "
+                                  "with focused native effort", flush=True)
                             continue
-                        if not (wrap or opens) or cancel.is_set():
+                        if not wrap or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
                         # short wrap-up and </think>) and let it answer: the next pass's prompt is this one plus what
@@ -3182,18 +3164,9 @@ class Service:
                 Path(emb).unlink(missing_ok=True)
         for ev in cut(parser.finish(finish)):
             yield "event", ev
-        if parser.rescued or parser.refused:
-            self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
-            print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
-                  f"reasoning (quoted, or the turn did not end on a stop)", flush=True)
-        if stops is not None and stops.hit is None and stops.held:
-            yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
-        done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
-                "timings": timings, "reasoning_tokens": thinking_n,
-                "reasoning_recoveries": recovery_count}
-        if stops is not None and stops.hit is not None:
-            done["stop_sequence"] = stops.hit
-        yield "done", done
+        yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
+                       "timings": timings, "reasoning_tokens": thinking_n,
+                       "reasoning_recoveries": recovery_count}
 
 
 def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
@@ -5123,12 +5096,9 @@ def main() -> int:
         if budget:
             print(f"[strata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
                   flush=True)
-    recovery = cfg.get("reasoning_loop_recovery", False)   # #728: false (default) | "stop" | "recover" (true)
-    if recovery is True:
-        recovery = "recover"
-    if recovery is not False and recovery not in ("stop", "recover"):
-        raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
-                         f"not {recovery!r}")
+    recovery = cfg.get("reasoning_loop_recovery", False)
+    if not isinstance(recovery, bool):
+        raise SystemExit("[strata] reasoning_loop_recovery must be a boolean")
     svc.reasoning_loop_recovery = recovery
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)

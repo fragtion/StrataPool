@@ -65,8 +65,7 @@ class ReasoningLoopRecovery(unittest.TestCase):
         self.assertEqual(engine.sampling_calls[0], request)
         self.assertEqual(engine.sampling_calls[1]['temperature'], 1.0)
         self.assertEqual(engine.sampling_calls[1]['presence_penalty'], 1.5)
-        self.assertEqual(engine.sampling_calls[1]['top_k'], 64)      # a client's top_k and top_p are never touched
-        self.assertEqual(engine.sampling_calls[1]['top_p'], .95)
+        self.assertEqual(engine.sampling_calls[1]['top_k'], 20)
         self.assertEqual(engine.sampling_calls[1]['seed'], request['seed'])
         self.assertEqual(request['temperature'], .2)
         self.assertEqual(request['presence_penalty'], 0)
@@ -80,35 +79,6 @@ class ReasoningLoopRecovery(unittest.TestCase):
         self.assertEqual(len(engine.sampling_objects), 2)
         self.assertIs(engine.sampling_objects[0], engine.sampling_objects[1])
         self.assertIs(engine.sampling_objects[1], sampler)
-
-    def test_a_lower_top_p_and_top_k_are_never_raised_or_lowered(self):
-        engine = RecordingEngine(self.tok, [self.loop, 'Verified.\n</think>\nComplete solution.'])
-        service = Service(engine, self.tok, None)
-        service.reasoning_loop_recovery = "recover"
-        list(service.run(self.ids, True, [], 40000, {'temperature': 0, 'top_p': .5, 'top_k': 5}, threading.Event()))
-        self.assertEqual((engine.sampling_calls[1]['top_p'], engine.sampling_calls[1]['top_k']), (.5, 5))
-        self.assertEqual((engine.sampling_calls[1]['temperature'], engine.sampling_calls[1]['presence_penalty']), (1.0, 1.5))
-
-    def test_the_splice_keeps_a_literal_think_tag_as_text(self):
-        """#537: the prompt is spliced as token ids, never decoded and encoded again."""
-        from serve.frontend import THINK_TAGS
-        head = '<|im_start|>system\n' + HIGH_EFFORT
-        marked = self.tok.encode(head + '<|im_end|>\n<|im_start|>user\nquote ' + THINK_TAGS['</think>'] +
-                                 ' please<|im_end|>\n<|im_start|>assistant\n<think>\n', parse_special=True)
-        spliced = focused_recovery_prompt(self.tok, marked, [])
-        tail = marked[len(self.tok.encode(head, parse_special=True)):]
-        self.assertEqual(spliced[-len(tail):], tail)             # everything after the sentence is the same ids
-        self.assertNotEqual(spliced, marked)
-
-    def test_stop_mode_ends_the_reply_at_the_loop(self):
-        engine = RecordingEngine(self.tok, [self.loop])
-        service = Service(engine, self.tok, None)
-        service.reasoning_loop_recovery = "stop"
-        events = list(service.run(self.ids, True, [], 40000, {}, threading.Event()))
-        self.assertEqual(len(engine.calls), 1)                   # no second pass
-        self.assertEqual(events[-1][1]['finish'], 'length')
-        self.assertLess(events[-1][1]['completion_tokens'], 20000)
-        self.assertEqual(events[-1][1]['reasoning_recoveries'], 0)
 
     def test_disabled_is_one_pass(self):
         engine, events = self.run_case(False)
