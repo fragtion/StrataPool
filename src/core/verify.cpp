@@ -1390,6 +1390,7 @@ void Verifier::collect_profile() {
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
     using namespace strata::kernels;
+    const auto run_t0 = std::chrono::steady_clock::now();   // POOL: this stage's share of the window (stage_ms)
     const OnDevice on_device(device_);
     last_batch_ = false;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
@@ -1547,6 +1548,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         ++windows;
         if (link_ != nullptr) {             // POOL: the rest of the model is on other PCs
             progress_at("verify window: the pool's workers", (int64_t) T);
+            link_->stage_ms(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - run_t0).count());
             return link_->run(T, tokens, pos0, out, err);
         }
         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);

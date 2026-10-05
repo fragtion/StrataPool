@@ -303,6 +303,78 @@ static void test_split() {
     CHECK(!one.ok);
 }
 
+static void test_measured_split() {
+    SplitModel m;
+    m.n_layers = 48;
+    for (int r = 0; r < 12288; ++r) m.profile.push_back({(int32_t) (r % 48), (int32_t) (r / 48)});
+    m.slot_bytes = [](int64_t) { return (int64_t) 1 << 20; };
+    m.layer_arena_bytes.assign(48, (int64_t) 1 << 28);
+    m.session_bytes = [](int64_t lb, int64_t le) { return (le - lb) * ((int64_t) 8 << 20); };
+    NodeCap a{"desktop", (int64_t) 4 << 30, (int64_t) 40 << 30, 0.5};
+    NodeCap b{"laptop", (int64_t) 3 << 30, (int64_t) 40 << 30, 0.5};
+    const SplitPlan base = auto_split(m, {a, b});
+    CHECK(base.ok && !base.measured && base.node_pred.size() == 2);
+    double sum = 0;
+    for (const double x : base.node_ms) sum += x;
+    CHECK(std::fabs(base.ms - (sum + m.hop_ms * 2.0)) < 1e-9);   // the per-node parts add up to the old total
+    // too few windows: not used
+    SplitCalib c;
+    c.add({20.0, 10.0}, {10.0, 10.0}, 12.0, 3.0, 100);
+    CHECK(!c.usable(2) && std::fabs(c.scale[0] - 2.0) < 1e-9 && std::fabs(c.fixed_ms - 12.0) < 1e-9);
+    c.add({20.0, 10.0}, {10.0, 10.0}, 12.0, 3.0, 150);
+    CHECK(c.usable(2) && !c.usable(3) && c.windows == 250);
+    // measured: the coordinator's layers cost twice the estimate, the laptop's as estimated -> the laptop gets more
+    m.calib = &c;
+    const SplitPlan cal = auto_split(m, {a, b});
+    CHECK(cal.ok && cal.measured && cal.at[0] < base.at[0]);
+    CHECK(std::fabs(cal.ms - (cal.node_ms[0] + cal.node_ms[1] + 12.0 + 3.0)) < 1e-9);
+    CHECK(std::fabs(cal.node_ms[0] - 2.0 * cal.node_pred[0]) < 1e-9);
+    // a bad measurement (a node without its own timing) changes nothing
+    SplitCalib before = c;
+    c.add({0.0, 10.0}, {10.0, 10.0}, 12.0, 3.0, 500);
+    CHECK(c.windows == before.windows && c.scale == before.scale);
+    // the file: round trip, other pools kept, the entry replaced
+    const std::string path = "strata-pool-test-calib.txt";
+    std::remove(path.c_str());
+    std::string err;
+    SplitCalib other;
+    other.add({5.0}, {10.0}, 1.0, 0.0, 300);
+    CHECK(save_calib(path, "pool A", other, err) && save_calib(path, "pool B", c, err) && save_calib(path, "pool B", c, err));
+    SplitCalib r;
+    CHECK(load_calib(path, "pool B", r) && r.windows == c.windows && r.scale.size() == 2 &&
+          std::fabs(r.scale[0] - c.scale[0]) < 1e-3 && std::fabs(r.fixed_ms - c.fixed_ms) < 1e-3);
+    CHECK(load_calib(path, "pool A", r) && r.scale.size() == 1 && !load_calib(path, "pool C", r));
+    std::remove(path.c_str());
+}
+
+static void test_rank_for_range() {
+    // 4 layers x 3 experts; prior ranks by expert then layer: (0,0) (1,0) (2,0) (3,0) (0,1) ...
+    using P = std::pair<int32_t, int32_t>;
+    std::vector<P> prior;
+    for (int e = 0; e < 3; ++e)
+        for (int l = 0; l < 4; ++l) prior.push_back({l, e});
+    // a node of layers [2, 4) learned: its resident pairs first ((3,2) (2,1)), then the rest of the whole model
+    std::vector<P> learned = {{3, 2}, {2, 1}, {2, 0}, {3, 0}, {3, 1}, {2, 2}};
+    for (int e = 0; e < 3; ++e)
+        for (int l = 0; l < 2; ++l) learned.push_back({l, e});
+    const std::vector<P> r = rank_for_range(learned, prior, 2, 4, 4, 3);
+    CHECK(r.size() == 12);
+    // layers 0 and 1 keep prior's places; layers 2-3 take prior's places of layers 2-3 in learned's order
+    const std::vector<P> want = {{0, 0}, {1, 0}, {3, 2}, {2, 1}, {0, 1}, {1, 1}, {2, 0}, {3, 0},
+                                 {0, 2}, {1, 2}, {3, 1}, {2, 2}};
+    CHECK(r == want);
+    // a whole-model node, or no prior: learned as it is
+    CHECK(rank_for_range(learned, prior, 0, 4, 4, 3) == learned);
+    CHECK(rank_for_range(learned, {}, 2, 4, 4, 3) == learned);
+    // a prior that lacks pairs: they follow at the end, every pair once
+    std::vector<P> short_prior(prior.begin(), prior.begin() + 6);
+    const std::vector<P> r2 = rank_for_range(learned, short_prior, 2, 4, 4, 3);
+    CHECK(r2.size() == 12);
+    std::vector<P> sorted = r2;
+    std::sort(sorted.begin(), sorted.end());
+    CHECK(std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end());
+}
+
 int main() {
     if (!net_init()) { std::fprintf(stderr, "no sockets\n"); return 1; }
     test_hashes();
@@ -311,6 +383,8 @@ int main() {
     test_frames();
     test_handshake();
     test_split();
+    test_rank_for_range();
+    test_measured_split();
     if (failures) { std::fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
     std::printf("strata-pool-test: all checks passed\n");
     return 0;
