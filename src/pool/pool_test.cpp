@@ -319,16 +319,32 @@ static void test_measured_split() {
     CHECK(std::fabs(base.ms - (sum + m.hop_ms * 2.0)) < 1e-9);   // the per-node parts add up to the old total
     // too few windows: not used
     SplitCalib c;
-    c.add({20.0, 10.0}, {10.0, 10.0}, 12.0, 3.0, 100);
+    c.add({20.0, 10.0}, {10.0, 10.0}, 12.0, 3.0, 100, base.at);
     CHECK(!c.usable(2) && std::fabs(c.scale[0] - 2.0) < 1e-9 && std::fabs(c.fixed_ms - 12.0) < 1e-9);
-    c.add({20.0, 10.0}, {10.0, 10.0}, 12.0, 3.0, 150);
+    c.add({20.0, 10.0}, {10.0, 10.0}, 12.0, 3.0, 150, base.at);
     CHECK(c.usable(2) && !c.usable(3) && c.windows == 250);
+    SplitCalib unseen = c;
+    unseen.seen.clear();
+    CHECK(!unseen.usable(2));   // an entry without its measured splits is not used
     // measured: the coordinator's layers cost twice the estimate, the laptop's as estimated -> the laptop gets more
     m.calib = &c;
     const SplitPlan cal = auto_split(m, {a, b});
     CHECK(cal.ok && cal.measured && cal.at[0] < base.at[0]);
     CHECK(std::fabs(cal.ms - (cal.node_ms[0] + cal.node_ms[1] + 12.0 + 3.0)) < 1e-9);
     CHECK(std::fabs(cal.node_ms[0] - 2.0 * cal.node_pred[0]) < 1e-9);
+    // measured at one split, the search stays within kTrust layers of it
+    SplitCalib near_c = c;
+    near_c.seen = {std::to_string(base.at[0])};
+    m.calib = &near_c;
+    const SplitPlan close = auto_split(m, {a, b});
+    CHECK(close.ok && close.measured && std::llabs(close.at[0] - base.at[0]) <= SplitCalib::kTrust);
+    CHECK(near_c.near({base.at[0] + 3}) && !near_c.near({base.at[0] + 4}));
+    SplitCalib far_c = c;
+    far_c.seen = {"16,32"};                   // measured with another pool's shape: the built-in estimate
+    m.calib = &far_c;
+    const SplitPlan fb = auto_split(m, {a, b});
+    CHECK(fb.ok && fb.at == base.at && !fb.measured);
+    m.calib = &c;
     // a bad measurement (a node without its own timing) changes nothing
     SplitCalib before = c;
     c.add({0.0, 10.0}, {10.0, 10.0}, 12.0, 3.0, 500);
@@ -344,6 +360,11 @@ static void test_measured_split() {
     CHECK(load_calib(path, "pool B", r) && r.windows == c.windows && r.scale.size() == 2 &&
           std::fabs(r.scale[0] - c.scale[0]) < 1e-3 && std::fabs(r.fixed_ms - c.fixed_ms) < 1e-3);
     CHECK(load_calib(path, "pool A", r) && r.scale.size() == 1 && !load_calib(path, "pool C", r));
+    SplitCalib s2;
+    s2.add({20.0, 10.0}, {10.0, 10.0}, 12.0, 3.0, 300, {33});
+    s2.add({20.0, 10.0}, {10.0, 10.0}, 12.0, 3.0, 300, {30});
+    CHECK(save_calib(path, "pool S", s2, err) && load_calib(path, "pool S", r) && r.seen.size() == 2 &&
+          r.seen[0] == "33" && r.seen[1] == "30" && r.near({27}) && !r.near({26}));
     std::remove(path.c_str());
 }
 
