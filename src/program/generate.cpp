@@ -2627,6 +2627,7 @@ int main(int argc, char** argv) {
         if (const char* v = std::getenv("STRATA_POOL_CALIB")) calib_path = (std::string(v) == "0") ? "" : v;
         std::string calib_key = "model=" + pool_fp.pack + " layers=" + std::to_string(g.n_layers) +
                                 " ctx=" + std::to_string(o.max_context) + " kv=" + o.kv + " spec=" + std::to_string(o.spec) +
+                                (o.batch > 0 ? " batch=" + std::to_string(o.batch) : std::string()) +
                                 " nodes=" + pool_node_name();
         for (const strata::pool::WorkerInfo& w : pool_link.workers())
             calib_key += "," + w.hello.str("name", w.addr) + "@" + w.addr;
@@ -6448,7 +6449,6 @@ int main(int argc, char** argv) {
                     if (!pool_ch.recv(t, msg, e, (uint64_t) 8 << 30)) { why = e; break; }
                     strata::pool::Unpacker u(msg.data(), msg.size());
                     if (t == strata::pool::Msg::Verify) {
-                        const auto tv = Clock::now();
                         int32_t T = 0;
                         int64_t pos0 = 0;
                         int32_t toks[strata::kernels::kVerifyMaxT];
@@ -6460,6 +6460,8 @@ int main(int argc, char** argv) {
                         }
                         strata::pool::decode_rows(pool_wire, u.here(), (size_t) T * (size_t) HB, pool_hand_in);
                         if (!w_refill(e)) { fail("refilling a lent slot: " + e); fatal = true; break; }
+                        // (timed from here: the refill after a prompt is the prompt's cost, not this window's)
+                        const auto tv = Clock::now();
                         apply_pending(false);
                         drive.d.layers = 0;
                         drive.d.experts = 0;
@@ -6480,7 +6482,6 @@ int main(int argc, char** argv) {
                     } else if (t == strata::pool::Msg::BatchVerify) {
                         // a pipelined batch window of the slot group [base, base + S): this PC's layers over the
                         // group's rows with the slots' own sessions (the commit runs right behind it, every row kept)
-                        const auto tv = Clock::now();
                         int32_t base = 0, S = 0;
                         int32_t toks[strata::kernels::kVerifyMaxT] = {};
                         int64_t poss[strata::kernels::kVerifyMaxT] = {};
@@ -6495,6 +6496,7 @@ int main(int argc, char** argv) {
                         strata::pool::decode_rows(pool_wire, u.here(), (size_t) S * (size_t) HB,
                                                   pool_hand_in + (size_t) base * (size_t) HB);
                         if (!w_refill(e)) { fail("refilling a lent slot: " + e); fatal = true; break; }
+                        const auto tv = Clock::now();
                         apply_pending(false);
                         drive.d.layers = 0;
                         drive.d.experts = 0;
