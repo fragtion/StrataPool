@@ -713,7 +713,9 @@ void PoolLink::report_request(double decode_ms) {
                     std::vector<double> measured{mine};
                     for (const WorkerInfo& wi : workers_)
                         measured.push_back(wi.req.f64("ms_verify", 0) / (double) std::max<int64_t>(wi.req.i64("windows", 0), 1));
-                    calib_.add(measured, calib_pred_, here - mine, net - layers_ms, windows);
+                    std::vector<int64_t> at;   // the split these numbers belong to (each worker's first layer)
+                    for (const WorkerInfo& wi : workers_) at.push_back(wi.lb);
+                    calib_.add(measured, calib_pred_, here - mine, net - layers_ms, windows, at);
                     std::string e;
                     if (!save_calib(calib_path_, calib_key_, calib_, e))
                         std::fprintf(stderr, "strata pool: the split's timings were not saved: %s\n", e.c_str());

@@ -32,14 +32,19 @@ struct NodeCap {
 struct SplitCalib {
     static constexpr int64_t kMinWindows = 200;   ///< below this the built-in model is used
     static constexpr int64_t kMemory = 4000;      ///< the past counts at most this many windows
+    static constexpr int64_t kTrust = 3;          ///< the search moves at most this many layers from a measured split
     std::vector<double> scale;
+    /// the splits these numbers were measured with ("33", "16,32"): one measurement cannot tell a node's per-layer
+    /// time from its misses' cost, so the scaled estimate is only trusted near them (kTrust layers per split point)
+    std::vector<std::string> seen;
+    bool near(const std::vector<int64_t>& at) const;
     double fixed_ms = 0, net_ms = 0;
     int64_t windows = 0;
     bool usable(size_t nodes) const;
     /// one request's numbers: per node its measured and its predicted ms per window (the prediction for the split it
     /// ran with), the coordinator's time outside its layers and the network's, over `w` windows
     void add(const std::vector<double>& measured, const std::vector<double>& predicted, double fixed, double net,
-             int64_t w);
+             int64_t w, const std::vector<int64_t>& at = {});
     std::string encode() const;
     bool decode(const std::string& text);
 };

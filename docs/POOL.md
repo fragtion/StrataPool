@@ -159,8 +159,10 @@ The head, the sampling and the draft layer always run on the coordinator, so no 
 coordinator compares each PC's measured layer time with what the built-in estimate predicted for that PC's layers,
 and keeps the ratio per pool in `pool-split-measured.txt`, in the engine's folder. One line per pool: the model, the
 context, the KV format, the window, and the PCs' names. After 200 windows, the next **automatic** split predicts with
-the measured numbers instead of the estimate. It also moves workers that still hold the old layers when the
-measured numbers say another split is at least 3% faster (they reload, a minute or two, once). Delete the file to
+the measured numbers instead of the estimate. One split's numbers cannot tell a PC's own layer time from what its
+cache misses cost, so the search moves at most 3 layers from a split it measured; each split it tries is measured in
+turn. It moves workers that still hold their layers only when the measured numbers say the new split is at least 5%
+faster (they reload once, a minute or two). Delete the file to
 start again from the estimate, or set `STRATA_POOL_CALIB=0` in the config's `env` to turn it off
 (`STRATA_POOL_CALIB=<file>` keeps it elsewhere).
 

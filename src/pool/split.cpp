@@ -83,14 +83,27 @@ SplitPlan evaluate_split(const SplitModel& m, const std::vector<NodeCap>& nodes,
 
 // ------------------------------------------------------------------------------------------------ measured timings
 bool SplitCalib::usable(size_t nodes) const {
-    if (windows < kMinWindows || scale.size() != nodes) return false;
+    // (an entry without the splits it was measured with - written before they were kept - is not used)
+    if (windows < kMinWindows || scale.size() != nodes || seen.empty()) return false;
     for (const double s : scale)
         if (!(s > 0.0) || !std::isfinite(s)) return false;
     return std::isfinite(fixed_ms) && std::isfinite(net_ms) && fixed_ms >= 0 && net_ms >= 0;
 }
 
+bool SplitCalib::near(const std::vector<int64_t>& at) const {
+    if (seen.empty()) return true;
+    for (const std::string& s : seen) {
+        std::vector<int64_t> p;
+        if (!parse_split(s, p) || p.size() != at.size()) continue;
+        bool ok = true;
+        for (size_t i = 0; i < p.size() && ok; ++i) ok = std::llabs(p[i] - at[i]) <= kTrust;
+        if (ok) return true;
+    }
+    return false;
+}
+
 void SplitCalib::add(const std::vector<double>& measured, const std::vector<double>& predicted, double fixed,
-                     double net, int64_t w) {
+                     double net, int64_t w, const std::vector<int64_t>& at) {
     if (w <= 0 || measured.size() != predicted.size() || measured.empty()) return;
     for (size_t i = 0; i < measured.size(); ++i)
         if (!(measured[i] > 0.0) || !(predicted[i] > 0.0)) return;   // a node without its own timing: not this time
@@ -101,6 +114,12 @@ void SplitCalib::add(const std::vector<double>& measured, const std::vector<doub
     for (size_t i = 0; i < measured.size(); ++i) {
         const double s = std::clamp(measured[i] / predicted[i], 0.02, 50.0);
         scale[i] = (scale[i] * old + s * nw) / tot;
+    }
+    if (!at.empty()) {
+        std::string k;
+        for (size_t i = 0; i < at.size(); ++i) k += (i ? "," : "") + std::to_string(at[i]);
+        if (std::find(seen.begin(), seen.end(), k) == seen.end()) seen.push_back(k);
+        if (seen.size() > 8) seen.erase(seen.begin());
     }
     fixed_ms = (fixed_ms * old + std::max(fixed, 0.0) * nw) / tot;
     net_ms = (net_ms * old + std::max(net, 0.0) * nw) / tot;
@@ -117,7 +136,12 @@ std::string SplitCalib::encode() const {
     char line[256];
     std::snprintf(line, sizeof line, "windows=%lld fixed_ms=%.3f net_ms=%.3f scale=", (long long) windows, fixed_ms,
                   net_ms);
-    return line + sc;
+    std::string out = line + sc;
+    if (!seen.empty()) {
+        out += " seen=";
+        for (size_t i = 0; i < seen.size(); ++i) out += (i ? ";" : "") + seen[i];
+    }
+    return out;
 }
 
 bool SplitCalib::decode(const std::string& text) {
@@ -134,7 +158,15 @@ bool SplitCalib::decode(const std::string& text) {
         if (k == "windows") windows = std::atoll(v.c_str());
         else if (k == "fixed_ms") fixed_ms = std::atof(v.c_str());
         else if (k == "net_ms") net_ms = std::atof(v.c_str());
-        else if (k == "scale") {
+        else if (k == "seen") {
+            size_t c = 0;
+            while (c < v.size()) {
+                size_t d = v.find(';', c);
+                if (d == std::string::npos) d = v.size();
+                if (d > c) seen.push_back(v.substr(c, d - c));
+                c = d + 1;
+            }
+        } else if (k == "scale") {
             size_t c = 0;
             while (c < v.size()) {
                 size_t d = v.find(',', c);
@@ -212,7 +244,11 @@ SplitPlan auto_split(const SplitModel& m, const std::vector<NodeCap>& nodes) {
     if (ns == 1) return evaluate_split(m, nodes, {});
     const int64_t L = m.n_layers;
     std::string last_why;
+    // with measured timings: only near a split they were measured with (SplitCalib::near); the plain estimate
+    // searches everywhere (and takes over when nothing near a measured split fits any more)
+    const bool trust = m.calib != nullptr && m.calib->usable(nodes.size());
     auto consider = [&](const std::vector<int64_t>& at) {
+        if (trust && !m.calib->near(at)) return;
         SplitPlan p = evaluate_split(m, nodes, at);
         if (!p.ok) { last_why = p.why; return; }
         // ties (within 0.1%): the placement whose busiest node holds the fewest layers above its share
@@ -242,6 +278,11 @@ SplitPlan auto_split(const SplitModel& m, const std::vector<NodeCap>& nodes) {
                     t[(size_t) i] += d;
                     consider(t);
                 }
+    }
+    if (!best.ok && trust) {   // nothing near a measured split fits now: the built-in estimate, everywhere
+        SplitModel plain = m;
+        plain.calib = nullptr;
+        return auto_split(plain, nodes);
     }
     if (!best.ok) best.why = last_why.empty() ? "no placement fits" : last_why;
     return best;

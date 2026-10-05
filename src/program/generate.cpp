@@ -2645,7 +2645,7 @@ int main(int argc, char** argv) {
         if (o.pool_split == "auto") {
             // workers that still hold a range from this coordinator's last start keep it when it still fits (a
             // reload of a worker's share costs minutes; the search would land within a layer of it anyway) - unless
-            // the measured timings say another split is clearly faster (3%: then the reload pays for itself)
+            // the measured timings say another split is clearly faster (5%: then the reload pays for itself)
             bool adopt = true;
             std::vector<int64_t> at;
             for (size_t i = 0; i < pool_link.workers().size() && adopt; ++i) {
@@ -2661,7 +2661,7 @@ int main(int argc, char** argv) {
                 plan = strata::pool::evaluate_split(sm, nodes, at);
                 if (plan.ok && plan.measured) {
                     const strata::pool::SplitPlan best = strata::pool::auto_split(sm, nodes);
-                    if (best.ok && best.at != plan.at && best.ms < plan.ms * 0.97) {
+                    if (best.ok && best.at != plan.at && best.ms < plan.ms * 0.95) {
                         std::fprintf(stderr, "strata pool: the measured timings predict %.1f ms per window with split %lld "
                                              "against %.1f ms with the loaded %lld: the workers load the new range\n",
                                      best.ms, (long long) best.at[0], plan.ms, (long long) plan.at[0]);
@@ -2688,11 +2688,10 @@ int main(int argc, char** argv) {
         pool_at = plan.at;
         std::string ks;
         for (size_t i = 0; i < pool_at.size(); ++i) ks += (i ? "," : "") + std::to_string(pool_at[i]);
-        std::fprintf(stderr, plan.measured ? "strata pool: split %s - this PC runs layers 0-%lld, predicted %.1f ms per decode window (measured); "
-                                           : "strata pool: split %s - this PC runs layers 0-%lld, predicted %.1f ms per decode window; "
+        std::fprintf(stderr, "strata pool: split %s - this PC runs layers 0-%lld, predicted %.1f ms per decode window%s; "
                              "the pool's GPUs hold ~%lld of %zu profiled experts (~%.1f%% of the routed mass)\n",
-                     ks.c_str(), (long long) (pool_at[0] - 1), plan.ms, (long long) plan.held, sm.profile.size(),
-                     100.0 * plan.mass);
+                     ks.c_str(), (long long) (pool_at[0] - 1), plan.ms, plan.measured ? " (measured)" : "",
+                     (long long) plan.held, sm.profile.size(), 100.0 * plan.mass);
         for (size_t i = 0; i < nodes.size(); ++i)
             std::fprintf(stderr, "strata pool:   %-22s layers %2lld-%2lld, ~%lld experts in VRAM, %.1f GiB of experts in RAM\n",
                          nodes[i].name.c_str(), (long long) (i == 0 ? 0 : pool_at[i - 1]),
