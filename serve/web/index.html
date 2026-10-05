@@ -300,15 +300,17 @@
               bytes, for slow networks.</span>
           </div>
           <div class="st-field">
-            <span class="st-label">Chats at once</span>
-            <div class="seg seg--3" id="pool-chats" role="radiogroup" aria-label="Chats at once">
-              <button type="button" role="radio" data-v="1">One</button>
-              <button type="button" role="radio" data-v="2">Two</button>
-              <button type="button" role="radio" data-v="3">Three</button>
+            <span class="st-label">Several chats at once</span>
+            <div class="seg seg--2" id="pool-chats" role="radiogroup" aria-label="Several chats at once">
+              <button type="button" role="radio" data-v="off">Off</button>
+              <button type="button" role="radio" data-v="on">On</button>
             </div>
-            <span class="muted small">With two or more, the PCs work on different chats at the same moment: more words
-              per second in total, each chat slower than alone. Each extra chat's state takes VRAM (fewer cached
-              experts, so a chat alone runs a little slower too) and RAM on every PC.</span>
+            <span class="muted small">On: up to one chat per PC runs at the same time, each PC working on a different
+              one, so two chats together get more words per second than one at a time.</span>
+            <span class="pool-note small"><strong>Costs speed when on:</strong> while two chats run, each is slower
+              than one alone (no drafts). Each PC also keeps room for the extra chats in VRAM, so fewer experts are
+              cached and a chat on its own runs a little slower too; with a long context, each extra chat locks
+              gigabytes of RAM on every PC. Leave it off if you run one chat at a time.</span>
           </div>
         </div>
       </div>

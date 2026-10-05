@@ -53,7 +53,7 @@ class PoolConfig:
     (lends its GPU to a coordinator).  Every PC of a pool shares `secret`."""
 
     DEFAULTS = {"role": "off", "name": "", "secret": "", "worker_port": ENGINE_PORT, "peers": [], "split": "auto",
-                "wire": "f32", "draft_wire": "f16", "discovery": True, "chats": 1,
+                "wire": "f32", "draft_wire": "f16", "discovery": True, "several_chats": False,
                 "route_peers": [], "primary": False, "move_tokens": 8000}
 
     def __init__(self, path: str | None = None, data: dict | None = None):
@@ -123,12 +123,12 @@ class PoolConfig:
             if out[k] not in WIRES:
                 raise ValueError(f"{k}: one of {', '.join(WIRES)}")
         out["discovery"] = bool(out["discovery"])
-        c = out["chats"]
-        if isinstance(c, str) and c.isdigit():
-            c = int(c)
-        if not isinstance(c, int) or isinstance(c, bool) or not 1 <= c <= 4:
-            raise ValueError("chats: 1..4 (the split's conversations at once)")
-        out["chats"] = c
+        sc = out["several_chats"]
+        if isinstance(sc, str) and sc.lower() in ("true", "false", "on", "off", "1", "0"):
+            sc = sc.lower() in ("true", "on", "1")
+        if not isinstance(sc, bool):
+            raise ValueError("several_chats: true or false")
+        out["several_chats"] = sc
         peers = out["peers"]
         if not isinstance(peers, list) or len(peers) > 7:
             raise ValueError("peers: a list of up to 7 workers")
@@ -222,10 +222,12 @@ def coordinator_args(pc: PoolConfig) -> list[str]:
         return []
     out = ["--pool-peers", ",".join(peers), "--pool-split", pc["split"], "--pool-wire", pc["wire"],
            "--pool-draft-wire", pc["draft_wire"]]
-    if pc["chats"] > 1:
+    if pc["several_chats"]:
         # several conversations at once: the engine's batch slots, pipelined across the PCs (one PC runs one chat's
-        # layers while the next runs another's).  Only in the split: the config's own "parallel" is for one PC.
-        out += ["--batch", str(pc["chats"])]
+        # layers while the next runs another's).  One slot per PC keeps every PC busy; more would only share the
+        # same speed among more chats.  The engine carves fewer when they do not fit.  Only in the split: the
+        # config's own "parallel" is for one PC.
+        out += ["--batch", str(min(1 + len(peers), 4))]
     return out
 
 

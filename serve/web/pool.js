@@ -321,7 +321,7 @@
       $("pool-split").hidden = !manual;
       if (document.activeElement !== $("pool-split")) $("pool-split").value = manual ? draft.split : "";
       setSeg("pool-wire", draft.wire);
-      setSeg("pool-chats", String(draft.chats || 1));
+      setSeg("pool-chats", draft.several_chats ? "on" : "off");
       const pool = state.engine && state.engine.pool;
       $("pool-split-out").textContent = pool && pool.workers.length ? `now ${pool.workers.map((w) => w.lb).join(",")}` : "";
     }
@@ -348,7 +348,7 @@
     touch();
   };
   for (const b of $("pool-wire").querySelectorAll("button")) b.onclick = () => { if (draft) { draft.wire = b.dataset.v; touch(); } };
-  for (const b of $("pool-chats").querySelectorAll("button")) b.onclick = () => { if (draft) { draft.chats = Number(b.dataset.v); touch(); } };
+  for (const b of $("pool-chats").querySelectorAll("button")) b.onclick = () => { if (draft) { draft.several_chats = b.dataset.v === "on"; touch(); } };
   $("pool-split").oninput = () => { draft.split = $("pool-split").value.replace(/\s/g, "") || "auto"; dirty = true; renderMap(); };
   $("pool-name").oninput = () => { draft.name = $("pool-name").value; dirty = true; };
   $("pool-port").oninput = () => { draft.worker_port = Number($("pool-port").value) || 7701; dirty = true; };
