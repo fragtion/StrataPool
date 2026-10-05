@@ -326,6 +326,33 @@ bool PoolLink::forward(Msg type, const std::vector<uint8_t>& prefix_tmpl, int64_
     return true;
 }
 
+// the output head over the first T rows of R_dev_ -> logits_dev_ (on stream_; not synced)
+bool PoolLink::head_logits(int T, std::string& err) {
+    const cudaStream_t cs = (cudaStream_t) stream_;
+    const int64_t N = g_->n_embd;
+    for (int t = 0; t < T; ++t) {
+        core::BlockBuffers bb = block_;
+        bb.R = R_dev_ + (size_t) t * (size_t) d_;
+        bb.mixed = mixed_dev_ + (size_t) t * (size_t) N;
+        if (head_ != nullptr && head_->loaded()) {
+            if (!core::lm_head_mix(*wt_, *g_, bb, cs, err)) return false;
+        } else if (!core::lm_head(*wt_, *g_, bb, logits_dev_ + (size_t) t * (size_t) n_vocab_, cs, err)) {
+            return false;
+        }
+    }
+    if (head_ != nullptr && head_->loaded()) {
+        try {
+            strata::kernels::native_quantize_q8_1(mixed_dev_, xq_dev_, (int) N, T, cs);
+            strata::kernels::native_mmvq(head_->type(), head_->weights(), xq_dev_, logits_dev_, (int) N, (int) n_vocab_,
+                                         T, cs);
+        } catch (const std::exception& e) {
+            err = std::string("pool head: ") + e.what();
+            return false;
+        }
+    }
+    return true;
+}
+
 bool PoolLink::run(int T, const int32_t* tokens, int64_t pos0, int32_t* out, std::string& err) {
     std::lock_guard<std::mutex> lk(mu_);
     if (T < 1 || T > max_t_) { err = "pool: window size out of range"; return false; }
@@ -358,27 +385,7 @@ bool PoolLink::run(int T, const int32_t* tokens, int64_t pos0, int32_t* out, std
         for (int t = 0; t < T; ++t) out[t] = 0;
         return true;
     }
-    const int64_t N = g_->n_embd;
-    for (int t = 0; t < T; ++t) {
-        core::BlockBuffers bb = block_;
-        bb.R = R_dev_ + (size_t) t * (size_t) d_;
-        bb.mixed = mixed_dev_ + (size_t) t * (size_t) N;
-        if (head_ != nullptr && head_->loaded()) {
-            if (!core::lm_head_mix(*wt_, *g_, bb, cs, err)) return false;
-        } else if (!core::lm_head(*wt_, *g_, bb, logits_dev_ + (size_t) t * (size_t) n_vocab_, cs, err)) {
-            return false;
-        }
-    }
-    if (head_ != nullptr && head_->loaded()) {
-        try {
-            strata::kernels::native_quantize_q8_1(mixed_dev_, xq_dev_, (int) N, T, cs);
-            strata::kernels::native_mmvq(head_->type(), head_->weights(), xq_dev_, logits_dev_, (int) N, (int) n_vocab_,
-                                         T, cs);
-        } catch (const std::exception& e) {
-            err = std::string("pool head: ") + e.what();
-            return false;
-        }
-    }
+    if (!head_logits(T, err)) return false;
     // the verify window's own rule: greedy, or this request's sampling with Philox(seed, pos0 + t) and penalties
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     strata::kernels::SamplerParams sp;
@@ -443,6 +450,153 @@ bool PoolLink::prefill(const float* rows, const int64_t* tokens, int64_t T, int6
     *out = dst;
     ms_prefill_net += ms_since(t0);
     return true;
+}
+
+// ------------------------------------------------------------------------------------------------ batch slots
+// A pipelined batch window of the slot group [base, base + S): the coordinator's verifier has written the group's
+// hand-off rows (rows [base, base + S) of its hand-off buffer, [R][bo][inj] for the S rows); worker w runs its layers
+// over them with the group's own slot sessions and sends them back.  One group at a time per worker (the pipeline
+// gives each stage one group), so a worker's reply is always the group it was sent.
+bool PoolLink::batch_send(size_t w, int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (batch_.size() < ch_.size()) batch_.resize(ch_.size());
+    if (w >= ch_.size() || S < 1 || base < 0 || base + S > kMaxBatchRows) { err = "pool: a batch group out of range"; return false; }
+    BatchStage& st = batch_[w];
+    if (st.busy) { err = "pool: worker " + workers_[w].addr + " already runs a batch group"; return false; }
+    const size_t n = (size_t) S * (size_t) hb_;
+    const float* src = nullptr;
+    if (w == 0) {
+        src = hand_host_ + (size_t) base * (size_t) hb_;
+    } else {
+        const BatchStage& prev = batch_[w - 1];
+        if (prev.base != base || prev.S != S || prev.rows.size() != n) { err = "pool: a batch group skipped a worker"; return false; }
+        src = prev.rows.data();
+    }
+    Packer pk;
+    pk.put<int32_t>(base);
+    pk.put<int32_t>(S);
+    pk.put_bytes(tokens, (size_t) S * 4);
+    pk.put_bytes(pos, (size_t) S * 8);
+    Channel& c = ch_[w];
+    const uint8_t* body = (const uint8_t*) src;
+    if (wire_ != Wire::F32) {
+        st.enc.resize(n * wire_bytes(wire_));
+        encode_rows(wire_, src, n, st.enc.data());
+        body = st.enc.data();
+    }
+    if (!c.drain(err) || !c.send(Msg::BatchVerify, pk.b.data(), pk.b.size(), body, n * wire_bytes(wire_), err)) {
+        err = "pool worker " + workers_[w].addr + ": " + err;
+        return false;
+    }
+    st.busy = true;
+    st.base = base;
+    st.S = S;
+    for (int t = 0; t < S; ++t) st.pos[t] = pos[t];
+    st.t0 = Clock::now();
+    return true;
+}
+
+int PoolLink::batch_poll(size_t w, std::string& err) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (batch_.size() < ch_.size()) batch_.resize(ch_.size());
+    if (w >= ch_.size()) { err = "pool: no such worker"; return -1; }
+    BatchStage& st = batch_[w];
+    if (!st.busy) return 1;
+    Channel& c = ch_[w];
+    std::string e;
+    if (!c.readable(e)) {
+        if (!e.empty()) { err = "pool worker " + workers_[w].addr + ": " + e; st.busy = false; return -1; }
+        if (std::chrono::duration<double>(Clock::now() - st.t0).count() > timeout_s_) {
+            err = "pool worker " + workers_[w].addr + ": no batch rows within " + std::to_string((int) timeout_s_) + " s";
+            st.busy = false;
+            return -1;
+        }
+        return 0;
+    }
+    Msg t;
+    std::vector<uint8_t>& in = st.in;
+    st.busy = false;
+    if (!c.recv(t, in, err, (uint64_t) 1 << 30)) { err = "pool worker " + workers_[w].addr + ": " + err; return -1; }
+    if (t != Msg::BatchRows) { err = "pool worker " + workers_[w].addr + ": " + unexpected(t, Msg::BatchRows, in); return -1; }
+    const size_t n = (size_t) st.S * (size_t) hb_;
+    if (in.size() != n * wire_bytes(wire_)) {
+        err = "pool worker " + workers_[w].addr + " returned " + std::to_string(in.size()) + " bytes of batch rows";
+        return -1;
+    }
+    st.rows.resize(n);
+    decode_rows(wire_, in.data(), n, st.rows.data());
+    ms_batch_net += std::chrono::duration<double, std::milli>(Clock::now() - st.t0).count();
+    if (w + 1 < ch_.size() || !batch_head_) return 1;   // the next worker takes them (batch_send from these rows)
+    // the last worker: the head and the picks of the group's rows here (its R rows are the first S x hc*n_embd floats)
+    const cudaStream_t cs = (cudaStream_t) stream_;
+    const int S = st.S;
+    if (cudaMemcpyAsync(R_dev_, st.rows.data(), (size_t) S * (size_t) d_ * 4, cudaMemcpyHostToDevice, cs) != cudaSuccess) {
+        err = std::string("pool: the batch rows' upload: ") + cudaGetErrorString(cudaGetLastError());
+        return -1;
+    }
+    if (!head_logits(S, err)) return -1;
+    strata::kernels::SamplerParams greedy;
+    greedy.greedy = true;
+    greedy.temperature = 0.0f;
+    strata::kernels::sample_tokens(logits_dev_, S, (int) n_vocab_, nullptr, 0, greedy, out_dev_, cs);
+    // a sampled slot's row again with its own parameters: Philox(seed, position), as its solo window draws it
+    for (int r = 0; r < S; ++r) {
+        const int slot = st.base + r;
+        if (slot < 0 || slot >= (int) slot_sp_.size()) continue;
+        strata::kernels::SamplerParams sp = slot_sp_[(size_t) slot];
+        if (sp.greedy || sp.temperature <= 0.0f) continue;
+        sp.counter = (uint64_t) st.pos[r];
+        sp.penalty_last_n = 0;
+        strata::kernels::sample_tokens(logits_dev_ + (size_t) r * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,
+                                       out_dev_ + r, cs);
+    }
+    if (cudaStreamSynchronize(cs) != cudaSuccess) {
+        err = std::string("pool: the batch head: ") + cudaGetErrorString(cudaGetLastError());
+        return -1;
+    }
+    for (int r = 0; r < S; ++r) batch_out_[r] = ((volatile int32_t*) out_host_)[r];
+    ++batch_windows;
+    return 1;
+}
+
+void PoolLink::set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (slot < 0 || slot >= kMaxBatchRows) return;
+    if ((int) slot_sp_.size() <= slot) {
+        strata::kernels::SamplerParams g;
+        g.greedy = true;
+        g.temperature = 0.0f;
+        slot_sp_.resize((size_t) slot + 1, g);
+    }
+    slot_sp_[(size_t) slot] = sp;
+}
+
+bool PoolLink::slot_copy(bool load, int slot, const std::vector<int32_t>& ids, std::string& err) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (batch_.size() < ch_.size()) batch_.resize(ch_.size());
+    Packer pk;
+    pk.put<int32_t>(slot);
+    pk.put<int64_t>((int64_t) ids.size());
+    pk.put<int32_t>(ids.size() >= 2 ? ids[ids.size() - 2] : -1);
+    pk.put<int32_t>(ids.empty() ? -1 : ids.back());
+    for (size_t i = 0; i < ch_.size(); ++i) {
+        Channel& c = ch_[i];
+        if (batch_[i].busy) { err = "pool: a slot copy while a batch group is in flight"; return false; }
+        if (!c.send(load ? Msg::SlotLoad : Msg::SlotStore, pk.b, err)) { err = "pool worker " + workers_[i].addr + ": " + err; return false; }
+        ++c.pending;
+    }
+    for (size_t i = 0; i < ch_.size(); ++i)   // the copies are done when the call returns, as on this PC
+        if (!ch_[i].drain(err)) { err = "pool worker " + workers_[i].addr + ": " + err; return false; }
+    return true;
+}
+
+int64_t PoolLink::batch_slots() const {
+    int64_t n = -1;
+    for (const WorkerInfo& w : workers_) {
+        const int64_t b = w.ready.i64("batch_slots", 0);
+        n = n < 0 ? b : std::min(n, b);
+    }
+    return std::max<int64_t>(n, 0);
 }
 
 // ------------------------------------------------------------------------------------------------ session ops

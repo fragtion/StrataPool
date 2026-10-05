@@ -299,6 +299,17 @@
             <span class="muted small">Exact sends 32-bit rows, so the answers match one PC's exactly. f16 halves the
               bytes, for slow networks.</span>
           </div>
+          <div class="st-field">
+            <span class="st-label">Chats at once</span>
+            <div class="seg seg--3" id="pool-chats" role="radiogroup" aria-label="Chats at once">
+              <button type="button" role="radio" data-v="1">One</button>
+              <button type="button" role="radio" data-v="2">Two</button>
+              <button type="button" role="radio" data-v="3">Three</button>
+            </div>
+            <span class="muted small">With two or more, the PCs work on different chats at the same moment: more words
+              per second in total, each chat slower than alone. Each extra chat's state takes VRAM (fewer cached
+              experts, so a chat alone runs a little slower too) and RAM on every PC.</span>
+          </div>
         </div>
       </div>
 

@@ -122,6 +122,11 @@ bool wait_fd(sock_t fd, bool read, double timeout_s, std::string& err) {
 
 }  // namespace
 
+bool Socket::readable(double timeout_s, std::string& err) {
+    if (fd_ < 0) { err = "not connected"; return false; }
+    return wait_fd((sock_t) fd_, true, timeout_s, err);
+}
+
 bool net_init() {
 #if defined(_WIN32)
     static std::once_flag once;
