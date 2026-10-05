@@ -146,6 +146,32 @@ VRAM, and their part of the context (KV and state). A worker leaves out the embe
 coordinator leaves out the workers' layers. So the VRAM that the other layers' dense weights would take goes to
 experts instead, and the pool as a whole caches more of them than any one PC.
 
+## The split learns from its timings
+
+After each request the coordinator's log splits a decode window into its parts:
+
+```
+strata pool: <N> windows, <W> ms each = this PC <C> ms + the workers' layers <L> ms + the network <X> ms ...
+strata pool:   this PC: its layers <A> ms + the head, sampling and the drafter <B> ms
+```
+
+The head, the sampling and the draft layer always run on the coordinator, so no split moves that part. The
+coordinator compares each PC's measured layer time with what the built-in estimate predicted for that PC's layers,
+and keeps the ratio per pool in `pool-split-measured.txt`, in the engine's folder. One line per pool: the model, the
+context, the KV format, the window, and the PCs' names. After 200 windows, the next **automatic** split predicts with
+the measured numbers instead of the estimate. It also moves workers that still hold the old layers when the
+measured numbers say another split is at least 3% faster (they reload, a minute or two, once). Delete the file to
+start again from the estimate, or set `STRATA_POOL_CALIB=0` in the config's `env` to turn it off
+(`STRATA_POOL_CALIB=<file>` keeps it elsewhere).
+
+## What each PC's expert cache learns
+
+With `"expert_profile_save"` in the model's config, each PC saves which experts its requests used, so the next
+start fills the cache with them (Strata #477). In a pool, a PC sees only its own layers, so it re-ranks only those
+layers' experts and keeps the order it started with for every other layer. The saved file is still a ranking for the
+whole model: the same PC can start alone, share requests, or take another split without a lopsided cache. A worker
+saves between requests (every `expert_profile_save_every` minutes, 10 by default) and when its coordinator leaves.
+
 ## Which PCs make good workers
 
 The pool runs its layers one after the other, so a token waits for every PC's part in turn. A worker helps when its
@@ -173,6 +199,10 @@ out of the pool. The automatic split would give it as few layers as it can.
 - **Conversation parking** (whole-chat snapshots in RAM). The per-chat checkpoints (`--prompt-cache`) work across
   the pool: each worker keeps its own layers' part.
 - **Several GPUs in one pool PC.** Each pool PC uses one GPU, and the pool is the split.
+- **Batch slots** (`"parallel"`, `--batch`). Two chats at once through one split would let the PCs work on
+  different chats at the same moment, but a batch window carries no drafts, and the coordinator's own part (its
+  layers plus the head and the drafter) is about three quarters of a window. The overlap would hide only the
+  workers' part. For two chats at once, *Share requests* runs each at one PC's full speed.
 
 ## Engine flags
 
