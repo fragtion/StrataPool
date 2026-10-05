@@ -583,6 +583,7 @@ class PoolManager:
         self.last_error = None
         self.peer_cache: dict[str, dict] = {}
         self.peer_cache_at = 0.0
+        self.coord_cache = None                       # a worker: (host, when, the coordinator's facts)
         self.addresses = lambda: []                  # the server sets its lan_addresses here
         svc.pool_role = pc.role
 
@@ -754,11 +755,17 @@ class PoolManager:
             state = "starting"
         else:
             state = "running" if self.svc.loaded() else "stopped"
-        layers = None
+        layers, slots = None, None
         if self.pc.role == "worker" and self.worker is not None:
             w = self.worker.snapshot()
             if w.get("lb") is not None and w.get("le"):
                 layers = f"{w['lb']}-{w['le'] - 1}"
+            slots = (w.get("ready") or {}).get("slots")
+        elif self.pc.role == "coordinator":
+            ep = parse_engine_pool(info)
+            if ep and ep.get("le"):
+                layers = f"{ep['lb']}-{ep['le'] - 1}"
+                slots = ep.get("slots_here")
         from serve.route import secret_id
         settings = {"sampling": getattr(self.svc, "sampling_defaults", {}), "shared": getattr(self.svc, "shared", {}),
                     "reasoning_budget_tokens": getattr(self.svc, "reasoning_budget_tokens", 0)}
@@ -776,7 +783,7 @@ class PoolManager:
                 "vram_mib": int(hw["gpu_mem_total"] / 2**20) if hw.get("gpu_mem_total") else None,
                 "ram_mib": int(hw["ram_total"] / 2**20) if hw.get("ram_total") else None,
                 "http_port": self.http_port, "worker_port": self.pc["worker_port"], "state": state,
-                "version": info.get("version"), "layers": layers, "app": "strata-pool"}
+                "version": info.get("version"), "layers": layers, "slots": slots, "app": "strata-pool"}
 
     def beacon(self) -> dict:
         return self.node()
@@ -807,10 +814,34 @@ class PoolManager:
             self.peer_cache = results
         return [{**p, **self.peer_cache.get(p["addr"], {"facts": None, "reachable": False})} for p in self.pc["peers"]]
 
+    def coordinator_facts(self) -> dict | None:
+        """A worker: the connected coordinator's public facts (name, layers, experts in VRAM) for the layer map - from
+        its beacon, else from its own server (GET /pool/node on this PC's HTTP port, the usual setup); cached a few
+        seconds.  None when not a worker, no coordinator is connected, or neither answers."""
+        if self.pc.role != "worker" or self.worker is None:
+            return None
+        addr = self.worker.snapshot().get("coordinator")
+        if not addr:
+            return None
+        host = addr.rsplit(":", 1)[0].strip("[]")
+        now = time.time()
+        cached = self.coord_cache
+        if cached and cached[0] == host and now - cached[1] < 4.0:
+            return cached[2]
+        facts = None
+        for d in (self.discovery.peers() if self.discovery else []):
+            if d.get("ip") == host and d.get("role") == "coordinator":
+                facts = d
+        if facts is None or facts.get("slots") is None:
+            facts = probe(f"{host}:{(facts or {}).get('http_port') or self.http_port}", 1.0) or facts
+        self.coord_cache = (host, now, facts)
+        return facts
+
     def state(self, reveal_secret: bool) -> dict:
         info = dict(getattr(self.svc.engine, "info", {}) or {})
         return {"config": self.pc.public(reveal_secret), "node": self.node(),
                 "worker": self.worker.snapshot() if self.worker else None,
+                "coordinator": self.coordinator_facts(),
                 "engine": {"loaded": self.svc.loaded(), "pool": parse_engine_pool(info),
                            "expert_slots": info.get("expert_slots"), "n_layers": 48},
                 "peers": self.peers_status() if self.pc["peers"] else [],

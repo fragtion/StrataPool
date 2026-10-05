@@ -98,8 +98,13 @@
     if (d.role === "worker") {
       const w = s.worker || {};
       if (w.lb != null && w.le) {
-        return {nodes: [{name: w.coordinator ? `coordinator ${w.coordinator}` : "the coordinator", lb: 0, le: w.lb},
-                        {name: `${me} (this worker)`, lb: w.lb, le: w.le, slots: w.ready && w.ready.slots}], live: true, me: 1};
+        // the coordinator's name and experts in VRAM come from its own beacon or server (s.coordinator); else its
+        // address, without the connection's port
+        const c = s.coordinator || {};
+        const host = w.coordinator ? w.coordinator.replace(/:\d+$/, "") : "";
+        const cname = c.name ? `${c.name} (coordinator)` : host ? `coordinator ${host}` : "the coordinator";
+        return {nodes: [{name: cname, lb: 0, le: w.lb, slots: c.slots != null ? c.slots : undefined},
+                        {name: `${me} (this worker)`, lb: w.lb, le: w.le, slots: w.ready && w.ready.slots}], live: true};
       }
       return {nodes: [{name: `${me} (this worker)`}], live: false, auto: true};
     }
@@ -107,18 +112,18 @@
   }
 
   function renderMap() {
-    const {nodes, live, auto, me} = nodesForMap();
+    const {nodes, live, auto} = nodesForMap();
     const cells = [];
     for (let l = 0; l < 48; ++l) {
       const i = nodes.findIndex((n) => n.lb != null && l >= n.lb && l < n.le);
       const n = nodes[i];
-      cells.push(`<span data-node="${i < 0 ? "" : me && i === 0 ? "" : i}" title="layer ${l}${n ? " · " + esc(n.name) : ""}"></span>`);
+      cells.push(`<span data-node="${i < 0 ? "" : i}" title="layer ${l}${n ? " · " + esc(n.name) : ""}"></span>`);
     }
     $("pool-map").innerHTML = cells.join("");
     $("pool-legend").innerHTML = nodes.map((n, i) => {
       const range = n.lb != null ? `layers ${n.lb}–${n.le - 1}` : "layers: decided when it starts";
       const slots = n.slots != null ? ` · ${fmt(n.slots)} experts in VRAM` : "";
-      const color = ["var(--st-accent)", "var(--st-info)", "var(--st-warn)", "var(--st-danger)"][me && i === 0 ? 4 : i] || "var(--st-ink-muted)";
+      const color = ["var(--st-accent)", "var(--st-info)", "var(--st-warn)", "var(--st-danger)"][i] || "var(--st-ink-muted)";
       return `<span><i style="background:${color}"></i>${esc(n.name)} · ${range}${slots}</span>`;
     }).join("");
     const total = nodes.reduce((a, n) => a + (n.slots || 0), 0);
