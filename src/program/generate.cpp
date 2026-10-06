@@ -10425,7 +10425,7 @@ int main(int argc, char** argv) {
             bool pl_ran = false;
             const bool pl_want = pipe && pl_pw >= 2 && pl_snap2[0] != nullptr;
             const char* pl_serial = !pl_want ? nullptr
-                                  : hist_n > 0 ? "repetition penalties (penalty_last_n)"
+                                  : hist_n > 0 && !pool_pipe ? "repetition penalties (penalty_last_n)"
                                   : mtp.coupled() ? "coupled draft sampling" : nullptr;
             if (pl_serial != nullptr) {   // said once per reason
                 static std::set<std::string> said;
@@ -10857,6 +10857,16 @@ int main(int argc, char** argv) {
                     // ---- stage 1: A, once its stage 0 is done
                     if (A.finished && !A.s1) {
                         if (chain_kind == 1 && !B.ready) ++pl_late;   // stage 0 idles until the chain has B
+                        if (pool_pipe && hist_n > 0) {
+                            // POOL: the head is here and runs once A's verdict before it is in `consumed`, so each
+                            // row's penalty history is the serial loop's (the consumed tokens, then A's own rows)
+                            strata::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), A.tok, A.T,
+                                                          hist_n, hist_stage.data());
+                            const strata::core::OnDevice on_h(hist_dev);
+                            if (cudaMemcpy(d_hist, hist_stage.data(), (size_t) A.T * (size_t) hist_n * sizeof(int32_t),
+                                           cudaMemcpyHostToDevice) != cudaSuccess)
+                                return die("the penalty rows' upload failed");
+                        }
                         if (!V1(A).pl_launch(A.T, A.tok, A.p, err)) return die(err);
                         A.s1 = true;
                         tre("L1", A.seq, A.T);
