@@ -23,6 +23,7 @@ Tests (about 4-6 minutes in all):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pathlib
 import threading
@@ -77,6 +78,17 @@ def ask(url: str, messages: list, max_tokens: int, name: str, results: list, loc
            "decode_ms": tm.get("predicted_ms"), "decode_tok_s": tm.get("predicted_per_second"),
            "drafts": tm.get("draft_n"), "accepted": tm.get("draft_n_accepted"),
            "finish": (out.get("choices") or [{}])[0].get("finish_reason")}
+    # the window's own cost, apart from how many drafts the text let it accept: each verify window hands out its
+    # accepted drafts plus one token, so windows = generated - accepted.  Two engines whose texts differ (a near-tie
+    # that rounds the other way) accept different numbers of drafts; ms per window compares their speed itself.
+    gen, acc, dms = rec["generated"], rec["accepted"], rec["decode_ms"]
+    if gen and acc is not None and dms and gen > acc:
+        rec["windows"] = gen - acc
+        rec["ms_per_window"] = round(dms / (gen - acc), 2)
+        rec["tokens_per_window"] = round(gen / (gen - acc), 3)
+    text = ((out.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    rec["text_sha1"] = hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]   # the same text in two runs or not
+    rec["text_head"] = text[:300]
     if lock:
         with lock:
             results.append(rec)
@@ -86,7 +98,8 @@ def ask(url: str, messages: list, max_tokens: int, name: str, results: list, loc
         print(f"  ! {name}: finished with {rec['finish']!r} - not a full answer; its speed is not comparable")
     print(f"  {name:<22} prompt {rec['prompt_tokens']} (reused {rec['reused']}, read {rec['read']} at "
           f"{rec['prompt_tok_s']} tok/s), {rec['generated']} generated at {rec['decode_tok_s']} tok/s, "
-          f"{rec['wall_s']} s", flush=True)
+          f"{rec['wall_s']} s" + (f", {rec['ms_per_window']} ms/window x {rec['tokens_per_window']} tokens"
+                                   if "ms_per_window" in rec else ""), flush=True)
     return out
 
 
