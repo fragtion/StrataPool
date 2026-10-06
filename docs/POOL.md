@@ -171,11 +171,12 @@ coordinator's log).
 ### Reading short prompts
 
 With CPU assist (from architectds' fork, on by default; `STRATA_PREFILL_CPU=0` in a PC's config `env` turns it off),
-each PC's CPU pool computes part of a short prompt chunk's experts (up to 3,072 tokens, the size of an agent's new
-turn) from RAM while its GPU copies in the rest. Every PC does this for its own layers, since no other stage shares
-its CPU. It is not bitwise: the CPU's arithmetic differs from the GPU's by about 1-2% per expert, and architectds
-measured the next token's top choice unchanged over 60 prompts. Their numbers, on one PC: 515 tokens +47%, 2,071 +32%,
-2,798 +15%.
+each PC's CPU pool computes part of a short prompt chunk's least-routed experts from RAM while its GPU copies in the
+rest. Every PC does this for its own layers, since no other stage shares its CPU. It is not bitwise: the CPU's
+arithmetic differs from the GPU's by about 1-2% per expert (architectds measured the next token's top choice unchanged
+over 60 prompts). On the RTX 3060 desktop it read ~560-token prompts 11% faster (394 / 387 against 349 / 353 tok/s).
+architectds also staged chunks up to 3,072 tokens for it, which paid on a PCIe 3.0 card; on the desktop's PCIe 4.0 x16
+that made 2-3K-token prompts 5-8% slower, so it is opt-in here: `STRATA_PREFILL_CPU_STAGE=3072`.
 
 ## The split learns from its timings
 

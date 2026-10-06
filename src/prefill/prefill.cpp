@@ -125,6 +125,15 @@ constexpr int RING_MAX = 1024;          // the arrays; the ring itself is ring_s
 // tokens instead (set by `init`), since the pool helps only there: measured on a 5070 Ti (PCIe 3.0, DDR4-2133,
 // IQ3_XXS) against the streamed walk, mean of two runs: 1K prompts 1.43x, 2K 1.38x, 4K 0.95x, 8K 0.80x.
 int64_t g_stream_min_cpu = 0;
+// How far CPU assist moves the staged walk up (0: not at all, chunks above 1,024 tokens keep the streamed walk).
+// STRATA_PREFILL_CPU_STAGE=3072 is architectds' setting, measured +32% at 2K tokens on a 5070 Ti over PCIe 3.0; on
+// an RTX 3060 over PCIe 4.0 x16 (StrataPool's desktop, 2026-10-06) the streamed walk was faster there - 2,100 tokens
+// 812 / 815 tok/s without the assist against 776 / 766 with the 3,072 staging, 3,000 tokens 911 / 910 against 845 / 838
+// - while the assist inside the default 1,024 still paid (560 tokens 349 / 353 against 394 / 387).
+int64_t cpu_stage_max() {
+    static const int64_t v = [] { const char* e = std::getenv("STRATA_PREFILL_CPU_STAGE"); return e ? (int64_t) std::atoll(e) : (int64_t) 0; }();
+    return v;
+}
 // EXPERIMENT (exp/h22-merge): STRATA_SPLIT_CPU_ASSIST=1 - CPU assist on a layer split's stages too.  It helps chunks of at
 // most 3,072 tokens, and a prompt that short is one chunk, which the stages run one after the other: one stage at a time
 // drives the pool.  g_pool_busy makes sure of it - a stage that finds the pool taken reads its chunk without it.
@@ -828,7 +837,7 @@ Prefill::Prefill() : impl_(new Impl) {}
 void Prefill::set_cpu_pool(strata::kernels::cpu::ExpertPool* pool) { pool_ = pool; }
 void Prefill::set_pool_node(bool on) { g_pool_node = on; }
 void Prefill::arm_cpu_assist(bool applies) {
-    if (applies && cpu_assist().on) g_stream_min_cpu = 3072;
+    if (applies && cpu_assist().on && cpu_stage_max() > 0) g_stream_min_cpu = cpu_stage_max();
 }
 Prefill::~Prefill() { release(); }
 
@@ -997,11 +1006,11 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         err = "prefill: the stage's layer range is wrong";
         return false;
     }
-    // CPU assist on this path (every layer, a pool): its chunks are staged after routing up to 3,072 tokens - before
+    // CPU assist on this path (every layer, a pool): with STRATA_PREFILL_CPU_STAGE its chunks are staged up to that - before
     // the ring is sized below, and before any request's loan is (bytes_needed counts the ring the same way)
     if (pool_ != nullptr && cpu_assist().on &&
         (split_cpu_assist() || (stage_lb_ == 0 && stage_le_ == g.n_layers && next_ == nullptr)))
-        g_stream_min_cpu = 3072;
+        g_stream_min_cpu = cpu_stage_max();
     for (int b = 0; hands_on && b < 2; ++b)
         if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
             err = "prefill: the layer split's hand-off buffers";
