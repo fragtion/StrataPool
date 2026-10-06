@@ -3563,10 +3563,6 @@ def make_handler(svc: Service):
             super().handle_one_request()
             self._drain_body()
 
-        def _body(self) -> bytes:
-            self.body_read = True
-            return self.rfile.read(int(self.headers.get("Content-Length", 0)))
-
         def _drain_body(self):
             """An answer sent before the body was read (a 401, a 403, /load, a method with no handler) must not close
             the connection on unread bytes: the close then sends a reset, and a client that sends its body after the
@@ -3862,6 +3858,7 @@ def make_handler(svc: Service):
             """The request body, read once (routing reads it before the handler to check the pool's signature)."""
             if getattr(self, "_raw", None) is None:
                 self._raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self.body_read = True                        # nothing left for the drain to wait for (#594)
             return self._raw
 
         def _pool_signed(self, path) -> bool:
