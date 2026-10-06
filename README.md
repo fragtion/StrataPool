@@ -16,6 +16,12 @@
 > **[docs/POOL.md](docs/POOL.md)** for what each mode does.
 > Everything below is Strata's own README and applies unchanged, with one difference: StrataPool compiles its engine at
 > the first `START-HERE.bat` (10-20 minutes, once), because Strata's ready-made engines do not include the layer split.
+>
+> **Branches:** `main` is Strata's own history plus one commit holding all of StrataPool's changes. That commit is
+> replaced with each sync, so `main` is force-pushed, and Strata rewrote its own history once (October 2026). The full
+> history of every change is on **[`pool-support`](https://github.com/fragtion/StrataPool/tree/pool-support)**, which only
+> moves forward and has the same files as `main`. The `main` from before Strata's rewrite is kept as the tag
+> `archive/main-before-upstream-rewrite`.
 
 ### What a split pool did on our two PCs
 
