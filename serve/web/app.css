@@ -143,6 +143,14 @@ main { flex: 1; min-height: 0; display: flex; }
 .facts dd { margin: 0; color: var(--st-ink-soft); font-variant-numeric: tabular-nums; display: flex; align-items: center; gap: 6px;
             overflow-wrap: anywhere; }
 .facts dd code { font: 400 13px var(--st-font-mono); }
+/* Pool tab: this PC's addresses - one per line of chips, never broken inside an address */
+.facts dd .addr-list { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; min-width: 0; }
+.facts dd code.addr { white-space: nowrap; }
+.addr-more summary { cursor: pointer; color: var(--st-ink-muted); font-size: var(--st-fs-sm, 12px); list-style: none; }
+.addr-more summary::-webkit-details-marker { display: none; }
+.addr-more summary::before { content: "+ "; }
+.addr-more[open] summary::before { content: "\2013  "; }
+.addr-more .addr-rest { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; }
 .facts .st-btn--icon { width: 28px; height: 28px; }
 .facts .st-btn--icon .st-icon { width: 16px; height: 16px; }
 .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: var(--st-s-4); font-size: var(--st-fs-sm);
@@ -207,6 +215,7 @@ main { flex: 1; min-height: 0; display: flex; }
 .pool-explain ul { margin: 6px 0 0; padding-left: 18px; }
 .pool-note { display: block; margin-top: 6px; padding: 8px 12px; border-radius: var(--st-r-md); line-height: 1.5;
              background: var(--st-warn-tint); color: var(--st-warn-text); border-left: 3px solid var(--st-warn); }
+.pool-note[hidden] { display: none; }
 .pool-explain li + li { margin-top: 4px; }
 .pool-notice { padding: 12px 14px; border-radius: var(--st-r-md); font-size: var(--st-fs-sm); line-height: 1.5;
                background: var(--st-info-tint); color: var(--st-info-text); }

@@ -61,7 +61,8 @@ std::string ModelFingerprint::mismatch(const KV& w) const {
 PoolLink::~PoolLink() {
     bye();   // the workers keep their layers loaded for the next coordinator
     if (stream_) cudaStreamDestroy((cudaStream_t) stream_);
-    for (void* p : {(void*) R_dev_, (void*) mixed_dev_, (void*) xq_dev_, (void*) logits_dev_, (void*) R_odd_})
+    for (void* p : {(void*) R_dev_, (void*) mixed_dev_, (void*) xq_dev_, (void*) logits_dev_, (void*) R_odd_,
+                    (void*) hist_dev_})
         if (p) cudaFree(p);
     if (pl_ev_) cudaEventDestroy((cudaEvent_t) pl_ev_);
     for (void* p : {(void*) out_host_, (void*) rows_host_, (void*) pf_host_})
@@ -701,16 +702,56 @@ void PoolLink::pick_rows(int S, const int* slot, const int64_t* pos) {
     greedy.greedy = true;
     greedy.temperature = 0.0f;
     strata::kernels::sample_tokens(logits_dev_, S, (int) n_vocab_, nullptr, 0, greedy, out_dev_, cs);
-    // a sampled slot's row again with its own parameters: Philox(seed, position), as its solo window draws it
-    for (int r = 0; r < S; ++r) {
-        if (slot[r] < 0 || slot[r] >= (int) slot_sp_.size()) continue;
-        strata::kernels::SamplerParams sp = slot_sp_[(size_t) slot[r]];
-        if (sp.greedy || sp.temperature <= 0.0f) continue;
-        sp.counter = (uint64_t) pos[r];
-        sp.penalty_last_n = 0;
-        strata::kernels::sample_tokens(logits_dev_ + (size_t) r * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,
-                                       out_dev_ + r, cs);
+    if (hist_dev_ == nullptr && cudaMalloc((void**) &hist_dev_, (size_t) kMaxBatchRows * kHistCap * 4) != cudaSuccess) {
+        cudaGetLastError();
+        hist_dev_ = nullptr;   // (then no penalties, as one PC's batch windows)
     }
+    // a slot's row again with its own parameters: Philox(seed, position), as its solo window draws it, and its
+    // repetition penalties over the history its solo window would count (set_slot_window)
+    bool penalized = false;
+    for (int r = 0; r < S; ++r) {
+        const int b = slot[r];
+        if (b < 0 || b >= (int) slot_sp_.size()) continue;
+        int j = 0;   // this row's index among its slot's rows in the window
+        for (int q = 0; q < r; ++q) j += slot[q] == b ? 1 : 0;
+        strata::kernels::SamplerParams sp = slot_sp_[(size_t) b];
+        const bool sampled = !sp.greedy && sp.temperature > 0.0f;
+        const int hn = (size_t) b < slot_hist_n_.size() ? slot_hist_n_[(size_t) b] : 0;
+        const bool hist = hist_dev_ != nullptr && hn > 0 && j < slot_hist_T_[(size_t) b] &&
+                          slot_hist_[(size_t) b].size() >= (size_t) (j + 1) * (size_t) hn;
+        if (!sampled && !hist) continue;
+        sp.counter = (uint64_t) pos[r];
+        if (!hist) {
+            sp.penalty_last_n = 0;
+            strata::kernels::sample_tokens(logits_dev_ + (size_t) r * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0,
+                                           sp, out_dev_ + r, cs);
+            continue;
+        }
+        int32_t* hd = hist_dev_ + (size_t) r * kHistCap;
+        cudaMemcpyAsync(hd, slot_hist_[(size_t) b].data() + (size_t) j * (size_t) hn, (size_t) hn * 4,
+                        cudaMemcpyHostToDevice, cs);
+        strata::kernels::sample_tokens(logits_dev_ + (size_t) r * (size_t) n_vocab_, 1, (int) n_vocab_, hd, hn, sp,
+                                       out_dev_ + r, cs);
+        penalized = true;
+    }
+    if (penalized) ++penalized_windows;
+}
+
+void PoolLink::set_slot_window(int slot, const int32_t* consumed, size_t n_consumed, const int32_t* window, int T) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (slot < 0 || slot >= kMaxBatchRows || T < 1 || T > kMaxBatchRows) return;
+    if ((int) slot_hist_.size() <= slot) {
+        slot_hist_.resize((size_t) slot + 1);
+        slot_hist_n_.resize((size_t) slot + 1, 0);
+        slot_hist_T_.resize((size_t) slot + 1, 0);
+    }
+    const int want = (size_t) slot < slot_sp_.size() ? slot_sp_[(size_t) slot].penalty_last_n : 0;
+    const int hn = std::min(std::max(want, 0), kHistCap);
+    slot_hist_n_[(size_t) slot] = hn;
+    slot_hist_T_[(size_t) slot] = hn > 0 ? T : 0;
+    if (hn == 0) return;
+    slot_hist_[(size_t) slot].resize((size_t) T * (size_t) hn);
+    strata::kernels::penalty_rows(consumed, (int64_t) n_consumed, window, T, hn, slot_hist_[(size_t) slot].data());
 }
 
 // --batch-mtp: the coordinator's verifier ran its layers over every live slot's rows (hand-off rows [0, S)); the

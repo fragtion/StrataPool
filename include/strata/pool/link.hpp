@@ -104,8 +104,13 @@ public:
     bool run_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out,
                   std::string& err) override;
     bool commit_rows(const int* keep, int n, std::string& err) override;
-    /// a slot's sampling for its batch rows (greedy until set; penalties are not applied in batch windows)
+    /// a slot's sampling for its batch rows (greedy until set).  Its repetition penalties apply too once the slot's
+    /// rows of the next window are given with set_slot_window (the head is here, so a pool can; one PC cannot)
     void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp);
+    /// the penalty history of slot `slot`'s rows in its next batch window: what its sessions hold (`consumed`) and
+    /// the window's tokens for that slot (`T` of them: the fed-back token, then a draft with --batch-mtp).  Nothing
+    /// when the slot's sampling has no penalty window (penalty_last_n 0).
+    void set_slot_window(int slot, const int32_t* consumed, size_t n_consumed, const int32_t* window, int T);
     /// every worker copies its main session's first ids.size() tokens into slot `slot` (load) or the slot's back
     /// into its main session (!load), as this PC does for its own layers; returns when all are done
     bool slot_copy(bool load, int slot, const std::vector<int32_t>& ids, std::string& err);
@@ -117,6 +122,7 @@ public:
     const std::vector<float>& last_batch_rows() const { return batch_.back().rows; }
     double ms_batch_net = 0;    ///< batch groups: from the send to a worker to its rows back, summed
     int64_t batch_windows = 0;  ///< batch groups through the head here
+    int64_t penalized_windows = 0;   ///< ... of them with a slot's repetition penalties applied
 
     // ---- --pipeline-windows: the later stage of a pipelined decode (core::PipeRemote).  This PC's two first-stage
     // verifiers (one per window parity) each write their own hand-off; `pipe_init` gives the link both, and a second
@@ -189,6 +195,10 @@ private:
     int32_t batch_out_[kMaxBatchRows] = {};
     bool batch_head_ = true;
     std::vector<strata::kernels::SamplerParams> slot_sp_;
+    static constexpr int kHistCap = 4096;              ///< the longest penalty window (generate.cpp's kPenaltyWindowCap)
+    std::vector<std::vector<int32_t>> slot_hist_;      ///< per slot: its next window's rows, hist_n each (host)
+    std::vector<int> slot_hist_n_, slot_hist_T_;
+    int32_t* hist_dev_ = nullptr;                      ///< kMaxBatchRows rows of kHistCap (device, lazily)
     bool head_logits(int T, std::string& err, const float* R = nullptr);
     /// the picks of S rows of logits_dev_ (head_logits done): greedy, then each sampled slot's row again (slot[r], pos[r])
     void pick_rows(int S, const int* slot, const int64_t* pos);

@@ -8850,6 +8850,12 @@ int main(int argc, char** argv) {
                 }
             }
             if (batch_mtp && A > 0) next_slot = ((size_t) active[A - 1] + 1) % bs.size();
+            if (pool_coord)   // POOL: each slot's penalty history for its rows (the head runs here)
+                for (int a = 0; a < A; ++a) {
+                    const BSlot& sl = bs[(size_t) active[a]];
+                    const int nrow = (a + 1 < A ? first[a + 1] : S) - first[a];
+                    pool_link.set_slot_window(active[a], sl.ids.data(), sl.ids.size(), tok + first[a], nrow);
+                }
             if (S == 0) return true;
             const bool was_busy = strata::core::progress().busy.load();
             strata::core::progress().busy.store(true);
@@ -9048,6 +9054,10 @@ int main(int argc, char** argv) {
                         G.tok[t] = sl.active ? sl.x : 0;
                         G.pos[t] = sl.active ? sl.p : 0;
                         if (!sl.active) sl.cached = false;   // its pad row writes its state
+                        // POOL: the head is here, so the slot's repetition penalties apply (one PC's batch windows
+                        // have none): its history is what its sessions hold, then the token it is fed now
+                        if (pool_coord && sl.active)
+                            pool_link.set_slot_window(pick * GS + t, sl.ids.data(), sl.ids.size(), &sl.x, 1);
                     }
                     G.inflight = true;
                     G.stage = 0;
