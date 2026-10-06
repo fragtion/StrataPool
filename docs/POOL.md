@@ -248,8 +248,10 @@ says so). Requests with repetition penalties (`penalty_last_n`) overlap too: the
 window after the one before it. Since that measurement the coordinator serves the verified window's layers before a
 guessed one's (a guessed window one layer at a time while the workers run the verified one), guesses more often (the
 gate went from 0.20 to 0.10), and keeps copying from the prompt lookup across windows when the text repeats an earlier
-stretch (all three from architectds' fork, which measured +8.9% on a two-GPU PC). That has not been measured on the
-desktop + laptop pool yet: compare a few long replies with it on and off.
+stretch (all three from architectds' fork, which measured +8.9% on a two-GPU PC). Measured on the same pool with
+tools/pool_bench.py (greedy, 2026-10-06), against the defaults: code 55.4 against 51.3 tok/s (+8%), prose 50.5 against
+52.2 (-3%), the answer to a 9.8K-token document 50.1 against 48.8 (+3%). Keep it on if your replies are mostly code;
+compare on your own PCs.
 
 ## Drafts in several chats
 

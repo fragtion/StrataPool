@@ -1,0 +1,60 @@
+{
+ "label": "sp-split-overlap",
+ "run": "726db580",
+ "url": "http://127.0.0.1:8080",
+ "at": "2026-10-06 22:24:05",
+ "sampling": {
+  "temperature": 0,
+  "presence_penalty": 1.0,
+  "penalty_last_n": 512,
+  "reasoning_effort": "none"
+ },
+ "total_s": 64.9,
+ "results": [
+  {
+   "test": "code",
+   "wall_s": 22.94,
+   "prompt_tokens": 111,
+   "reused": 0,
+   "read": 111,
+   "prompt_ms": 1273.3,
+   "prompt_tok_s": 87.2,
+   "generated": 1200,
+   "decode_ms": 21658.7,
+   "decode_tok_s": 55.4,
+   "drafts": 921,
+   "accepted": 757,
+   "finish": "length"
+  },
+  {
+   "test": "prose",
+   "wall_s": 20.63,
+   "prompt_tokens": 75,
+   "reused": 0,
+   "read": 75,
+   "prompt_ms": 807.6,
+   "prompt_tok_s": 92.9,
+   "generated": 1000,
+   "decode_ms": 19812.4,
+   "decode_tok_s": 50.5,
+   "drafts": 620,
+   "accepted": 466,
+   "finish": "length"
+  },
+  {
+   "test": "long (~8K)",
+   "wall_s": 20.15,
+   "prompt_tokens": 9842,
+   "reused": 0,
+   "read": 9842,
+   "prompt_ms": 14135.6,
+   "prompt_tok_s": 696.3,
+   "generated": 300,
+   "decode_ms": 5983.2,
+   "decode_tok_s": 50.1,
+   "drafts": 229,
+   "accepted": 169,
+   "finish": "length"
+  }
+ ]
+}
