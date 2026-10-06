@@ -216,8 +216,8 @@ is accepted whole and what its next word is; when the verdict says otherwise, th
 back and runs the right window. The workers only ever get verified windows, in order, so nothing changes on them (a
 worker started with an older engine works too). It helps most when the workers' part and the network are a large share
 of a window. Upstream measured +14-16% on two GPUs in one PC; in a pool it is new, so compare a few long replies with it
-on and off. It needs the draft layer and is off while several chats run (the log says so); requests with repetition
-penalties decode serially.
+on and off. It needs the draft layer and is off while several chats run (the log says so). Requests with repetition
+penalties (`penalty_last_n`) overlap too: the head on the coordinator sees each window after the one before it.
 
 ## Drafts in several chats
 

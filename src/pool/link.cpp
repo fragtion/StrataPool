@@ -529,17 +529,19 @@ int PoolLink::pl_poll(int parity, std::string& err) {
         return -1;
     }
     if (!head_logits(pl_T_, err, R)) return -1;
-    // run()'s rule: greedy, or this request's sampling with Philox(seed, pos0 + t) (the pipelined loop keeps requests
-    // with repetition penalties serial)
+    // run()'s rule: greedy, or this request's sampling with Philox(seed, pos0 + t) and its penalties (the loop staged
+    // this window's penalty rows before its launch, once the verdict before it was known)
     strata::kernels::SamplerParams sp;
-    if (!sampling_.greedy && sampling_.temperature > 0.0f) {
+    const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
+    if (sampled || hist_d_ != nullptr) {
         sp = sampling_;
         sp.counter = (uint64_t) pl_pos_;
+        strata::kernels::sample_tokens(logits_dev_, pl_T_, (int) n_vocab_, hist_d_, hist_len_, sp, out_dev_, cs);
     } else {
         sp.greedy = true;
         sp.temperature = 0.0f;
+        strata::kernels::sample_tokens(logits_dev_, pl_T_, (int) n_vocab_, nullptr, 0, sp, out_dev_, cs);
     }
-    strata::kernels::sample_tokens(logits_dev_, pl_T_, (int) n_vocab_, nullptr, 0, sp, out_dev_, cs);
     if (cudaEventRecord((cudaEvent_t) pl_ev_, cs) != cudaSuccess) { err = "pool: event record failed"; return -1; }
     (void) cudaStreamQuery(cs);   // WDDM: submit now
     pl_phase_ = 2;
