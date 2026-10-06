@@ -235,6 +235,9 @@ out of the pool. The automatic split would give it as few layers as it can.
 - **Conversation parking** (whole-chat snapshots in RAM). The per-chat checkpoints (`--prompt-cache`) work across
   the pool: each worker keeps its own layers' part.
 - **Several GPUs in one pool PC.** Each pool PC uses one GPU, and the pool is the split.
+- From Strata 0.1.40: **`--pipeline-windows`** and **`--batch-mtp`** (they say they are off), **`--kv-grow`** (the
+  elastic K/V; off with a note) and **session files** (`/slots/0?action=save|restore` answers that a pool does not
+  support them yet).
 
 ## Engine flags
 
