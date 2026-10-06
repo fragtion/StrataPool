@@ -3030,7 +3030,14 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
 // `unbuffered` (Windows, experts_unbuffered): each chunk's 4 KiB-aligned window is read with FILE_FLAG_NO_BUFFERING into
 // an aligned buffer and scattered into the blobs - no copy through the file cache when the drive is read anyway.
 LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
-                            int threads, bool unbuffered, int64_t lb = 0, int64_t le = -1) {
+                            int threads, bool unbuffered, const std::atomic<int>* ready, int64_t lb, int64_t le) {
+    // `ready`: layer l is written only once *ready > l + 1 (a PinnedArena registering its slices meanwhile; the next
+    // slice too, since its registration starts on the page that may hold this layer's tail).  POOL: the slices are
+    // the range's, so layer l is slice l - lb
+    auto wait_ready = [ready, lb](int64_t l) {
+        if (ready != nullptr)
+            while (ready->load(std::memory_order_acquire) <= l - lb + 1) std::this_thread::yield();
+    };
     LoadStats st;
     if (le < 0) le = lay.n_layers;
     st.layers = (uint64_t) (le - lb);
@@ -3061,6 +3068,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
             for (;;) {
                 const int64_t l = next.fetch_add(1);
                 if (l >= le || bad) break;
+                wait_ready(l);
                 const auto& fm = lay.fmt[(size_t) l];
                 const uint64_t blob = lay.bytes[(size_t) l];
                 const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
@@ -3139,6 +3147,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
         for (;;) {
             const int64_t l = next.fetch_add(1);
             if (l >= le || bad) break;
+            wait_ready(l);
             const auto& fm = lay.fmt[(size_t) l];
             const uint64_t blob = lay.bytes[(size_t) l];
             const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
@@ -3360,20 +3369,23 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     const bool unbuffered = experts_unbuffered(files, want + (uint64_t) blob, why);
     const int readers = unbuffered ? std::max(threads, 16) : threads;   // 16 keep a PCIe 5 drive's queue full
     LoadStats st;
-    if (from_gguf) {
-        st = load_experts_gguf(gguf_, biased, lay, readers, unbuffered, rlb, rle);
-    } else {
-        if (unbuffered) st = load_experts_direct(path, biased, loff, lbytes, readers, /*chunk=*/8u << 20);
-        if (!unbuffered || (!st.ok && st.error.empty()))   // unaligned ranges: the buffered reader
-            st = load_experts_ranges(path, biased, loff, lbytes, threads, /*chunk=*/8u << 20);
+    std::atomic<int> ready{0};
+    std::thread reg;
+    if (deferred) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        reg = std::thread([a, &ready, dev] {
+            cudaSetDevice(dev);
+            a->register_slices(ready);
+        });
     }
     const std::atomic<int>* rp = deferred ? &ready : nullptr;
     if (from_gguf) {
-        st = load_experts_gguf(gguf_, a->data(), lay, readers, unbuffered, rp);
+        st = load_experts_gguf(gguf_, biased, lay, readers, unbuffered, rp, rlb, rle);
     } else {
-        if (unbuffered) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20, rp);
+        if (unbuffered) st = load_experts_direct(path, biased, loff, lbytes, readers, /*chunk=*/8u << 20, rp);
         if (!unbuffered || (!st.ok && st.error.empty()))   // unaligned ranges: the buffered reader
-            st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20, rp);
+            st = load_experts_ranges(path, biased, loff, lbytes, threads, /*chunk=*/8u << 20, rp);
     }
     if (reg.joinable()) reg.join();
     std::fprintf(stderr, "strata generate: expert arena read %s (%s)\n", unbuffered ? "unbuffered" : "through the file cache",

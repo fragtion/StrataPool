@@ -790,8 +790,10 @@ private:
 bool check_experts_gguf(const std::string& native, const strata::kernels::cpu::ExpertLayout& lay, std::string& err);
 /// Fills `dst` (lay.total bytes, the experts.bin layout) from the GGUF files, one role at a time.
 /// `unbuffered`: each chunk read past the file cache (Windows); `ready`: layer l is written only once
-/// *ready > l + 1 (an arena that is still being registered).
+/// *ready > l + 1 (an arena that is still being registered).  POOL: only the layers [lb, le) (le < 0: to the end);
+/// `dst` is still addressed as the whole layout (a range-sized arena hands its base biased back by the range's start).
 LoadStats load_experts_gguf(const std::string& native, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
-                            int threads, bool unbuffered = false, const std::atomic<int>* ready = nullptr);
+                            int threads, bool unbuffered = false, const std::atomic<int>* ready = nullptr,
+                            int64_t lb = 0, int64_t le = -1);
 
 }  // namespace strata::core

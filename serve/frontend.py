@@ -148,25 +148,33 @@ def images_of(messages: list[dict]) -> list[str]:
 # a user quoting "</think>" used to hand the model a real end-of-reasoning token.  Before the template is rendered
 # they are swapped for these private-use characters, and the server encodes the spans they mark as ordinary text.
 THINK_TAGS = {"<think>": "\U000F0E01", "</think>": "\U000F0E02"}
-CONTROL_MARK0 = 0xF0E10      # the control tokens' marks start here, clear of the think tags' two
+# #554: the vision markers the same way.  They are special tokens only where the template writes them for an image
+# item; the same strings in a message's text (an agent reading chat_template.jinja, a tool result quoting it) became
+# the same special ids, so text with <|vision_start|><|image_pad|> before a picture took that picture's embeddings
+VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", "<|vision_end|>": "\U000F0E05",
+               "<|video_pad|>": "\U000F0E06"}
+LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS}
+THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
+CONTROL_MARK0 = 0xF0E10      # the control tokens' marks start here, clear of the two sets above
 
 
 def literal_tags(controls) -> dict[str, str]:
-    """THINK_TAGS plus a mark for each control token's text (`controls`: the tokenizer's CONTROL literals,
+    """LITERAL_TAGS plus a mark for each control token's text (`controls`: the tokenizer's CONTROL literals,
     <|im_start|>, <|im_end|>, <|endoftext|>, ...).  The rendered prompt is encoded with those literals parsed, so one
-    written inside a message - a file an agent reads, a pasted chat template - opened or ended a turn there.
-    Longest first, as the tokenizer matches them: a literal inside a longer one is not marked before it."""
-    tags = {**THINK_TAGS, **{c: chr(CONTROL_MARK0 + k) for k, c in enumerate(controls)}}
+    written inside a message - a file an agent reads, a pasted chat template - opened or ended a turn there.  Longest
+    first, as the tokenizer matches them: a literal inside a longer one is not marked before it."""
+    tags = {**LITERAL_TAGS, **{c: chr(CONTROL_MARK0 + k) for k, c in enumerate(c for c in controls
+                                                                                if c not in LITERAL_TAGS)}}
     return dict(sorted(tags.items(), key=lambda t: -len(t[0])))
 
 
-def _mark(text: str, tags: dict[str, str]) -> str:
+def _mark(text: str, tags: dict[str, str] = LITERAL_TAGS) -> str:
     for tag, mark in tags.items():
         text = text.replace(tag, mark)
     return text
 
 
-def _mark_deep(v, tags):
+def _mark_deep(v, tags: dict[str, str] = LITERAL_TAGS):
     if isinstance(v, str):
         return _mark(v, tags)
     if isinstance(v, dict):
@@ -176,7 +184,7 @@ def _mark_deep(v, tags):
     return v
 
 
-def _has_tag(v, tags) -> bool:
+def _has_tag(v, tags: dict[str, str] = LITERAL_TAGS) -> bool:
     if isinstance(v, str):
         return any(tag in v for tag in tags)
     if isinstance(v, dict):
@@ -186,12 +194,12 @@ def _has_tag(v, tags) -> bool:
     return False
 
 
-def mark_literals(messages: list[dict], tools: list[dict] | None, tags: dict[str, str]):
-    """#537: (messages, tools) with every literal of `tags` (<think> / </think>, and with literal_tags() the control
-    tokens' texts) in their text swapped for its mark, and whether there was one (None: no change, the same objects
-    back - a prompt without them renders as it always did).  An assistant message whose content opens with a whole
-    <think>...</think> block (clients that send the reasoning inline) keeps that one block as the model's markers,
-    as before."""
+def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: dict[str, str] = LITERAL_TAGS):
+    """#537: (messages, tools) with every literal <think> / </think> (#554: and vision marker) in their text swapped for
+    LITERAL_TAGS' marks (or `tags`': literal_tags() adds the control tokens' texts), and
+    whether there was one (None: no change, the same objects back - a prompt without them renders as it always did).
+    An assistant message whose content opens with a whole <think>...</think> block (clients that send the reasoning
+    inline) keeps that one block as the model's markers, as before."""
     if not _has_tag(messages, tags) and not _has_tag(tools, tags):
         return messages, tools, False
     out = []
@@ -210,12 +218,16 @@ def mark_literals(messages: list[dict], tools: list[dict] | None, tags: dict[str
     return out, _mark_deep(tools, tags), True
 
 
-def unmark_literals(prompt: str, tags: dict[str, str]) -> tuple[str, list[tuple[int, int]]]:
-    """The rendered prompt with the marks turned back into their literals' text, and the (start, end) spans of those
-    literals in it: the server encodes them as ordinary text (the tokenizer's `plain` spans)."""
-    marks = {v: k for k, v in tags.items()}
+_THINK_MARK_RE = re.compile("|".join(THINK_MARKS))
+
+
+def unmark_think_literals(prompt: str, tags: dict[str, str] = LITERAL_TAGS) -> tuple[str, list[tuple[int, int]]]:
+    """The rendered prompt with THINK_TAGS' marks turned back into the tags' text, and the (start, end) spans of those
+    tags in it: the server encodes them as ordinary text (the tokenizer's encode_plain_spans)."""
+    marks = THINK_MARKS if tags is LITERAL_TAGS else {v: k for k, v in tags.items()}
+    mark_re = _THINK_MARK_RE if tags is LITERAL_TAGS else re.compile("|".join(map(re.escape, marks)))
     out, spans, pos, n = [], [], 0, 0
-    for m in re.finditer("[" + "".join(marks) + "]", prompt):
+    for m in mark_re.finditer(prompt):
         out.append(prompt[pos:m.start()])
         n += m.start() - pos
         tag = marks[m.group(0)]
@@ -441,22 +453,6 @@ CALL_END = "</tool_call>"
 PARAM_END = "</parameter>"
 FUNC_START = "<function="
 FUNC_END = "</function>"
-FUNC_START = "<function="
-FENCES = ("```", "~~~")
-
-
-def _lines(state: tuple[bool, str], text: str) -> tuple[bool, str]:
-    """Follow the reasoning text line by line: (inside a ``` or ~~~ fence, the start of the current line so far)."""
-    fence, line = state
-    parts = text.split("\n")
-    for k, part in enumerate(parts):
-        if len(line) < 16:
-            line = (line + part)[:16]
-        if k < len(parts) - 1:              # the line ended
-            if line.lstrip().startswith(FENCES):
-                fence = not fence
-            line = ""
-    return fence, line
 
 
 def param_end(text: str, final: bool = False) -> int:
@@ -612,11 +608,6 @@ class OutputParser:
         self.refused = 0             # declared calls kept as reasoning text (quoted, or the turn was cut)
         self.fence, self.line, self.ticks = "", "", 0
         self._reset_scan()
-        # A tool call written inside the thinking, without </think> first (seen with Qwen3.8-Flash-Next): ends the
-        # thinking implicitly (vLLM PR #35687 does the same).  Only a real call does - see _implicit_call.
-        self.implicit_ends = 0       # how many times this reply did that (the server logs and counts them)
-        self.implicit_open = False   # the call being read began inside the thinking
-        self.rstate = (False, "")    # _lines() of the reasoning already emitted
 
     def _track(self, text: str) -> str:
         """Follow the reasoning text that has gone out: the open code fence, the current line, and the backticks of
@@ -800,18 +791,21 @@ class OutputParser:
                             call = parse_tool_call(body[:end], self.schemas.get(name))
                     except ValueError:
                         pass
-                    if call is not None:
-                        out.append(Event("tool_call", call=call))
+                    raw = self.buf[:len(CALL_START) + end + len(CALL_END)]
+                    if call is not None or self.pending:
+                        self.pending.append([raw, call])    # settled by what follows it (see __init__)
                     else:
-                        out.append(Event("reasoning", self.buf[:len(CALL_START) + end + len(CALL_END)]))
+                        out.append(Event("reasoning", self._track(raw)))
                     self.buf = body[end + len(CALL_END):]
                     self.state = "reasoning"
                 elif think >= 0:                     # the thinking ended inside it: it never was a call
-                    out.append(Event("reasoning", self.buf[:len(CALL_START) + think]))
+                    out += self._release(False)
+                    out.append(Event("reasoning", self._track(self.buf[:len(CALL_START) + think])))
                     self.buf = body[think:]
                     self.state = "reasoning"
                 elif len(body) > RCALL_MAX:          # a tag in the prose that never closes: stop holding the thinking back
-                    out.append(Event("reasoning", self.buf))
+                    out += self._release(False)
+                    out.append(Event("reasoning", self._track(self.buf)))
                     self.buf = ""
                     self.state = "reasoning"
                 else:
@@ -839,18 +833,22 @@ class OutputParser:
                 tool = self.buf.find(CALL_START) if self.schemas else -1
                 if tool >= 0 and (i < 0 or tool < i):
                     if tool:
-                        out.append(Event("reasoning", self.buf[:tool]))
-                    self.buf = self.buf[tool:]
-                    self.state = "rcall"
+                        out.append(Event("reasoning", self._track(self.buf[:tool])))
+                    if self._opener_ok():
+                        self.buf = self.buf[tool:]
+                        self.state = "rcall"
+                    else:                            # mid-sentence, in a fence or in inline code: a quote
+                        out.append(Event("reasoning", self._track(CALL_START)))
+                        self.buf = self.buf[tool + len(CALL_START):]
                     continue
                 if i < 0:
-                    keep = self._hold(self.buf, (THINK_END, CALL_START))
+                    keep = self._hold(self.buf, (THINK_END, CALL_START) if self.schemas else (THINK_END,))
                     if len(self.buf) > keep:
-                        out.append(Event("reasoning", self.buf[:len(self.buf) - keep]))
+                        out.append(Event("reasoning", self._track(self.buf[:len(self.buf) - keep])))
                         self.buf = self.buf[len(self.buf) - keep:]
                     return out
                 if i:
-                    out.append(Event("reasoning", self.buf[:i]))
+                    out.append(Event("reasoning", self._track(self.buf[:i])))
                 self.buf = self.buf[i + len(THINK_END):]
                 self.state, self.lead = "content", True
                 self.fence, self.line, self.ticks = "", "", 0     # the answer's own text starts here
@@ -922,12 +920,16 @@ class OutputParser:
                     call.id = self.scall.id
                 out.append(Event("tool_call", call=call))
                 self._reset_scan()
-                self.state, self.lead, self.implicit_open = "content", True, False
+                self.state, self.lead = "content", True
 
-    def finish(self) -> list[Event]:
+    def finish(self, reason: str | None = None) -> list[Event]:
         """End of generation: flush whatever is held (an unterminated tool call is returned as content; one that was
-        already announced stays unfinished: its JSON is not closed and no "tool_call" follows it, #211)."""
+        already announced stays unfinished: its JSON is not closed and no "tool_call" follows it, #211).  `reason` is
+        how the turn ended: calls waiting from the reasoning become real calls only on a natural stop (None = stop);
+        a turn cut by max tokens (or cancelled, or failed) keeps them as reasoning text (#1058)."""
         out = []
+        if self.pending:
+            out += self._release(reason in (None, "stop") and self.state == "reasoning" and not self.buf)
         if self.state == "call" and self.stream_tools and self.scall is not None:
             out += self._scan()                 # the output ended inside a call that was already announced
             if self.ss == "done":               # only its </tool_call> is missing: the call itself is whole
@@ -936,9 +938,8 @@ class OutputParser:
             self._reset_scan()
             return out
         if self.buf:
-            kind = {"reasoning": "reasoning", "content": "content"}.get(self.state, "content")
-            if self.state == "call" and self.implicit_open:     # an implicit call never finished: still thinking
-                kind = "reasoning"
+            # an unfinished call inside the reasoning (#804) is reasoning text, never a call
+            kind = {"reasoning": "reasoning", "rcall": "reasoning", "content": "content"}.get(self.state, "content")
             text = self.buf if self.state != "call" else CALL_START + self.buf
             out.append(Event(kind, text))
             self.buf = ""

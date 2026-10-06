@@ -1876,6 +1876,14 @@ int main(int argc, char** argv) {
         }
         }
     }
+#if defined(STRATA_USE_HIP)
+    {   // gfx1151 (Strix Halo): the switches that are exact there are on by default (strata/core/arch_defaults.hpp); before
+        // any engine code reads its switches (they are read at first use), and the user's own settings are kept
+        cudaDeviceProp ad{};
+        if (cudaGetDeviceProperties(&ad, 0) == cudaSuccess) strata::core::apply_arch_defaults(ad.gcnArchName);
+        else (void) cudaGetLastError();
+    }
+#endif
     // ---- POOL: what a pool node can combine (yet).  A pool node runs one GPU; its layer range comes from the
     // coordinator (a worker) or from the split search (the coordinator), and the conversation parking (whole-session
     // snapshots) is single-PC.
@@ -3951,6 +3959,25 @@ int main(int argc, char** argv) {
         // a pool node carves only its own range: the context's state of the other layers is on the other PCs
         const int64_t lo0 = pool_any ? node_lb : 0;
         const int64_t hi0 = multi_gpu ? split_at[0] : pool_any ? node_le : -1;
+        // the elastic K/V (--kv-grow, see kvg_ensure): one GPU, the whole K/V in VRAM (no streaming), a profiled cache
+        // that can give slots up, and every expert in RAM for the CPU to compute the ones it gives up
+        {
+            const char* ev = std::getenv("STRATA_KV_GROW");
+            bool remote = false;
+            for (const int r : o.expert_cache_remote) remote = remote || r > 0;
+            const bool asked = ev != nullptr && ev[0] != '\0' ? ev[0] != '0' : o.kv_grow;
+            const bool on = asked && !multi_gpu && !pool_any && o.kv_resident <= 0 &&
+                            !o.expert_profile.empty() && !o.resident_cpu_experts && o.expert_cache != 0 && !remote &&
+                            strata::core::vmm_available() &&
+                            // the batch slots carve their own K/V and --vram-elastic's cache is not one VMM range
+                            o.batch == 0 && !o.vram_elastic && o.peer_device < 0;
+            if (asked && !on)
+                std::fprintf(stderr, "strata generate: --kv-grow is off (one GPU, a profile, the whole K/V in VRAM, "
+                                     "every expert in RAM, no --batch, --vram-elastic, --peer-device or pool)\n");
+            const char* iv = std::getenv("STRATA_KV_GROW_INIT");
+            strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
+            strata::core::ExpertCache::set_vmm(on);
+        }
         if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, lo0, hi0)) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
@@ -4018,7 +4045,8 @@ int main(int argc, char** argv) {
     if (batch_mtp) {
         const char* why = o.batch < 2 ? "it needs --batch 2 or more" : o.mtp.empty() ? "it needs --mtp"
                         : o.spec < 2 ? "it needs --spec T (T >= 2)" : (multi_gpu || split_same || !stages.empty())
-                        ? "it is for one GPU (no layer split or helper) for now" : !o.serve ? "it needs --serve" : nullptr;
+                        ? "it is for one GPU (no layer split or helper) for now" : !o.serve ? "it needs --serve"
+                        : pool_any ? "not in a pool yet" : nullptr;
         if (why != nullptr) {
             std::fprintf(stderr, "strata generate: WARNING: --batch-mtp is off: %s\n", why);
             batch_mtp = false;
@@ -4145,6 +4173,7 @@ int main(int argc, char** argv) {
     const int64_t n_vocab = wo->ne1;
     strata::core::NativeHead native_head;
     if (!o.native_head_gguf.empty() && !multi_gpu && !pool_worker) {   // a layer split's head is on its last stage
+        const auto head_t0 = std::chrono::steady_clock::now();
         if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
             std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str());
             return 1;
@@ -4370,12 +4399,14 @@ int main(int argc, char** argv) {
         const int64_t prefill_mib = owned_prefill_mib();
         // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
         // ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (#199)
-        const int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
-                                     ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
+        int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
+                               ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
+        for (const auto& d : slot_mtp)
+            mtp_bind += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
         // POOL: the pool's own buffers (hand-off rows, the coordinator's head logits, the draft layer's
         // prompt rows) are allocated after this, as the split assumed (96 MiB)
         const int64_t pool_mib = pool_any ? 96 : 0;
-        const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib + pool_mib) << 20) + mtp_bind;
+        const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib + pool_mib) << 20) + mtp_bind + pipe_first;
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         int64_t slots = ((int64_t) free_b - reserve) / blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
@@ -6078,12 +6109,18 @@ int main(int argc, char** argv) {
     }
     if (o.adapt_async && !src.complement_ready()) adapt_async_off("the resident RAM mode is not running");
     if (o.serve) {
-        if (o.spec < 2 || (o.mtp.empty() && !pool_worker) || o.prefill_chunk <= 0 ||
+        if (o.spec < 2 || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
             std::fprintf(stderr, "strata serve: needs --spec T and --prefill CHUNK (and a fillable "
                                  "--expert-cache; the graphed hit path additionally needs --expert-profile P)\n");
             return 2;
         }
+        // STRATA_VOLTA_BUILD backport (see docs/ and ninfer-flash-next-v100-backport): --mtp is optional here,
+        // mirroring the plain `generate` command's own use_mtp handling below. Without it, drafting falls back
+        // to the suffix/prompt-lookup drafter (DraftPolicy still picks Lookup vs plain per round) or, when
+        // neither fires, plain one-token-per-round decoding - slower, never wrong: the verify window still
+        // confirms every emitted token against the real model regardless of where the draft came from.
+        const bool use_mtp = !o.mtp.empty();
         // POOL: the workers have been loading their layers while this PC loaded its own; their prompt chunk
         // caps this one's (a chunk crosses every node whole)
         int64_t pool_chunk_cap = 0;
@@ -6673,6 +6710,50 @@ int main(int argc, char** argv) {
                           " (CUDA" + std::to_string(split_same ? 0 : stages[(size_t) st - 1]->dev) + ")";
             std::fprintf(stderr, "strata serve: layer split: layers %s, one hand-off per window\n", plan_s.c_str());
         }
+        // --pipeline-windows: the odd windows' verifiers and their hand-off (initialized before `ver`, which stays the
+        // watchdog's verifier), and the drafter's own row buffer, which either parity's rows are copied into
+        float* pl_mtp_R = nullptr;
+        if (pipe) {
+            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
+                              (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
+            float *hh = nullptr, *hand_b = nullptr;
+            if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                cudaHostGetDevicePointer((void**) &hand_b, hh, 0) != cudaSuccess) {
+                std::fprintf(stderr, "strata serve: --pipeline-windows: the second hand-off allocation failed\n");
+                return 1;
+            }
+            std::memset(hh, 0, hb);
+            GpuStage& gs = *stages[0];
+            ver_b.set_stage(0, split_at[0], nullptr, hand_b);
+            gs.ver_b.set_stage(split_at[0], -1, hand_b, nullptr);
+            {
+                const strata::core::OnDevice on(gs.dev);
+                strata::core::VerifyHits vs;
+                vs.d_res = gs.d_res;
+                vs.h_res = host_res.empty() ? nullptr : host_res.data();
+                vs.cache_base = gs.cache.device_slot(0);
+                vs.blob = thits.blob;
+                vs.slot_off = gs.cache.slot_offsets();
+                vs.n_slots = gs.cache.slots();
+                if (!gs.ver_b.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, o.spec, err)) {
+                    std::fprintf(stderr, "strata serve: --pipeline-windows: the second verifier on CUDA%d (the later "
+                                         "card): %s (raise --vram-reserve-mib by ~200, or --pipeline-windows 0)\n",
+                                 gs.dev, err.c_str());
+                    return 1;
+                }
+                if (cudaMalloc((void**) &pl_mtp_R, (size_t) strata::kernels::kVerifyMaxT * (size_t) (g.hc * g.n_embd) *
+                                                       sizeof(float)) != cudaSuccess) {
+                    std::fprintf(stderr, "strata serve: --pipeline-windows: the drafter's row buffer does not fit\n");
+                    return 1;
+                }
+            }
+            if (!ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
+                std::fprintf(stderr, "strata serve: --pipeline-windows: the second verifier on CUDA0 (the first card): "
+                                     "%s (raise --vram-reserve-mib by ~200, or --pipeline-windows 0)\n", err.c_str());
+                return 1;
+            }
+            ver_b.set_next(&gs.ver_b, &split_drive_b);   // the setters reach it; the pipeline never chains run/commit
+        }
         // POOL: this PC's verifier runs its layers and hands the window on: on the coordinator to the workers
         // (PoolLink, which runs the head here), on a worker back over the network (the worker loop)
         float* pool_hand_in = nullptr;    // worker: the rows the coordinator sends (mapped host)
@@ -6707,9 +6788,11 @@ int main(int argc, char** argv) {
             }
         }
         ver.set_remote_expert_opt(remote_opt.get());
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, o.batch), err) ||
-            (!pool_worker &&
-             !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err))) {
+        if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
+                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
+            (use_mtp && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
+                                  pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
@@ -7116,7 +7199,8 @@ int main(int argc, char** argv) {
                 if (c.pool_id != 0) ids.push_back(c.pool_id);
             return pool_link.ckpt_retain(ids, e);
         };
-        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, uint64_t pool_id = 0) -> bool {
+        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false,
+                                 uint64_t pool_id = 0) -> bool {
             ckpt_why.clear();
             if (o.prompt_cache <= 0 || L < 1) return true;
             for (ConvCheckpoint& c : checks)
@@ -7317,7 +7401,7 @@ int main(int argc, char** argv) {
                         part_at.erase(part_at.begin(), part_at.upper_bound(done));
                     }
                     const bool complete = parts.size() == 1 && !parts[0].gdn.empty() && ck != 0;
-                    if (complete && !checkpoint_at(done, &parts, ck)) {
+                    if (complete && !checkpoint_at(done, &parts, false, ck)) {
                         e = "saving a conversation checkpoint failed";
                         return false;
                     }
@@ -8536,6 +8620,17 @@ int main(int argc, char** argv) {
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
             }
+            if (batch_mtp) {
+                // Admission first builds the solo draft KV; copy it into the slot before drafting.
+                strata::core::ConversationKv image;
+                if (!mtp.idle(e) || !slot_mtp[(size_t) b]->idle(e) ||
+                    !strata::core::conversation_kv_save(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
+                    !strata::core::conversation_kv_restore(image, slot_mtp[(size_t) b]->kv_state(),
+                                                           draft_geometry, upto, false, e) ||
+                    cudaDeviceSynchronize() != cudaSuccess)
+                    return false;
+                slot_mtp[(size_t) b]->set_prompt_len(upto);
+            }
             if (pool_coord && !pool_link.slot_copy(true, b, ids, e)) return false;   // the workers' layers too
             return true;
         };
@@ -8570,6 +8665,17 @@ int main(int argc, char** argv) {
                         return false;
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
+            }
+            if (batch_mtp) {
+                // A returning solo request resumes from its slot's draft KV.
+                strata::core::ConversationKv image;
+                if (!slot_mtp[(size_t) b]->idle(e) || !mtp.idle(e) ||
+                    !strata::core::conversation_kv_save(image, slot_mtp[(size_t) b]->kv_state(),
+                                                        draft_geometry, upto, false, e) ||
+                    !strata::core::conversation_kv_restore(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
+                    cudaDeviceSynchronize() != cudaSuccess)
+                    return false;
+                mtp.set_prompt_len(upto);
             }
             if (pool_coord && !pool_link.slot_copy(false, b, bs[(size_t) b].ids, e)) return false;   // the workers' too
             return true;
@@ -8951,6 +9057,7 @@ int main(int argc, char** argv) {
                 strata::core::progress_at(save ? "saving a session" : "restoring a session");
                 if (path.empty()) { refuse("missing path"); continue; }
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
+                if (pool_any) { refuse("session files do not support a pool yet (the other PCs hold their layers' part)"); continue; }
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
                 if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }

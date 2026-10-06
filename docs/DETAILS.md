@@ -91,8 +91,8 @@ at temperature 0 can end in a different (equally good) answer when the drafting,
 conversation differ (issue #152). `STRATA_IQ_MT_MIN=1` (in the config's `env`) uses the multi-token kernels for
 every group: the answer then no longer depends on the drafting. Measured on a Ryzen 7600 (AVX-512): IQ3_S decode
 -1..-3%, the other models the same; the default stays the fastest rule. On an Intel CPU of Alder Lake or later
-without AVX-512, where the AVX-2 kernel gathers the IQ3_S grid, IQ3_S takes the multi-token kernel for one token by
-default, because there it is the faster one (`STRATA_IQ_MT_MIN=2` restores ggml's dot). Through the server, two more things carry
+without AVX-512, where the AVX-2 kernel gathers the IQ3_S grid, `STRATA_IQ3S_MT1=1` (opt-in) gives IQ3_S the multi-token
+kernel for one token, which is the faster one there; it changes a lone token's rounding, so it is off by default. Through the server, two more things carry
 over from one request to the next (#410): the adaptive tier moves experts between RAM and VRAM (the GPU and the CPU
 round an expert differently), and the prompt cache resumes a repeated prompt and reads only its tail through the
 decode path. For byte-identical repeats add `--prompt-cache 0 --adapt-swaps 0 --pcie-frac 0` to the engine's args
@@ -578,19 +578,20 @@ print(r.choices[0].message.content)
   server ends it there with `finish_reason` `"length"` and says so in its window: a model in a loop, or a broken
   state that answers one token forever (#606 saw 36,689 tokens of `!`). `"repeat_stop_tokens": N` in
   `strata-<model>.json` sets the run length; `0` turns it off (for a request that really wants one token many times).
-- **Recovering repeated reasoning (opt-in).** `"reasoning_loop_recovery": true` in `strata-<model>.json` checks
-  reasoning for repeated passages, which the single-token guard above does not detect. Every 512 output tokens,
-  at a complete character and parser boundary, it measures the last 2,000 words and punctuation marks. If at least
-  25% belong to 12-word passages seen three times in the reasoning history, it stops and drains that generation,
-  then resumes once from all its generated token IDs. Only the native high-effort instruction in the first system
-  message changes to the template's low-effort instruction. The task stays the same; no answer or `</think>` is
-  inserted, and both passes share the original output limit. On recovery only, temperature is raised to at least
-  1.0, presence penalty to at least 1.5, top-p becomes 0.95 and top-k 20; the seed is kept. This can change an
-  explicit client sampler, so it is off by default. `/metrics` records `reasoning_recoveries` and the coverage.
-  This is a recovery policy, not a numerical engine fix or a guarantee of an answer. It needs the exact native
-  high-effort hint in the first system message and skips images; other templates and effort positions have not
-  been validated. Re-reading the modified prefix costs prompt time. It can also mistake repeated useful code or
-  checks for a loop, so keep the recorded answer quality alongside the completion rate when testing it.
+- **Repeated reasoning (opt-in, #728).** The single-token guard above does not see a model that repeats whole
+  passages. `"reasoning_loop_recovery"` in `strata-<model>.json` is `false` (the default), `"stop"` or `"recover"`
+  (`true` means `"recover"`). Every 512 output tokens, at a complete character and parser boundary, the reasoning is
+  measured over its last 2,000 words and punctuation marks (counting passages over the last 30,000 words). If at
+  least 25% belong to 12-word passages seen three times, `"stop"` ends the reply there as `"length"` and says so in
+  the server window. `"recover"` stops and drains that generation, then goes on once from all its generated token
+  ids with the template's low-effort sentence in place of the xhigh one in the first system message (a splice of
+  token ids: the rest of the prompt is not decoded or re-encoded). The task stays the same; no answer or `</think>`
+  is inserted, and both passes share the original output limit. On recovery only, temperature is raised to at least
+  1.0 and presence penalty to at least 1.5; a client's top-p, top-k and seed are never changed. `/metrics` records
+  `reasoning_recoveries` and the coverage. This is a policy, not a numerical engine fix or a guarantee of an answer.
+  `"recover"` needs the exact xhigh sentence in the first system message and skips requests with images; re-reading
+  the changed prefix costs prompt time. Either mode can mistake repeated useful code or checks for a loop, so keep
+  the recorded answer quality alongside the completion rate when testing it.
 - **Changing the effort without re-reading the prompt (opt-in, 0.1.39, #458).** The effort's instruction is the
   first thing in the prompt, so a request that only changes the effort (an agent's "think harder" switch, `none` for
   a quick tool step) reads the whole conversation again. `"effort_position": "end"` in `strata-<model>.json` renders
