@@ -41,6 +41,7 @@ struct FakeWorker {
     std::atomic<int> runs{0}, bcommits{0}, last_keep0{0}, verifies{0}, commits{0}, resets{0}, prefills{0}, sessions{0}, batches{0}, slot_loads{0}, slot_stores{0};
     std::atomic<int> last_base{-1}, last_slot{-1};
     std::set<uint64_t> ckpts;
+    std::set<uint64_t> convs;   // parked conversations
     std::mutex mu;
     bool reload_first = false;     // answer the first CONFIG with "reload" (it had another range)
     bool wrong_model = false;
@@ -83,6 +84,7 @@ struct FakeWorker {
                 ready.set("slots", (int64_t) 1000);
                 ready.set("chunk", (int64_t) 64);
                 ready.set("cache_mib", (int64_t) 2048);
+                ready.set("conv_park", (int64_t) 1);
                 std::string e;
                 ch.send(Msg::Ready, ready, e);
                 std::vector<uint8_t> p;
@@ -178,6 +180,22 @@ struct FakeWorker {
                         for (uint32_t i = 0; i < n; ++i) { uint64_t id; u.get(id); keep.insert(id); }
                         { std::lock_guard<std::mutex> g(mu); std::set<uint64_t> k2; for (auto id : ckpts) if (keep.count(id)) k2.insert(id); ckpts = k2; }
                         ch.send(Msg::Ack, e);
+                    } else if (t == Msg::ConvPark) {
+                        uint64_t id; int64_t n; u.get(id); u.get(n);
+                        if (n >= 1000) { KV no; no.set("message", std::string("parking: too big")); ch.send(Msg::Err, no, e); }
+                        else { { std::lock_guard<std::mutex> g(mu); convs.insert(id); } ch.send(Msg::Ack, e); }
+                    } else if (t == Msg::ConvRestore) {
+                        uint64_t id; u.get(id);
+                        bool have;
+                        { std::lock_guard<std::mutex> g(mu); have = convs.count(id) != 0; }
+                        if (have) ch.send(Msg::Ack, e);
+                        else { KV no; no.set("message", "no parked conversation " + std::to_string(id)); ch.send(Msg::Err, no, e); }
+                    } else if (t == Msg::ConvRetain) {
+                        uint32_t n; u.get(n);
+                        std::set<uint64_t> keep;
+                        for (uint32_t i = 0; i < n; ++i) { uint64_t id; u.get(id); keep.insert(id); }
+                        { std::lock_guard<std::mutex> g(mu); std::set<uint64_t> k2; for (auto id : convs) if (keep.count(id)) k2.insert(id); convs = k2; }
+                        ch.send(Msg::Ack, e);
                     } else if (t == Msg::EndRequest) {
                         KV st;
                         st.set("windows", (int64_t) 4);
@@ -230,6 +248,18 @@ static void test_two_workers(Wire wire) {
     CHECK(link.ckpt_retain({99}, err));
     CHECK(!link.ckpt_restore(7, err) && err.find("no checkpoint 7") != std::string::npos);
     err.clear();
+    // parked conversations: every worker parks, restores and drops its part; a refusal reaches the caller
+    CHECK(link.all_ready("conv_park"));
+    CHECK(!link.all_ready("no_such_key"));
+    CHECK(link.conv_park(41, 500, err));
+    CHECK(link.conv_park(42, 600, err));
+    CHECK(!link.conv_park(43, 5000, err) && err.find("too big") != std::string::npos);
+    err.clear();
+    CHECK(link.conv_restore(41, err));
+    CHECK(link.conv_retain({42}, err));
+    CHECK(!link.conv_restore(41, err) && err.find("no parked conversation 41") != std::string::npos);
+    err.clear();
+    CHECK(link.conv_restore(42, err));
     // a pipelined batch group (slots 1-2) through both workers, without the head; slot copies on both (the fake
     // workers read and write f32 rows)
     if (wire == Wire::F32) {

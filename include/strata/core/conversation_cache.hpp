@@ -153,6 +153,8 @@ struct SavedConversation {
     bool cvec = true;
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
+    // POOL: the workers keep their layers' part of this image under this id (0: none)
+    uint64_t pool_id = 0;
 
     size_t bytes() const {
         size_t n = live.bytes() + checkpoints.capacity() * sizeof(ConversationCheckpoint) +
@@ -286,6 +288,15 @@ public:
         return dropped;
     }
     size_t superseded() const { return superseded_; }
+
+    /// POOL: the ids the workers must keep for the parked entries - each image's own and its checkpoints'
+    void pool_ids(std::vector<uint64_t>& images, std::vector<uint64_t>& checkpoints) const {
+        for (const auto& e : entries_) {
+            if (e.pool_id != 0) images.push_back(e.pool_id);
+            for (const auto& c : e.checkpoints)
+                if (c.pool_id != 0) checkpoints.push_back(c.pool_id);
+        }
+    }
 
     bool put(SavedConversation&& image, size_t held = 0) {
         const size_t n = image.bytes();

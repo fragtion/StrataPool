@@ -60,6 +60,10 @@ enum class Msg : uint16_t {
     // --batch-mtp: one window over every live slot's rows (a slot's token and its draft), committed after the verdict
     BatchRun = 26,   // i32 S, i32 slot[S], i32 tokens[S], i64 pos[S], rows[S x handoff] -> BatchRows (no commit)
     BatchCommit = 27,// i32 n, i32 keep[n]: each slot keeps that prefix of its rows in the last BatchRun (lazy ACK)
+    // a parked conversation (--conversation-cache-mib): each worker keeps an image of its own layers' state
+    ConvPark = 32,   // u64 id, i64 n: keep the session's first n tokens (K/V and running state) under id  (ACK / Err)
+    ConvRestore = 33,// u64 id: put that image back into the session                                     (ACK / Err)
+    ConvRetain = 34, // u32 n, u64 ids[n]: drop every other image                                        (lazy ACK)
     Ack = 30,
     Err = 31,        // message=<text>
     Bye = 40,        // the coordinator is leaving; the worker keeps its load for the next one

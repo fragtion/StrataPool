@@ -154,6 +154,18 @@ next to the experts when it checks a PC's RAM. On Windows it also keeps a PC's e
 its RAM, less 2 GiB, because that is roughly what Windows lets a program pin (a 32 GB laptop failed at about 14 GiB
 and ran at 12.7). Set `STRATA_POOL_PIN_GIB=<n>` in a PC's config `env` to give its own limit, or `=0` for none.
 
+### Parked conversations
+
+With `--conversation-cache-mib` in the coordinator's config (setup suggests it when there is RAM to spare), a split
+parks a conversation it switches away from, as one PC does: an agent's subtasks, a second client, or a title request
+no longer make the main conversation read again everything after the part they share (usually the system prompt) when
+it comes back. Each PC keeps its own part in its own RAM: the coordinator its layers and the draft layer, under the
+budget and slot count of its config; each worker its layers, as long as that leaves
+`--conversation-cache-min-free-mib` (default 2,560 MiB) of its RAM free. A worker that cannot park its part says so in
+the coordinator's log (`skip parking`), and that conversation is read again when it comes back, as before. The
+worker's log shows each park and restore and how much it holds. Every PC must run an engine with this (an older worker
+turns it off, with a note in the coordinator's log).
+
 ## The split learns from its timings
 
 After each request the coordinator's log splits a decode window into its parts:
@@ -254,8 +266,6 @@ out of the pool. The automatic split would give it as few layers as it can.
 
 - **Images** (vision), the **experimental speed projection** (control vectors) and the **low-RAM modes**. The Pool tab
   says when your setup has one of them on.
-- **Conversation parking** (whole-chat snapshots in RAM). The per-chat checkpoints (`--prompt-cache`) work across
-  the pool: each worker keeps its own layers' part.
 - **Several GPUs in one pool PC.** Each pool PC uses one GPU, and the pool is the split.
 - From Strata 0.1.40: **`--kv-grow`** (the elastic K/V; off with a note - it also needs the whole K/V in VRAM, which a
   long context with `--kv-resident` does not have) and **session files** (`/slots/0?action=save|restore` answers that

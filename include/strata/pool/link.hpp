@@ -149,6 +149,14 @@ public:
     bool ckpt_restore(uint64_t id, std::string& err);    ///< ... and puts it back
     bool ckpt_retain(const std::vector<uint64_t>& ids, std::string& err);   ///< drop every other id
     bool end_request(std::string& err);                  ///< a request ended (workers refill, log)
+    /// Parked conversations (--conversation-cache-mib): every worker keeps an image of its own layers' state of the
+    /// session's first n tokens under id, puts one back, or drops every image not in ids.  A worker that cannot park
+    /// (RAM) answers with an error and keeps nothing: the caller then parks nothing either.
+    bool conv_park(uint64_t id, int64_t n, std::string& err);
+    bool conv_restore(uint64_t id, std::string& err);
+    bool conv_retain(const std::vector<uint64_t>& ids, std::string& err);
+    /// every worker said "<key>=1" in READY (a capability an older worker lacks)
+    bool all_ready(const char* key) const;
     uint64_t new_ckpt_id() { return ++ckpt_seq_; }
     void bye();                                          ///< tell the workers we are leaving (they stay loaded)
 

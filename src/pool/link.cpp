@@ -900,6 +900,56 @@ bool PoolLink::ckpt_retain(const std::vector<uint64_t>& ids, std::string& err) {
     return true;
 }
 
+// every worker answers before the next one is asked: a park or a restore that fails on one PC must not be taken as
+// done (the caller drops a park, and reads the prompt again after a failed restore)
+static bool ask_all(std::vector<Channel>& ch, const std::vector<WorkerInfo>& workers, Msg m, const std::vector<uint8_t>& b,
+                    std::string& err) {
+    for (size_t i = 0; i < ch.size(); ++i) {
+        Channel& c = ch[i];
+        Msg t;
+        std::vector<uint8_t> p;
+        if (!c.drain(err) || !c.send(m, b, err) || !c.recv(t, p, err, 1 << 20)) {
+            err = "pool worker " + workers[i].addr + ": " + err;
+            return false;
+        }
+        if (t != Msg::Ack) { err = "pool worker " + workers[i].addr + ": " + unexpected(t, Msg::Ack, p); return false; }
+    }
+    return true;
+}
+
+bool PoolLink::conv_park(uint64_t id, int64_t n, std::string& err) {
+    std::lock_guard<std::mutex> lk(mu_);
+    Packer pk;
+    pk.put<uint64_t>(id);
+    pk.put<int64_t>(n);
+    return ask_all(ch_, workers_, Msg::ConvPark, pk.b, err);
+}
+
+bool PoolLink::conv_restore(uint64_t id, std::string& err) {
+    std::lock_guard<std::mutex> lk(mu_);
+    Packer pk;
+    pk.put<uint64_t>(id);
+    return ask_all(ch_, workers_, Msg::ConvRestore, pk.b, err);
+}
+
+bool PoolLink::conv_retain(const std::vector<uint64_t>& ids, std::string& err) {
+    std::lock_guard<std::mutex> lk(mu_);
+    Packer pk;
+    pk.put<uint32_t>((uint32_t) ids.size());
+    for (const uint64_t id : ids) pk.put<uint64_t>(id);
+    for (size_t i = 0; i < ch_.size(); ++i) {
+        if (!ch_[i].send(Msg::ConvRetain, pk.b, err)) { err = "pool worker " + workers_[i].addr + ": " + err; return false; }
+        ++ch_[i].pending;
+    }
+    return true;
+}
+
+bool PoolLink::all_ready(const char* key) const {
+    for (const WorkerInfo& w : workers_)
+        if (w.ready.i64(key, 0) != 1) return false;
+    return !workers_.empty();
+}
+
 bool PoolLink::end_request(std::string& err) {
     std::lock_guard<std::mutex> lk(mu_);
     for (size_t i = 0; i < ch_.size(); ++i) {

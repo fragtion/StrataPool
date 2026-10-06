@@ -1921,11 +1921,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata pool: %s\n", why);
             return 2;
         }
-        if (o.conversation_cache_mib > 0) {
-            std::fprintf(stderr, "strata pool: conversation parking is single-PC; the pool keeps the per-chat "
-                                 "checkpoints (--prompt-cache) instead\n");
-            o.conversation_cache_mib = 0;
-        }
+        // parked conversations: the coordinator parks its layers and the draft layer, every worker its own layers
+        // (CONV_PARK); a worker that cannot (an older engine) turns parking off once the workers are ready
         if (pool_worker) o.mtp.clear();   // the coordinator drafts; a worker runs layers only
         // --batch in a pool: the slot groups are pipelined across the PCs (one group per PC at a time), so while a
         // worker runs one conversation's layers this PC runs another's.  Groups of one slot overlap the most.  A
@@ -6162,6 +6159,11 @@ int main(int argc, char** argv) {
                 return 1;
             }
             pool_chunk_cap = pool_link.max_chunk();
+            if (o.conversation_cache_mib > 0 && !pool_link.all_ready("conv_park")) {
+                std::fprintf(stderr, "strata pool: a worker runs an engine without parked conversations (rebuild it); "
+                                     "the pool keeps the per-chat checkpoints only\n");
+                o.conversation_cache_mib = 0;
+            }
             // --batch: as many slots as every PC carved (a worker says how many fit beside its layers)
             if (o.batch > 0) {
                 const int64_t wb = pool_link.batch_slots();
@@ -7105,6 +7107,16 @@ int main(int argc, char** argv) {
             id.config = *config_fp;
             return true;
         };
+        // POOL: the workers drop the images of the parked conversations this PC no longer holds (`pool_keep_conv`: one
+        // taken out to be restored, still needed on the workers)
+        uint64_t pool_keep_conv = 0;
+        auto pool_conv_retain = [&](std::string& e) -> bool {
+            if (!pool_coord || !conversations.enabled()) return true;
+            std::vector<uint64_t> imgs, cks;
+            conversations.pool_ids(imgs, cks);
+            if (pool_keep_conv != 0) imgs.push_back(pool_keep_conv);
+            return pool_link.conv_retain(imgs, e);
+        };
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
@@ -7185,6 +7197,7 @@ int main(int argc, char** argv) {
                 return true;
             }
             const auto t0 = Clock::now();
+            if (pool_coord && !pool_conv_retain(err)) return false;   // the evicted entries' worker images go first
             try {
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                 const size_t retained = reuse.bytes() + stage_retained;
@@ -7213,6 +7226,15 @@ int main(int argc, char** argv) {
                 if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(), 0, floor)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM floor after capture, or telemetry unavailable)\n");
                     return true;
+                }
+                if (pool_coord) {   // every worker parks its own layers of the same tokens, or none of this is kept
+                    const uint64_t id = pool_link.new_ckpt_id();
+                    std::string pe;
+                    if (!pool_link.conv_park(id, (int64_t) live.size(), pe)) {
+                        std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n", pe.c_str());
+                        return true;
+                    }
+                    image.pool_id = id;
                 }
                 const size_t snapshot_bytes = image.bytes();
                 const bool stored = conversations.put(std::move(image), held);
@@ -7270,10 +7292,11 @@ int main(int argc, char** argv) {
         // coordinator no longer has
         auto pool_retain = [&](std::string& e) -> bool {
             if (!pool_coord) return true;
-            std::vector<uint64_t> ids;
+            std::vector<uint64_t> ids, imgs;
             for (const ConvCheckpoint& c : checks)
                 if (c.pool_id != 0) ids.push_back(c.pool_id);
-            return pool_link.ckpt_retain(ids, e);
+            conversations.pool_ids(imgs, ids);   // a parked conversation's checkpoints keep their worker parts too
+            return pool_link.ckpt_retain(ids, e) && pool_conv_retain(e);
         };
         auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false,
                                  uint64_t pool_id = 0) -> bool {
@@ -7963,6 +7986,8 @@ int main(int argc, char** argv) {
             std::vector<uint8_t> w_enc;
             std::vector<int32_t> w_out((size_t) strata::kernels::kVerifyMaxT);
             std::map<uint64_t, ConvCheckpoint> w_ckpts;
+            std::map<uint64_t, strata::core::SavedConversation> w_convs;   // parked conversations (CONV_PARK)
+            size_t w_conv_bytes = 0;
             int64_t w_pf_T = 0, w_pf_p0 = 0;   // rows read back so far of the chunk being run, and its first position
             sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
                 // (one call per chunk the prompt path cut the message into: normally one)
@@ -7992,6 +8017,7 @@ int main(int argc, char** argv) {
                 r.set("batch_slots", (int64_t) (bslot_ss.empty() ? 0 : bslot_ss[0].size()));
                 r.set("lb", node_lb);
                 r.set("le", node_le);
+                r.set("conv_park", (int64_t) 1);   // CONV_PARK / CONV_RESTORE / CONV_RETAIN
                 std::string e;
                 if (!pool_ch.send(strata::pool::Msg::Ready, r, e)) {
                     std::fprintf(stderr, "strata pool: %s\n", e.c_str());
@@ -8301,6 +8327,87 @@ int main(int argc, char** argv) {
                         for (auto it = w_ckpts.begin(); it != w_ckpts.end();)
                             it = keep.count(it->first) ? std::next(it) : w_ckpts.erase(it);
                         if (!ack()) { why = "the coordinator went away"; break; }
+                    } else if (t == strata::pool::Msg::ConvPark) {
+                        // a parked conversation: this PC's layers of the session's first n tokens (their K/V from
+                        // the authoritative copies, and the running state), kept in RAM until CONV_RETAIN drops it
+                        uint64_t id = 0;
+                        int64_t n = 0;
+                        if (!u.get(id) || !u.get(n) || n < 1) { fail("a bad CONV_PARK"); continue; }
+                        const auto t0 = Clock::now();
+                        std::string pe;
+                        try {
+                            const std::vector<int32_t> ids((size_t) n, 0);   // the coordinator matches the tokens
+                            const std::vector<strata::core::ConversationImageKey> no_imgs;
+                            const std::vector<ConvCheckpoint> no_checks;   // this PC's checkpoints stay in w_ckpts
+                            const strata::core::ConversationView view{ids, no_imgs, no_checks, true};
+                            size_t bytes = 0;
+                            const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                            if (cudaDeviceSynchronize() != cudaSuccess) { fail("parking: the GPU failed"); fatal = true; break; }
+                            if (!strata::core::conversation_snapshot_bytes(view, ss, g, nullptr, bytes, pe)) {
+                                fail("parking: " + pe);
+                                continue;
+                            }
+                            if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
+                                                                         bytes, floor)) {
+                                fail("parking: " + std::to_string(bytes >> 20) + " MiB do not fit in RAM above a floor of " +
+                                     std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB");
+                                continue;
+                            }
+                            strata::core::SavedConversation image;
+                            if (!strata::core::conversation_snapshot_save(image, view, ss, g, nullptr, pe)) {
+                                fail("parking: " + pe);
+                                continue;
+                            }
+                            w_conv_bytes += image.bytes();
+                            w_convs[id] = std::move(image);
+                        } catch (const std::bad_alloc&) {
+                            fail("parking: out of RAM");
+                            continue;
+                        }
+                        std::fprintf(stderr, "strata pool: parked a conversation (%lld tokens of layers %lld-%lld) in "
+                                             "%.1f ms; %zu parked, %.2f GiB\n", (long long) n, (long long) node_lb,
+                                     (long long) (node_le - 1),
+                                     std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                                     w_convs.size(), (double) w_conv_bytes / 1073741824.0);
+                        if (!ack()) { why = "the coordinator went away"; break; }
+                    } else if (t == strata::pool::Msg::ConvRestore) {
+                        uint64_t id = 0;
+                        const auto it = u.get(id) ? w_convs.find(id) : w_convs.end();
+                        if (it == w_convs.end()) {
+                            fail("this worker has no parked conversation " + std::to_string((unsigned long long) id));
+                            continue;   // the coordinator reads the prompt from the start instead
+                        }
+                        const auto t0 = Clock::now();
+                        std::string pe;
+                        if (!strata::core::conversation_snapshot_validate(it->second, ss, g, nullptr, pe)) {
+                            fail("a parked conversation does not fit this session: " + pe);
+                            continue;
+                        }
+                        if (strata::core::conversation_snapshot_restore(it->second, ss, g, nullptr, pe) !=
+                                strata::core::ConversationRestore::restored ||
+                            cudaDeviceSynchronize() != cudaSuccess) {
+                            fail("restoring a parked conversation failed: " + pe);
+                            fatal = true;   // the session may be half written
+                            break;
+                        }
+                        std::fprintf(stderr, "strata pool: restored a parked conversation (%zu tokens) in %.1f ms\n",
+                                     it->second.live.ids.size(),
+                                     std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                        if (!ack()) { why = "the coordinator went away"; break; }
+                    } else if (t == strata::pool::Msg::ConvRetain) {
+                        uint32_t n = 0;
+                        std::set<uint64_t> keep;
+                        if (u.get(n))
+                            for (uint32_t i = 0; i < n; ++i) {
+                                uint64_t id = 0;
+                                if (u.get(id)) keep.insert(id);
+                            }
+                        for (auto it = w_convs.begin(); it != w_convs.end();) {
+                            if (keep.count(it->first)) { ++it; continue; }
+                            w_conv_bytes -= std::min(w_conv_bytes, it->second.bytes());
+                            it = w_convs.erase(it);
+                        }
+                        if (!ack()) { why = "the coordinator went away"; break; }
                     } else if (t == strata::pool::Msg::EndRequest) {
                         if (!w_refill(e)) { fail("refilling a lent slot: " + e); fatal = true; break; }
                         ++w_requests;
@@ -8342,6 +8449,8 @@ int main(int argc, char** argv) {
                         strata::pool::KV k;
                         k.set("requests", w_requests);
                         k.set("checkpoints", (int64_t) w_ckpts.size());
+                        k.set("parked", (int64_t) w_convs.size());
+                        k.set("parked_mib", (int64_t) (w_conv_bytes >> 20));
                         k.set("slots", (int64_t) xcache.slots());
                         if (!pool_ch.send(strata::pool::Msg::StatsReply, k, e)) { why = e; break; }
                     } else if (t == strata::pool::Msg::Bye) {
@@ -8366,6 +8475,8 @@ int main(int argc, char** argv) {
                 // the next coordinator: the same essentials continue with what is loaded; anything else reloads
                 if (!w_refill(err)) return 1;
                 w_ckpts.clear();
+                w_convs.clear();
+                w_conv_bytes = 0;
                 strata::pool::KV next;
                 pool_accept(next);
                 if (pool_essentials(next) != pool_loaded) {
@@ -9642,6 +9753,11 @@ int main(int argc, char** argv) {
                 incoming.reset();
                 err.clear();
             }
+            if (incoming && pool_coord && incoming->pool_id == 0) {
+                std::fprintf(stderr, "strata serve: conversation cache: discard snapshot (no worker part)\n");
+                incoming.reset();
+            }
+            pool_keep_conv = incoming ? incoming->pool_id : 0;   // its worker images stay until it is restored
             // Preserve the outgoing branch before any checkpoint rewind, reset,
             // or incoming restore overwrites the positional state it requires.
             if ((!from_live || incoming || slot_source >= 0) && !park_current(incoming ? incoming->bytes() : 0)) {
@@ -9689,6 +9805,18 @@ int main(int argc, char** argv) {
             if (incoming && !kvg_ensure((int64_t) incoming->live.ids.size() + 256, kv_quiesce)) {
                 std::printf("ERR the K/V cannot grow to the parked conversation: no VRAM is left\n");
                 return 1;
+            }
+            if (incoming && pool_coord) {
+                // the workers first: one that cannot put its part back (or a lost image) leaves the pool's sessions
+                // mixed, so the prompt is read from the start (this PC's own session is untouched until below)
+                std::string pe;
+                if (!pool_link.conv_restore(incoming->pool_id, pe)) {
+                    std::fprintf(stderr, "strata serve: conversation cache: a worker could not restore its part (%s); "
+                                         "reading the prompt\n", pe.c_str());
+                    incoming.reset();
+                    resume = 0;
+                    from_live = false;   // (a lost link fails the reset below)
+                }
             }
             if (incoming) {
                 const auto t0 = Clock::now();
@@ -9749,6 +9877,7 @@ int main(int argc, char** argv) {
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes());
             }
+            pool_keep_conv = 0;   // restored (or given up): its worker images go at the next retain
             if (want_cvec != cvec_cached) {
                 live_ok = false;
                 checks.clear();
