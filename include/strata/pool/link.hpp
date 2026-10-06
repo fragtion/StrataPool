@@ -45,7 +45,7 @@ struct ModelFingerprint {
     std::string mismatch(const KV& w) const;
 };
 
-class PoolLink final : public core::StageLink {
+class PoolLink final : public core::StageLink, public core::PipeRemote {
 public:
     PoolLink() = default;
     ~PoolLink() override;
@@ -99,6 +99,11 @@ public:
     /// 1 = worker w's rows are back (the last worker's: the picks are in batch_out), 0 = not yet, -1 = an error
     int batch_poll(size_t w, std::string& err);
     const int32_t* batch_out() const { return batch_out_; }
+    /// --batch-mtp (core::StageLink): one window over every live slot's rows through the workers, the head and each
+    /// row's pick here (its slot's sampling at its position); the workers keep nothing until commit_rows
+    bool run_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out,
+                  std::string& err) override;
+    bool commit_rows(const int* keep, int n, std::string& err) override;
     /// a slot's sampling for its batch rows (greedy until set; penalties are not applied in batch windows)
     void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp);
     /// every worker copies its main session's first ids.size() tokens into slot `slot` (load) or the slot's back
@@ -112,6 +117,23 @@ public:
     const std::vector<float>& last_batch_rows() const { return batch_.back().rows; }
     double ms_batch_net = 0;    ///< batch groups: from the send to a worker to its rows back, summed
     int64_t batch_windows = 0;  ///< batch groups through the head here
+
+    // ---- --pipeline-windows: the later stage of a pipelined decode (core::PipeRemote).  This PC's two first-stage
+    // verifiers (one per window parity) each write their own hand-off; `pipe_init` gives the link both, and a second
+    // buffer for the final rows (the drafter reads one window's rows while the next window's arrive).
+    bool pipe_init(const float* handoff_host_odd, std::string& err);
+    bool pl_launch(int parity, int T, const int32_t* tokens, int64_t pos0, std::string& err) override;
+    int pl_poll(int parity, std::string& err) override;
+    bool pl_finish(int parity, int32_t* out, std::string& err) override;
+    bool pl_commit(int parity, int n_keep, std::string& err) override;
+    bool pl_in_flight(int parity) const override { (void) parity; return pl_phase_ != 0; }
+    const float* pl_final_R(int parity, int t) const override {
+        return ((parity & 1) ? R_odd_ : R_dev_) + (size_t) t * (size_t) d_;
+    }
+    cudaStream_t pl_stream() const override { return (cudaStream_t) stream_; }
+    int64_t pl_windows = 0;     ///< windows decoded pipelined (their timings overlap: no split calibration from them)
+    /// tests: the pipelined later stage without a device side - the last worker's rows stay in last_pl_rows()
+    const std::vector<float>& last_pl_rows() const { return pl_rows_; }
 
     /// the prompt rows' width and longest chunk without a device side (init_device sets both; the tests use this)
     void set_rows_geometry(int64_t d, int64_t max_chunk);
@@ -167,7 +189,20 @@ private:
     int32_t batch_out_[kMaxBatchRows] = {};
     bool batch_head_ = true;
     std::vector<strata::kernels::SamplerParams> slot_sp_;
-    bool head_logits(int T, std::string& err);
+    bool head_logits(int T, std::string& err, const float* R = nullptr);
+    /// the picks of S rows of logits_dev_ (head_logits done): greedy, then each sampled slot's row again (slot[r], pos[r])
+    void pick_rows(int S, const int* slot, const int64_t* pos);
+    // --pipeline-windows: the window in flight on the workers (one at a time)
+    const float* pl_src_[2] = {nullptr, nullptr};   ///< each parity's hand-off (mapped host)
+    float* R_odd_ = nullptr;                        ///< the odd windows' final rows
+    void* pl_ev_ = nullptr;                         ///< cudaEvent_t after the head of the window in flight
+    int pl_phase_ = 0;                              ///< 0 idle, 1 on worker pl_w_, 2 the head runs here, 3 picks ready
+    int pl_par_ = 0, pl_T_ = 0;
+    int64_t pl_pos_ = 0;
+    size_t pl_w_ = 0;
+    std::chrono::steady_clock::time_point pl_t0_;
+    std::vector<uint8_t> pl_prefix_, pl_in_;
+    std::vector<float> pl_rows_;
     std::string calib_path_, calib_key_;
     std::vector<double> calib_pred_;
     SplitCalib calib_;

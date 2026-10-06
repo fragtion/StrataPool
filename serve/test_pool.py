@@ -136,6 +136,17 @@ class Config(unittest.TestCase):
         for bad in (2, "maybe", None):
             with self.assertRaises(ValueError, msg=str(bad)):
                 PoolConfig.clean({"several_chats": bad})
+            with self.assertRaises(ValueError, msg=str(bad)):
+                PoolConfig.clean({"overlap_windows": bad})
+        # overlapped windows and the chats' drafts (each off by default)
+        self.assertNotIn("--pipeline-windows", coordinator_args(two))
+        self.assertNotIn("--batch-mtp", coordinator_args(two))
+        ov = PoolConfig(None, {"role": "coordinator", "peers": ["a"], "overlap_windows": "on"})
+        self.assertEqual(coordinator_args(ov)[-2:], ["--pipeline-windows", "2"])
+        cd = PoolConfig(None, {"role": "coordinator", "peers": ["a"], "several_chats": True, "chat_drafts": True})
+        self.assertEqual(coordinator_args(cd)[-3:], ["--batch", "2", "--batch-mtp"])
+        nd = PoolConfig(None, {"role": "coordinator", "peers": ["a"], "chat_drafts": True})
+        self.assertNotIn("--batch-mtp", coordinator_args(nd))       # only with several chats
         self.assertEqual(strip_pool_args(["--x", "1", "--pool-peers", "a", "--pool-wire=f16", "--y"]), ["--x", "1", "--y"])
         # Strata's own CPU-pool flags stay
         self.assertEqual(strip_pool_args(["--pool-affinity", "auto", "--pool-workers", "15", "--pool-listen", "0.0.0.0:7701"]),

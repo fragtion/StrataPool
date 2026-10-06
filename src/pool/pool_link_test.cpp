@@ -38,7 +38,7 @@ struct FakeWorker {
     std::thread t;
     std::string secret;
     float add;
-    std::atomic<int> commits{0}, resets{0}, prefills{0}, sessions{0}, batches{0}, slot_loads{0}, slot_stores{0};
+    std::atomic<int> runs{0}, bcommits{0}, last_keep0{0}, verifies{0}, commits{0}, resets{0}, prefills{0}, sessions{0}, batches{0}, slot_loads{0}, slot_stores{0};
     std::atomic<int> last_base{-1}, last_slot{-1};
     std::set<uint64_t> ckpts;
     std::mutex mu;
@@ -116,6 +116,39 @@ struct FakeWorker {
                         batches++;
                         last_base = base;
                         ch.send(Msg::BatchRows, r.data(), r.size() * 4, nullptr, 0, e);
+                    } else if (t == Msg::BatchRun) {
+                        // i32 S, i32 slot[S], i32 tokens[S], i64 pos[S], rows (the wire): back with `add`
+                        int32_t S = 0;
+                        std::memcpy(&S, p.data(), 4);
+                        const size_t off = 4 + (size_t) S * 16;
+                        const size_t n = (p.size() - off) / wire_bytes(wire);
+                        std::vector<float> r(n);
+                        decode_rows(wire, p.data() + off, n, r.data());
+                        for (float& v : r) v += add;
+                        std::vector<uint8_t> out(n * wire_bytes(wire));
+                        encode_rows(wire, r.data(), n, out.data());
+                        runs++;
+                        ch.send(Msg::BatchRows, out, e);
+                    } else if (t == Msg::BatchCommit) {
+                        int32_t n = 0, k0 = 0;
+                        std::memcpy(&n, p.data(), 4);
+                        if (n > 0) std::memcpy(&k0, p.data() + 4, 4);
+                        last_keep0 = k0;
+                        bcommits++;
+                        ch.send(Msg::Ack, e);
+                    } else if (t == Msg::Verify) {
+                        // i32 T, i64 pos0, i32 tokens[T], rows (the wire): back with `add` on every value
+                        int32_t T = 0;
+                        std::memcpy(&T, p.data(), 4);
+                        const size_t off = 12 + (size_t) T * 4;
+                        const size_t n = (p.size() - off) / wire_bytes(wire);
+                        std::vector<float> r(n);
+                        decode_rows(wire, p.data() + off, n, r.data());
+                        for (float& v : r) v += add;
+                        std::vector<uint8_t> out(n * wire_bytes(wire));
+                        encode_rows(wire, r.data(), n, out.data());
+                        verifies++;
+                        ch.send(Msg::VerifyRows, out, e);
                     } else if (t == Msg::SlotLoad || t == Msg::SlotStore) {
                         int32_t slot = 0;
                         std::memcpy(&slot, p.data(), 4);
@@ -224,6 +257,42 @@ static void test_two_workers(Wire wire) {
         CHECK(a.batches == 1 && b.batches == 1 && a.last_base == 1 && b.last_base == 1);
         CHECK(link.slot_copy(true, 1, {5, 6, 7}, err) && link.slot_copy(false, 1, {5, 6, 7}, err));
         CHECK(a.slot_loads == 1 && b.slot_stores == 1 && b.last_slot == 1);
+        // --pipeline-windows: an odd window (its own hand-off) through both workers without blocking, then its commit
+        std::vector<float> odd(8 * hb, 0.0f);
+        for (int i = 0; i < 3 * hb; ++i) odd[(size_t) i] = 100.0f + (float) i;
+        CHECK(link.pipe_init(odd.data(), err));
+        const int32_t pt[3] = {7, 8, 9};
+        CHECK(link.pl_launch(1, 3, pt, 300, err));
+        CHECK(link.pl_in_flight(1) && !link.pl_launch(0, 3, pt, 303, err));   // one window on the workers at a time
+        err.clear();
+        for (int spin = 0; spin < 2000 && (r = link.pl_poll(1, err)) == 0; ++spin)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(r == 1 && link.pl_poll(1, err) == 1);
+        int32_t picks[3] = {};
+        CHECK(link.pl_finish(1, picks, err) && !link.pl_in_flight(1));
+        const std::vector<float>& pr = link.last_pl_rows();
+        exact = pr.size() == (size_t) (3 * hb);
+        for (size_t i = 0; exact && i < pr.size(); ++i) exact = std::fabs(pr[i] - (100.0f + (float) i + 11.0f)) < 1e-2f;
+        CHECK(exact);
+        CHECK(a.verifies == 1 && b.verifies == 1 && link.pl_windows == 1);
+        CHECK(link.pl_commit(1, 2, err));
+        // --batch-mtp: two slots with a draft row each (slot 0 rows 0-1, slot 2 rows 2-3), then each slot's prefix
+        for (int i = 0; i < 4 * hb; ++i) hand[(size_t) i] = 50.0f + (float) i;
+        link.set_batch_host(hand.data(), hb, false);
+        const int brows[4] = {0, 0, 2, 2};
+        const int32_t btok[4] = {1, 2, 3, 4};
+        const int64_t bpos[4] = {10, 11, 20, 21};
+        int32_t bout[4] = {9, 9, 9, 9};
+        CHECK(link.run_rows(brows, 4, btok, bpos, bout, err));
+        const std::vector<float>& rr = link.last_pl_rows();
+        exact = rr.size() == (size_t) (4 * hb);
+        for (size_t i = 0; exact && i < rr.size(); ++i) exact = std::fabs(rr[i] - (50.0f + (float) i + 11.0f)) < 1e-2f;
+        CHECK(exact);
+        CHECK(a.runs == 1 && b.runs == 1 && link.batch_windows == 1);
+        const int keep[3] = {2, 0, 1};
+        CHECK(link.commit_rows(keep, 3, err));
+        CHECK(link.end_request(err));
+        CHECK(a.bcommits == 1 && b.bcommits == 1 && a.last_keep0 == 2);
     }
     CHECK(link.end_request(err));
     CHECK(link.workers()[0].req.i64("windows") == 4 && link.workers()[1].req.f64("ms_verify") == 10.0);
@@ -231,7 +300,8 @@ static void test_two_workers(Wire wire) {
     link.ms_net = 60.0;
     link.report_request(400.0);
     link.bye();
-    CHECK(a.commits == 25 && b.commits == 25 && a.resets == 1 && a.prefills == 1 && b.prefills == 1);
+    const int want_commits = wire == Wire::F32 ? 26 : 25;
+    CHECK(a.commits == want_commits && b.commits == want_commits && a.resets == 1 && a.prefills == 1 && b.prefills == 1);
 }
 
 static void test_refusals() {

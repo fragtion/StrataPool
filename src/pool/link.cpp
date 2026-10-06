@@ -61,8 +61,9 @@ std::string ModelFingerprint::mismatch(const KV& w) const {
 PoolLink::~PoolLink() {
     bye();   // the workers keep their layers loaded for the next coordinator
     if (stream_) cudaStreamDestroy((cudaStream_t) stream_);
-    for (void* p : {(void*) R_dev_, (void*) mixed_dev_, (void*) xq_dev_, (void*) logits_dev_})
+    for (void* p : {(void*) R_dev_, (void*) mixed_dev_, (void*) xq_dev_, (void*) logits_dev_, (void*) R_odd_})
         if (p) cudaFree(p);
+    if (pl_ev_) cudaEventDestroy((cudaEvent_t) pl_ev_);
     for (void* p : {(void*) out_host_, (void*) rows_host_, (void*) pf_host_})
         if (p) cudaFreeHost(p);
 }
@@ -298,7 +299,7 @@ bool PoolLink::init_device(const core::WeightTable& wt, const core::ModelGeometr
 // `last_wire`, which the last worker was told to use for this kind of message).
 bool PoolLink::forward(Msg type, const std::vector<uint8_t>& prefix_tmpl, int64_t T, int64_t floats_per_row,
                        const uint8_t* first, Wire last_wire, std::vector<uint8_t>& last, std::string& err) {
-    const Msg want = type == Msg::Verify ? Msg::VerifyRows : Msg::PrefillRows;
+    const Msg want = type == Msg::Verify ? Msg::VerifyRows : type == Msg::BatchRun ? Msg::BatchRows : Msg::PrefillRows;
     const uint8_t* cur = first;
     size_t cur_bytes = (size_t) T * (size_t) floats_per_row * wire_bytes(wire_);
     std::vector<uint8_t>* bufs[2] = {&buf_a_, &buf_b_};
@@ -326,13 +327,14 @@ bool PoolLink::forward(Msg type, const std::vector<uint8_t>& prefix_tmpl, int64_
     return true;
 }
 
-// the output head over the first T rows of R_dev_ -> logits_dev_ (on stream_; not synced)
-bool PoolLink::head_logits(int T, std::string& err) {
+// the output head over the first T rows of R (R_dev_ by default) -> logits_dev_ (on stream_; not synced)
+bool PoolLink::head_logits(int T, std::string& err, const float* R) {
     const cudaStream_t cs = (cudaStream_t) stream_;
     const int64_t N = g_->n_embd;
+    if (R == nullptr) R = R_dev_;
     for (int t = 0; t < T; ++t) {
         core::BlockBuffers bb = block_;
-        bb.R = R_dev_ + (size_t) t * (size_t) d_;
+        bb.R = const_cast<float*>(R) + (size_t) t * (size_t) d_;
         bb.mixed = mixed_dev_ + (size_t) t * (size_t) N;
         if (head_ != nullptr && head_->loaded()) {
             if (!core::lm_head_mix(*wt_, *g_, bb, cs, err)) return false;
@@ -415,6 +417,150 @@ bool PoolLink::commit(int n_keep, std::string& err) {
         ++ch_[i].pending;
     }
     return true;
+}
+
+// ------------------------------------------------------------------------------------------------ pipelined windows
+// The pipelined decode's later stage (--pipeline-windows; generate.cpp's loop, core::PipeRemote).  The loop launches a
+// window here once this PC's verifier of its parity has written the hand-off, polls it while it serves the next
+// window's layers on this PC, and commits it on the workers after its verdict.  The workers see the serial protocol
+// (VERIFY, then COMMIT) - only verified windows ever reach them - so a worker needs nothing new.
+bool PoolLink::pipe_init(const float* handoff_host_odd, std::string& err) {
+    std::lock_guard<std::mutex> lk(mu_);
+    pl_src_[0] = hand_host_;
+    pl_src_[1] = handoff_host_odd;
+    if (g_ == nullptr) return true;   // the tests: no device side
+    if (R_odd_ == nullptr && cudaMalloc((void**) &R_odd_, (size_t) max_t_ * (size_t) d_ * 4) != cudaSuccess) {
+        err = std::string("pool: the odd windows' rows: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    cudaEvent_t ev = nullptr;
+    if (pl_ev_ == nullptr) {
+        if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) { err = "pool: event create failed"; return false; }
+        pl_ev_ = ev;
+    }
+    return true;
+}
+
+bool PoolLink::pl_launch(int parity, int T, const int32_t* tokens, int64_t pos0, std::string& err) {
+    std::lock_guard<std::mutex> lk(mu_);
+    const int q = parity & 1;
+    if (pl_phase_ != 0) { err = "pool: a pipelined window is already on the workers"; return false; }
+    if (T < 1 || (g_ != nullptr && T > max_t_) || T > kMaxBatchRows || pl_src_[q] == nullptr) {
+        err = "pool: pipelined window out of range (pipe_init?)";
+        return false;
+    }
+    pl_t0_ = Clock::now();
+    Packer pk;
+    pk.put<int32_t>(T);
+    pk.put<int64_t>(pos0);
+    pk.put_bytes(tokens, (size_t) T * 4);
+    pl_prefix_ = pk.b;
+    const size_t n = (size_t) T * (size_t) hb_;
+    const uint8_t* first = (const uint8_t*) pl_src_[q];
+    if (wire_ != Wire::F32) {
+        enc_.resize(n * wire_bytes(wire_));
+        encode_rows(wire_, pl_src_[q], n, enc_.data());
+        first = enc_.data();
+    }
+    Channel& c = ch_[0];
+    if (!c.drain(err) || !c.send(Msg::Verify, pl_prefix_.data(), pl_prefix_.size(), first, n * wire_bytes(wire_), err)) {
+        err = "pool worker " + workers_[0].addr + ": " + err;
+        return false;
+    }
+    pl_phase_ = 1;
+    pl_par_ = q;
+    pl_T_ = T;
+    pl_pos_ = pos0;
+    pl_w_ = 0;
+    return true;
+}
+
+int PoolLink::pl_poll(int parity, std::string& err) {
+    std::lock_guard<std::mutex> lk(mu_);
+    (void) parity;
+    if (pl_phase_ == 0) return 1;
+    if (pl_phase_ == 3) return 1;
+    if (pl_phase_ == 2) {
+        const cudaError_t q = cudaEventQuery((cudaEvent_t) pl_ev_);
+        if (q == cudaErrorNotReady) return 0;
+        if (q != cudaSuccess) { err = std::string("pool: the head: ") + cudaGetErrorString(q); return -1; }
+        pl_phase_ = 3;
+        return 1;
+    }
+    // phase 1: worker pl_w_ has the window
+    Channel& c = ch_[pl_w_];
+    std::string e;
+    if (!c.readable(e)) {
+        if (!e.empty()) { err = "pool worker " + workers_[pl_w_].addr + ": " + e; return -1; }
+        if (std::chrono::duration<double>(Clock::now() - pl_t0_).count() > timeout_s_) {
+            err = "pool worker " + workers_[pl_w_].addr + ": no window rows within " + std::to_string((int) timeout_s_) + " s";
+            return -1;
+        }
+        return 0;
+    }
+    Msg t;
+    if (!c.recv(t, pl_in_, err, (uint64_t) 8 << 30)) { err = "pool worker " + workers_[pl_w_].addr + ": " + err; return -1; }
+    if (t != Msg::VerifyRows) { err = "pool worker " + workers_[pl_w_].addr + ": " + unexpected(t, Msg::VerifyRows, pl_in_); return -1; }
+    const size_t n = (size_t) pl_T_ * (size_t) hb_;
+    if (pl_in_.size() != n * wire_bytes(wire_)) {
+        err = "pool worker " + workers_[pl_w_].addr + " returned " + std::to_string(pl_in_.size()) + " bytes of rows";
+        return -1;
+    }
+    if (pl_w_ + 1 < ch_.size()) {   // the next worker takes these rows as they came (the same wire)
+        Channel& nx = ch_[++pl_w_];
+        if (!nx.drain(err) || !nx.send(Msg::Verify, pl_prefix_.data(), pl_prefix_.size(), pl_in_.data(), pl_in_.size(), err)) {
+            err = "pool worker " + workers_[pl_w_].addr + ": " + err;
+            return -1;
+        }
+        return 0;
+    }
+    ms_net += ms_since(pl_t0_);
+    if (g_ == nullptr) {   // the tests: the rows, no head
+        pl_rows_.resize(n);
+        decode_rows(wire_, pl_in_.data(), n, pl_rows_.data());
+        pl_phase_ = 3;
+        return 1;
+    }
+    decode_rows(wire_, pl_in_.data(), n, rows_host_);
+    const cudaStream_t cs = (cudaStream_t) stream_;
+    float* R = pl_par_ ? R_odd_ : R_dev_;
+    if (cudaMemcpyAsync(R, rows_host_, (size_t) pl_T_ * (size_t) d_ * 4, cudaMemcpyHostToDevice, cs) != cudaSuccess) {
+        err = std::string("pool: the final rows' upload: ") + cudaGetErrorString(cudaGetLastError());
+        return -1;
+    }
+    if (!head_logits(pl_T_, err, R)) return -1;
+    // run()'s rule: greedy, or this request's sampling with Philox(seed, pos0 + t) (the pipelined loop keeps requests
+    // with repetition penalties serial)
+    strata::kernels::SamplerParams sp;
+    if (!sampling_.greedy && sampling_.temperature > 0.0f) {
+        sp = sampling_;
+        sp.counter = (uint64_t) pl_pos_;
+    } else {
+        sp.greedy = true;
+        sp.temperature = 0.0f;
+    }
+    strata::kernels::sample_tokens(logits_dev_, pl_T_, (int) n_vocab_, nullptr, 0, sp, out_dev_, cs);
+    if (cudaEventRecord((cudaEvent_t) pl_ev_, cs) != cudaSuccess) { err = "pool: event record failed"; return -1; }
+    (void) cudaStreamQuery(cs);   // WDDM: submit now
+    pl_phase_ = 2;
+    return 0;
+}
+
+bool PoolLink::pl_finish(int parity, int32_t* out, std::string& err) {
+    std::lock_guard<std::mutex> lk(mu_);
+    (void) parity;
+    if (pl_phase_ != 3) { err = "pool: pl_finish before the picks"; return false; }
+    if (out != nullptr && g_ != nullptr)
+        for (int t = 0; t < pl_T_; ++t) out[t] = ((volatile int32_t*) out_host_)[t];
+    pl_phase_ = 0;
+    ++windows;
+    ++pl_windows;
+    return true;
+}
+
+bool PoolLink::pl_commit(int parity, int n_keep, std::string& err) {
+    (void) parity;
+    return commit(n_keep, err);
 }
 
 void PoolLink::set_rows_geometry(int64_t d, int64_t max_chunk) {
@@ -535,21 +681,9 @@ int PoolLink::batch_poll(size_t w, std::string& err) {
         return -1;
     }
     if (!head_logits(S, err)) return -1;
-    strata::kernels::SamplerParams greedy;
-    greedy.greedy = true;
-    greedy.temperature = 0.0f;
-    strata::kernels::sample_tokens(logits_dev_, S, (int) n_vocab_, nullptr, 0, greedy, out_dev_, cs);
-    // a sampled slot's row again with its own parameters: Philox(seed, position), as its solo window draws it
-    for (int r = 0; r < S; ++r) {
-        const int slot = st.base + r;
-        if (slot < 0 || slot >= (int) slot_sp_.size()) continue;
-        strata::kernels::SamplerParams sp = slot_sp_[(size_t) slot];
-        if (sp.greedy || sp.temperature <= 0.0f) continue;
-        sp.counter = (uint64_t) st.pos[r];
-        sp.penalty_last_n = 0;
-        strata::kernels::sample_tokens(logits_dev_ + (size_t) r * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,
-                                       out_dev_ + r, cs);
-    }
+    int slots[kMaxBatchRows] = {};
+    for (int r = 0; r < S; ++r) slots[r] = st.base + r;
+    pick_rows(S, slots, st.pos);
     if (cudaStreamSynchronize(cs) != cudaSuccess) {
         err = std::string("pool: the batch head: ") + cudaGetErrorString(cudaGetLastError());
         return -1;
@@ -557,6 +691,80 @@ int PoolLink::batch_poll(size_t w, std::string& err) {
     for (int r = 0; r < S; ++r) batch_out_[r] = ((volatile int32_t*) out_host_)[r];
     ++batch_windows;
     return 1;
+}
+
+void PoolLink::pick_rows(int S, const int* slot, const int64_t* pos) {
+    const cudaStream_t cs = (cudaStream_t) stream_;
+    strata::kernels::SamplerParams greedy;
+    greedy.greedy = true;
+    greedy.temperature = 0.0f;
+    strata::kernels::sample_tokens(logits_dev_, S, (int) n_vocab_, nullptr, 0, greedy, out_dev_, cs);
+    // a sampled slot's row again with its own parameters: Philox(seed, position), as its solo window draws it
+    for (int r = 0; r < S; ++r) {
+        if (slot[r] < 0 || slot[r] >= (int) slot_sp_.size()) continue;
+        strata::kernels::SamplerParams sp = slot_sp_[(size_t) slot[r]];
+        if (sp.greedy || sp.temperature <= 0.0f) continue;
+        sp.counter = (uint64_t) pos[r];
+        sp.penalty_last_n = 0;
+        strata::kernels::sample_tokens(logits_dev_ + (size_t) r * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,
+                                       out_dev_ + r, cs);
+    }
+}
+
+// --batch-mtp: the coordinator's verifier ran its layers over every live slot's rows (hand-off rows [0, S)); the
+// workers run theirs without committing, the head picks here, and commit_rows keeps each slot's accepted prefix
+bool PoolLink::run_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out,
+                        std::string& err) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (S < 1 || S > kMaxBatchRows || (g_ != nullptr && S > max_t_)) { err = "pool: batch rows out of range"; return false; }
+    const auto t0 = Clock::now();
+    Packer pk;
+    pk.put<int32_t>(S);
+    for (int r = 0; r < S; ++r) pk.put<int32_t>(rows[r]);
+    pk.put_bytes(tokens, (size_t) S * 4);
+    pk.put_bytes(pos, (size_t) S * 8);
+    const size_t n = (size_t) S * (size_t) hb_;
+    const uint8_t* first = (const uint8_t*) hand_host_;
+    if (wire_ != Wire::F32) {
+        enc_.resize(n * wire_bytes(wire_));
+        encode_rows(wire_, hand_host_, n, enc_.data());
+        first = enc_.data();
+    }
+    if (!forward(Msg::BatchRun, pk.b, S, hb_, first, wire_, fin_, err)) return false;
+    ms_batch_net += ms_since(t0);
+    ++batch_windows;
+    if (g_ == nullptr) {   // the tests: the rows, no head
+        pl_rows_.resize(n);
+        decode_rows(wire_, fin_.data(), n, pl_rows_.data());
+        for (int r = 0; r < S; ++r) out[r] = 0;
+        return true;
+    }
+    decode_rows(wire_, fin_.data(), n, rows_host_);
+    const cudaStream_t cs = (cudaStream_t) stream_;
+    if (cudaMemcpyAsync(R_dev_, rows_host_, (size_t) S * (size_t) d_ * 4, cudaMemcpyHostToDevice, cs) != cudaSuccess) {
+        err = std::string("pool: the batch rows' upload: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    if (!head_logits(S, err)) return false;
+    pick_rows(S, rows, pos);
+    if (cudaStreamSynchronize(cs) != cudaSuccess) {
+        err = std::string("pool: the batch head: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    for (int r = 0; r < S; ++r) out[r] = ((volatile int32_t*) out_host_)[r];
+    return true;
+}
+
+bool PoolLink::commit_rows(const int* keep, int n, std::string& err) {
+    std::lock_guard<std::mutex> lk(mu_);
+    Packer pk;
+    pk.put<int32_t>(n);
+    for (int i = 0; i < n; ++i) pk.put<int32_t>(keep[i]);
+    for (size_t i = 0; i < ch_.size(); ++i) {
+        if (!ch_[i].send(Msg::BatchCommit, pk.b, err)) { err = "pool worker " + workers_[i].addr + ": " + err; return false; }
+        ++ch_[i].pending;
+    }
+    return true;
 }
 
 void PoolLink::set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) {
@@ -697,6 +905,14 @@ void PoolLink::report_request(double decode_ms) {
         }
         const double net = ms_net / w;
         const double here = decode_ms / w - net;
+        if (pl_windows > 0) {   // --pipeline-windows: this PC's layers ran beside the workers', so no split of the time
+            std::fprintf(stderr, "strata pool: %lld windows (%lld pipelined), %.1f ms each; the workers and the network %.1f ms "
+                                 "a window, beside this PC's next window (%.0f KiB a window)%s\n",
+                         (long long) windows, (long long) pl_windows, decode_ms / w, net,
+                         (double) (bytes - req_bytes0_) / w / 1024.0, per.c_str());
+            all = false;
+            per.clear();
+        }
         // (a request of a window or two right after its prompt: the workers' refill of what the prompt borrowed
         // lands in the wait, so the split says nothing then)
         if (here < 0) all = false;
@@ -724,6 +940,8 @@ void PoolLink::report_request(double decode_ms) {
                         std::fprintf(stderr, "strata pool: the split's timings were not saved: %s\n", e.c_str());
                 }
             }
+        } else if (pl_windows > 0) {
+            // (said above)
         } else if (here < 0) {
             std::fprintf(stderr, "strata pool: %lld windows, %.1f ms each (right after a prompt: the workers' refill is in "
                                  "the wait)%s\n", (long long) windows, decode_ms / w, per.c_str());
@@ -735,6 +953,7 @@ void PoolLink::report_request(double decode_ms) {
     if (ms_prefill_net > 0)
         std::fprintf(stderr, "strata pool: prompt chunks waited %.0f ms on the workers\n", ms_prefill_net);
     windows = 0;
+    pl_windows = 0;
     ms_net = ms_prefill_net = ms_here_layers = 0;
     req_bytes0_ = bytes;
 }

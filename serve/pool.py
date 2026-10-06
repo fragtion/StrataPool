@@ -54,6 +54,7 @@ class PoolConfig:
 
     DEFAULTS = {"role": "off", "name": "", "secret": "", "worker_port": ENGINE_PORT, "peers": [], "split": "auto",
                 "wire": "f32", "draft_wire": "f16", "discovery": True, "several_chats": False,
+                "overlap_windows": False, "chat_drafts": False,
                 "route_peers": [], "primary": False, "move_tokens": 8000}
 
     def __init__(self, path: str | None = None, data: dict | None = None):
@@ -123,12 +124,13 @@ class PoolConfig:
             if out[k] not in WIRES:
                 raise ValueError(f"{k}: one of {', '.join(WIRES)}")
         out["discovery"] = bool(out["discovery"])
-        sc = out["several_chats"]
-        if isinstance(sc, str) and sc.lower() in ("true", "false", "on", "off", "1", "0"):
-            sc = sc.lower() in ("true", "on", "1")
-        if not isinstance(sc, bool):
-            raise ValueError("several_chats: true or false")
-        out["several_chats"] = sc
+        for k in ("several_chats", "overlap_windows", "chat_drafts"):
+            sc = out[k]
+            if isinstance(sc, str) and sc.lower() in ("true", "false", "on", "off", "1", "0"):
+                sc = sc.lower() in ("true", "on", "1")
+            if not isinstance(sc, bool):
+                raise ValueError(f"{k}: true or false")
+            out[k] = sc
         peers = out["peers"]
         if not isinstance(peers, list) or len(peers) > 7:
             raise ValueError("peers: a list of up to 7 workers")
@@ -228,6 +230,15 @@ def coordinator_args(pc: PoolConfig) -> list[str]:
         # same speed among more chats.  The engine carves fewer when they do not fit.  Only in the split: the
         # config's own "parallel" is for one PC.
         out += ["--batch", str(min(1 + len(peers), 4))]
+        if pc["chat_drafts"]:
+            # each chat's window carries its draft too (Strata's --batch-mtp): one window over every chat, the drafts
+            # kept where the head agrees, instead of the chats taking turns on the PCs
+            out += ["--batch-mtp"]
+    if pc["overlap_windows"]:
+        # one chat: this PC starts the next window on a guess while the workers run the current one (Strata's
+        # --pipeline-windows 2; a wrong guess is undone here, the workers only ever see verified windows).  The engine
+        # turns it off with a note while several chats run.
+        out += ["--pipeline-windows", "2"]
     return out
 
 
