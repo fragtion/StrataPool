@@ -25,7 +25,26 @@ The KV-streaming copy is already wide: `copy_kernel`, `src/kernels/cuda/kv_strea
 
 ## 2. Vectorization
 
-TBD
+The gather (`kv_gather_q8_kernel`) was 4 values/thread: two `char4` (4 B) loads + two `ushort4` (8 B) stores.  The
+experimental build (`-DSTRATA_EXPERIMENTAL_SM60=ON`, Pascal/Volta) adds an 8-wide `kv_gather_q8_wide_kernel`: one
+`uint2` (8 B) load of codes, one `uint4` (16 B) store of the dequantized fp16, one scale per thread instead of two.
+The 8 values lie in one 64-value group, and the arithmetic is unchanged (`(float) code * scale -> f16_from_f32`,
+packed two halfs per 32-bit word), so the output is byte-identical.  The ready-made engine keeps exactly the
+4-wide kernel.
+
+`kv_q8_parity`: OK, worst INT8-vs-FP16 error 0.590 steps (bitwise codes, scales and gather; unchanged).
+
+Microbench (`kv_q8_parity --bench`, 2,051 cells / 2 KV heads / 256 dims, 32k pool, random cells, V100):
+
+| | us/call | GB/s |
+|---|---|---|
+| before (4-wide) | 15.85 | 401 |
+| after (8-wide)  | 14.05 | 452 |
+
++11.4% on the gather. The default decode path (`g_fast_attn`) does not gather; its decode (`load8_q8`,
+`qsa_decode_attn.cu:46-54`) already reads 8 int8 with one `uint2` and is arithmetic-bound (8 I2F + 8 FMUL per
+cell), which `__byte_perm`/half2 cannot improve while staying bit-exact. The gather is what the non-fast,
+streaming and hybrid paths use.
 
 ## 3. int8 vs q4_0 vs k8v4 at 32k
 
