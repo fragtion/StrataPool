@@ -28,3 +28,22 @@ prompts. The `timings` in each record are the engine's own clock (prompt read, d
 
 In the several-chats runs the pair's per-request `reused` / `read` are not right (a chat in a batch slot reports the
 slot's tokens); its `generated` and `wall_s` are.
+
+## The controlled A/B (`ab-*`)
+
+Upstream and StrataPool alternated twice each on each PC (`up-1`, `sp-1`, `up-2`, `sp-2`), with `--adapt-every 0
+--pcie-frac 0` and the same frozen expert profile (`ab-profile-coder.bin`) in both configs; the laptop with
+`--expert-cache 300`. `ms_per_window` = decode time / (generated - accepted drafts): the cost of a window apart from
+how many drafts its text let it accept. `-lp`: the desktop's engines started "as administrator" (large pages were
+still refused, error 1314, with the privilege held and enabled in the token).
+
+| Means of two runs | Code tok/s (ms/window) | Prose | Document answer |
+| --- | --- | --- | --- |
+| Desktop, upstream | 35.0 (82.5) | 30.1 (64.4) | 27.7 (85.3) |
+| Desktop, StrataPool | 36.8 (81.7) | 30.6 (65.6) | 28.0 (86.6) |
+| Laptop, upstream | 25.8 (125.4) | 20.5 (118.4) | 23.9 (122.5) |
+| Laptop, StrataPool | 25.8 (122.8) | 22.1 (114.2) | 23.8 (111.7) |
+
+The replies' hashes differ between runs of the same engine too: even with swaps and the PCIe share off, the CPU
+pool's threads add in an order that varies, and a near-tie flips (`STRATA_IQ_MT_MIN=1` would make it bitwise). So a
+single run's speed moves by its text; compare means of alternated runs.

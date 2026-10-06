@@ -27,7 +27,7 @@ same model, the same requests and the same settings. Upstream Strata 0.1.40.1, b
 - **Switching between agent conversations is instant on the split too:** each switch read 24-33 new tokens and took
   the other 3,300-3,500 from parked conversations, as one PC does.
 
-<p align="center"><img src="docs/media/pool-results.svg" width="760" alt="Writing speed, one chat: laptop alone 28.3 tok/s, desktop alone 41.2 (upstream Strata) and 39.4 (StrataPool), split pool 50.8 (+23%), with Overlap 52.0 (+26%), with Several chats at once 43.6 (+6%). Two chats at once: laptop 27.4, desktop 40.3, Share requests 49.8 (+24%), split pool 52.5 (+30%), split with Several chats 38.4 (-5%), with drafts in several chats 43.0 (+7%)."></p>
+<p align="center"><img src="docs/media/pool-results.svg" width="760" alt="Writing speed, one chat: laptop alone 28.3 tok/s, desktop alone 41.2 (upstream Strata), split pool 50.8 (+23%), with Overlap 52.0 (+26%), with Several chats at once 43.6 (+6%). Two chats at once: laptop 27.4, desktop 40.3, Share requests 49.8 (+24%), split pool 52.5 (+30%), split with Several chats 38.4 (-5%), with drafts in several chats 43.0 (+7%)."></p>
 
 **Where the speed comes from:** memory, not compute. The desktop's 12 GB card holds about 2,300 of the model's
 experts and its CPU computes the rest. Split, each PC caches the experts of its own layers (the laptop 1,762 of
@@ -70,6 +70,9 @@ moves by about ±3% between repeats (the desktop's two runs each), so read range
 | + Overlap the PCs | 55.4 | 50.5 | 50.1 | |
 | + Several chats at once (one chat running) | 48.4 | 39.7 | 42.8 | 42.5 |
 
+Single runs (two for the desktop alone); StrataPool and upstream alone are the same speed once runs are alternated
+(see What we learned).
+
 ### Two chats at the same time
 
 | Setup | Both answers (2,200 tokens) | Each chat |
@@ -101,9 +104,14 @@ keeps the assist below 1,024 tokens (`STRATA_PREFILL_CPU_STAGE=3072` brings thei
   it if your own replies are mostly code.
 - **Several chats at once is still a loss here,** with or without drafts: the extra slot costs the laptop VRAM, and a
   chat in a slot writes at about half speed. It is for pools that serve many agents at once, not for one user.
-- **Each PC alone, StrataPool against upstream:** prompt reading is the same (faster on short prompts with the CPU
-  help). Writing measured 3-5% slower on the desktop (about one to two run-to-run spreads) and 7-12% slower on the
-  laptop (one run; a laptop's clocks move with its temperature). We are looking into both.
+- **Each PC alone, StrataPool is as fast as upstream.** The single runs above differ by a few percent either way,
+  which is the noise: a greedy reply's words still drift between runs (experts computed on the GPU or the CPU round
+  differently, and the CPU threads add in varying order), and with them how many drafts each window accepts.
+  Alternating the two engines twice each with expert swaps and the PCIe share off ([`ab-*`
+  runs](bench/results/2026-10-06-stratapool)): desktop code / prose / document 36.8 / 30.6 / 28.0 tok/s on StrataPool
+  against 35.0 / 30.1 / 27.7 upstream, the same time per window (82 / 66 / 87 ms against 83 / 64 / 85); laptop 25.8 /
+  22.1 / 23.8 against 25.8 / 20.5 / 23.9, with repeats of the same engine 10% apart. Prompt reading is the same,
+  faster on short prompts with the CPU help.
 - In real agent sessions at 40-80K tokens of context (a coding agent at temperature 0.6, an earlier StrataPool), the
   split wrote 34-40 tokens/s where the desktop alone wrote 21-33.
 
