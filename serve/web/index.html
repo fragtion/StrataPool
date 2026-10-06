@@ -170,15 +170,17 @@
           </div>
           <p class="muted small" id="pool-role-help"></p>
           <div class="pool-explain" role="note">
-            <b>Pooling does not add up the speed of the PCs.</b> Each new word passes through the model's layers one
-            after another, so one chat always runs at about one PC's speed.
+            <b>Where a pool's speed comes from.</b> It never adds the PCs' GPUs together on one word: each new word
+            passes through the model's layers one after another, so the PCs take turns rather than working at once.
             <ul>
-              <li><b>Share requests</b>: every PC runs the whole model on its own. Two chats at once run on two PCs at
-                full speed each; a chat stays on the PC that holds its conversation.</li>
-              <li><b>Split layers</b>: the PCs divide the model's layers, and each keeps its layers' experts in its own
-                RAM and VRAM and its share of the context. The pool caches more experts, and fits a model or context
-                one PC could not. The PCs take turns on every word, so a chat gains only from fewer cache misses, and
-                a slow GPU or network slows it down.</li>
+              <li><b>Share requests</b> adds chats, not speed per chat: every PC runs the whole model on its own, so two
+                chats at once run on two PCs, each at that PC's full speed. A chat stays on the PC that holds its
+                conversation.</li>
+              <li><b>Split layers</b> can make one chat faster, from memory rather than compute: each PC keeps only its
+                own layers' experts and context, so together their VRAM caches far more of the model. Fewer experts
+                then run on the slow CPU path. A desktop that wrote 21-33 words/s alone wrote 34-44 with a laptop
+                joined. The gain is largest when one GPU caches the model poorly; a slow GPU or network takes some of
+                it back, since every word crosses it.</li>
             </ul>
           </div>
         </div>
@@ -307,12 +309,11 @@
             </div>
             <span class="muted small">On: up to one chat per PC runs at the same time, each PC working on a different
               one, instead of the second chat waiting for the first.</span>
-            <span class="pool-note small"><strong>Usually slower:</strong> on a desktop + laptop pool two chats together
-              wrote 36-39 words/s against 44 one after the other, and a chat alone ran 10-15% slower (each PC keeps
-              VRAM for the extra chat, so fewer experts are cached; with a long context each extra chat also locks
-              gigabytes of RAM on every PC). Chats running side by side get no repetition penalties, so a model that
-              relies on them can loop in its thinking. Turn it on only if several agents must answer at the same
-              time.</span>
+            <span class="pool-note small" id="pool-chats-note" hidden><strong>Usually slower:</strong> on a desktop +
+              laptop pool two chats together wrote 36-39 words/s against 44 one after the other, and a chat alone ran
+              10-15% slower: each PC keeps VRAM for the extra chat, so fewer experts are cached, and with a long context
+              each extra chat also locks gigabytes of RAM on every PC. A shorter context makes it cheaper. Keep it on
+              only if several agents must answer at the same time.</span>
           </div>
           <div class="st-field" id="pool-chat-drafts-field">
             <span class="st-label">Drafts in several chats</span>

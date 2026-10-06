@@ -10,8 +10,10 @@
 > - **Split layers**: the PCs divide one model's layers, each holding its layers' experts in its own RAM and VRAM and
 >   its share of the context, so the pool caches more experts and fits what one PC cannot.
 >
-> Neither adds up the PCs' compute for one chat, but a split can still beat its faster PC alone: together the GPUs
-> cache far more of the model's experts. See **[docs/POOL.md](docs/POOL.md)** for what each mode does.
+> **Where the speed comes from:** a pool never adds the GPUs together on one word (each word passes through the
+> layers in turn), so Share requests adds chats, not speed per chat. Split layers can still make one chat faster, from
+> memory rather than compute: together the GPUs cache far more of the model's experts, so fewer run on the CPU. See
+> **[docs/POOL.md](docs/POOL.md)** for what each mode does.
 > Everything below is Strata's own README and applies unchanged, with one difference: StrataPool compiles its engine at
 > the first `START-HERE.bat` (10-20 minutes, once), because Strata's ready-made engines do not include the layer split.
 
@@ -40,7 +42,7 @@ decimals.
 | + Overlap the PCs | 41-42 | 41 ms | slower here: too many guessed windows are thrown away |
 | + Several chats at once, one chat running | 35-39 | 44-49 ms | the extra chat's VRAM costs the laptop 4 layers |
 | Two chats at once, one after the other | 44 | | the default: the second chat waits |
-| Two chats at once, Several chats at once | 36-39 together | | each chat about half that; no repetition penalties in slots |
+| Two chats at once, Several chats at once | 36-39 together | | each chat about half that; each keeps its repetition penalties |
 | + Drafts in several chats | ~33 together | | |
 | Very predictable text (a TCP explainer) | up to 54 | 95 ms | 5 accepted words per window |
 

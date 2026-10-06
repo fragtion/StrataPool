@@ -202,9 +202,8 @@ What it costs:
 - Every slot has its own state on every PC (its layers' KV and recurrent state), in VRAM the expert cache would
   otherwise use, so a chat alone runs a little slower than with one slot. With KV streaming (`--kv-resident`) each
   slot's whole context also takes pinned RAM.
-- Chats in slots get no repetition penalties (Strata's batch windows never apply them). With the shipped sampling
-  (presence penalty 1.0) the model then sometimes loops in its thinking until the token limit, and the reply ends
-  without an answer. A chat left alone goes back to the drafted path, with its penalties.
+- Each chat in a slot keeps its own repetition penalties: the head runs on the coordinator, which keeps every
+  slot's recent tokens and applies them to that slot's rows. (One PC's batch windows still apply none.)
 - The PCs' slot counts must match: the coordinator uses as many as every worker could carve.
 - Leave it off if you run one chat at a time: the slots then cost speed and memory for nothing.
 - For two chats at once, *Share requests* runs each at one PC's full speed (each PC holds the whole model). The

@@ -137,7 +137,12 @@
 
   function renderNode() {
     const n = state.node || {};
-    const addrs = (state.addresses || []).map((a) => `<code>${esc(a)}</code>`).join(", ");
+    // the default route's address first (what the other PCs type in); VPN / virtual adapters folded under it
+    const list = state.addresses || [];
+    const rest = list.slice(1);
+    const addrs = !list.length ? "" : `<span class="addr-list"><code class="addr">${esc(list[0])}</code>` +
+      (rest.length ? `<details class="addr-more"><summary>${rest.length} more</summary><span class="addr-rest">` +
+        rest.map((a) => `<code class="addr">${esc(a)}</code>`).join("") + "</span></details>" : "") + "</span>";
     $("pool-node").innerHTML = factsHTML([
       ["Name", esc(n.name || "")],
       ["GPU", esc(n.gpu || "–")],
@@ -322,6 +327,7 @@
       if (document.activeElement !== $("pool-split")) $("pool-split").value = manual ? draft.split : "";
       setSeg("pool-wire", draft.wire);
       setSeg("pool-chats", draft.several_chats ? "on" : "off");
+      $("pool-chats-note").hidden = !draft.several_chats;   // the cost is said where it is paid
       setSeg("pool-chat-drafts", draft.chat_drafts ? "on" : "off");
       $("pool-chat-drafts-field").hidden = !draft.several_chats;
       setSeg("pool-overlap", draft.overlap_windows ? "on" : "off");
