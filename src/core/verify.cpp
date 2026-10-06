@@ -1530,12 +1530,9 @@ bool Verifier::capture(int T, std::string& err) {
         std::fprintf(stderr, "\n");
     }
 #endif
-    const cudaError_t ie = cudaGraphInstantiate(&exec_t, graph, 0);
+    const bool made = instantiate_evicting(exec_t, graph, {}, "verify: instantiate: ", err);
     cudaGraphDestroy(graph);
-    if (ie != cudaSuccess) {
-        err = std::string("verify: instantiate: ") + cudaGetErrorString(ie);
-        return false;
-    }
+    if (!made) return false;
     const cudaError_t ue = cudaGraphUpload(exec_t, cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
     std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
@@ -2123,9 +2120,9 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
         err = !ok ? rerr : std::string("verify: end batch capture: ") + cudaGetErrorString(ce);
         return false;
     }
-    const cudaError_t ie = cudaGraphInstantiate(&ex, graph, 0);
+    const bool made = instantiate_evicting(ex, graph, bkey(rows, S, hbase), "verify: batch instantiate: ", err);
     cudaGraphDestroy(graph);
-    if (ie != cudaSuccess) { err = std::string("verify: batch instantiate: ") + cudaGetErrorString(ie); return false; }
+    if (!made) return false;
     cudaGraphUpload(ex, cs_);
     cudaStreamSynchronize(cs_);
     std::string list;
@@ -2216,12 +2213,66 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
         if (graph) cudaGraphDestroy(graph);
         return false;
     }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&cex, graph, 0) != cudaSuccess) {
+    if (ce != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
         err = std::string("verify: batch commit capture: ") + cudaGetErrorString(ce);
         return false;
     }
+    const bool made = instantiate_evicting(cex, graph, bkey(rows, S, hbase), "verify: batch commit instantiate: ", err);
     cudaGraphDestroy(graph);
+    return made;
+}
+
+bool Verifier::evict_batch_graph(const std::vector<int>& keep, bool& evicted, std::string& err) {
+    evicted = false;
+    auto old = exec_bm_.end();
+    uint64_t oldest = UINT64_MAX;
+    for (auto it = exec_bm_.begin(); it != exec_bm_.end(); ++it) {
+        if (it->first == keep) continue;
+        const auto u = bm_used_.find(it->first);
+        const uint64_t t = u == bm_used_.end() ? 0 : u->second;
+        if (t < oldest) { oldest = t; old = it; }
+    }
+    if (old == exec_bm_.end()) return true;
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = "verify: synchronizing before batch graph eviction failed";
+        return false;
+    }
+    const auto old_key = old->first;
+    if (old->second) cudaGraphExecDestroy(old->second);
+    exec_bm_.erase(old);
+    bm_used_.erase(old_key);
+    auto commit_old = commit_bm_.find(old_key);
+    if (commit_old != commit_bm_.end()) {
+        if (commit_old->second) cudaGraphExecDestroy(commit_old->second);
+        commit_bm_.erase(commit_old);
+    }
+    evicted = true;
+    return true;
+}
+
+bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const std::vector<int>& key,
+                                   const char* what, std::string& err) {
+    // #997: every layout of active slots keeps its own graph pair (20-30 MiB each on an L40S), and with an expert cache
+    // sized to the reserve the next window graph - a batch layout or a one-request window captured on first use - can
+    // find no VRAM left: free the least recently used layouts until it fits (they are captured again when needed)
+    cudaError_t ie = cudaGraphInstantiate(&ex, graph, 0);
+    int freed = 0;
+    for (bool evicted = true; ie == cudaErrorMemoryAllocation && evicted;) {
+        (void) cudaGetLastError();
+        if (!evict_batch_graph(key, evicted, err)) return false;
+        if (evicted) {
+            ++freed;
+            ie = cudaGraphInstantiate(&ex, graph, 0);
+        }
+    }
+    if (freed > 0)
+        std::fprintf(stderr, "strata verify: no VRAM for a new window graph: freed the graphs of %d older batch slot "
+                             "layouts, %zu kept (a larger --vram-reserve-mib keeps more)\n", freed, exec_bm_.size());
+    if (ie != cudaSuccess) {
+        err = std::string(what) + cudaGetErrorString(ie);
+        return false;
+    }
     return true;
 }
 
@@ -2261,33 +2312,13 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
         }
     refresh_ar();
     // --batch-mtp only (limit 0 = 0.1.39: no eviction): slot rotation creates new layouts; bound the captured graph
-    // pairs, evicting the least recently used layout.
-    if (batch_graph_limit_ > 0) {
-        const auto key = bkey(rows, S, hbase);
-        if (exec_bm_.find(key) == exec_bm_.end() && exec_bm_.size() >= batch_graph_limit_) {
-            if (cudaStreamSynchronize(cs_) != cudaSuccess) {
-                err = "verify: synchronizing before batch graph eviction failed";
-                return false;
-            }
-            auto old = exec_bm_.begin();
-            uint64_t oldest = UINT64_MAX;
-            for (auto it = exec_bm_.begin(); it != exec_bm_.end(); ++it) {
-                const auto u = bm_used_.find(it->first);
-                const uint64_t t = u == bm_used_.end() ? 0 : u->second;
-                if (t < oldest) { oldest = t; old = it; }
-            }
-            const auto old_key = old->first;
-            if (old->second) cudaGraphExecDestroy(old->second);
-            exec_bm_.erase(old);
-            bm_used_.erase(old_key);
-            auto commit_old = commit_bm_.find(old_key);
-            if (commit_old != commit_bm_.end()) {
-                if (commit_old->second) cudaGraphExecDestroy(commit_old->second);
-                commit_bm_.erase(commit_old);
-            }
-        }
-        bm_used_[key] = ++bm_tick_;
-    }
+    // pairs, evicting the least recently used layout.  Without a limit the same eviction frees VRAM for a capture.
+    const auto key = bkey(rows, S, hbase);
+    bool evicted = false;
+    if (batch_graph_limit_ > 0 && exec_bm_.find(key) == exec_bm_.end() && exec_bm_.size() >= batch_graph_limit_ &&
+        !evict_batch_graph(key, evicted, err))
+        return false;
+    bm_used_[key] = ++bm_tick_;
     if (!capture_batch(rows, S, hbase, err) || !capture_commit_batch(rows, S, hbase, err)) return false;
     const Clock::time_point t0 = Clock::now();
     const QsaShapes s = shapes_of(g);
@@ -2363,7 +2394,10 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     // ("verify batch: layer K never rang (graph finished)" - K is that stage's first layer), and with it the graph
     // sits on the PLE wait until the 20 s timeout.  As run() does: raise the PLE flag the graph's first wait reads,
     // let the graph run to the end, and skip the host's per-layer service (there is nothing to serve).
-    if (all_resident_) {
+    // #646 + #871: the skip is per-window (ar_on), not per-process (all_resident_): a stage that was 100%
+    // resident at init takes the doorbell graph while a prompt loan/shrink/swap is in flight (ar_off_), and that
+    // graph waits on host doorbells the skipped service never raises (GPU at 100%, host in the sync below).
+    if (ar_on()) {
         if (ss_->ple.ready() && ple_stage()) {
             std::atomic_thread_fence(std::memory_order_seq_cst);
             _mm_sfence();
@@ -2549,13 +2583,14 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     const int S = last_t_;
     // #646: an all-resident stage's graph raises no host doorbells (see run_slot_rows): nothing to serve per layer,
     // so the poll is just "has the graph finished" - except the PLE flag, which the graph's first wait reads and
-    // only the host can raise (the same raise run_slot_rows makes).
-    if (all_resident_ && ss_->ple.ready() && ple_stage()) {
+    // only the host can raise (the same raise run_slot_rows makes).  Per-window (ar_on): with a loan in flight the
+    // doorbell graph needs the per-layer service below.
+    if (ar_on() && ss_->ple.ready() && ple_stage()) {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
         *h_flag_ = 1;
     }
-    while (!all_resident_ && b_k_ < b_steps_) {
+    while (!ar_on() && b_k_ < b_steps_) {
         const uint32_t want = (uint32_t) (b_k_ + 1);
         if (*seq < want) {
             const auto now = Clock::now();
@@ -2769,7 +2804,8 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err, int max_la
         ms_host += ms_since(tp);
         return true;
     };
-    if (all_resident_) {   // the zero-doorbell graph never rings: it waits only for flag 1 (stage 0's PLE rows)
+    if (ar_on()) {   // the zero-doorbell graph never rings: it waits only for flag 1 (stage 0's PLE rows).
+        // Per-window: with a loan in flight (ar_off_) the doorbell graph needs the per-layer service below.
         if (!gather_ple()) return -1;
         *(volatile uint32_t*) h_flag_ = 1;
         fl_k_ = fl_total_;

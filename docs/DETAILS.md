@@ -218,7 +218,11 @@ RTX 5070, against ~3 tokens/s before these changes.
   and with `--batch`, `--vram-elastic` or `--peer-device`, the engine says so and stays off.
 - `--host-core last` (or `STRATA_HOST_CORE=last`, Windows): the host thread runs on the last physical core and the
   workers take the first. Windows sends a GPU's interrupts to the first core, where a host spinning on the GPU's flags
-  waits for them (`--host-core first` is the default; the startup log names the cores).
+  waits for them (`--host-core first` is the default; the startup log names the cores). It leaves a hybrid CPU as it
+  is. `--host-core sibling` (or `STRATA_HOST_CORE=sibling`) keeps the host on the first core but on its other
+  hardware thread (SMT), so the interrupts keep the first logical processor and the workers keep every core; it works
+  on hybrid CPUs too, and is `first` on a core without SMT. On a 4060 Ti + 5080 layer split with an i9-14900KF it
+  turned a decode that swung by ±6% from run to run into a steady one, 8% faster on average.
 - `STRATA_ADAPT_LAG=2` (#764): a window takes the adaptive tier's swaps once they are two windows old (default 1,
   as 0.1.39). `STRATA_PREFILL_EQUAL=1` (#693): a prompt segment is read in chunks of equal size, not full chunks and a
   short last one (changes the rounding). `STRATA_OWNED_PRICE=exact` (#796): the cache sizing prices the prompt path's
@@ -752,11 +756,11 @@ Snapshots contain running state, checkpoints, used K/V pages, and draft-layer K/
 They add host RAM, not another model or VRAM allocation. The byte budget also counts
 an incoming snapshot during a switch. After a restore, unchanged K/V pages can be
 retained for the next parking operation; growth appends storage without copying
-the existing pages. Rewinds refresh the affected pages, and running state and
+the existing pages, with room for the next turns of at most an eighth of each
+buffer (and at most 16 MiB), which the budget counts like the rest of the snapshot.
+Rewinds refresh the affected pages, and running state and
 checkpoints are captured again. Retained active K/V counts against the same byte
 budget and is discarded before evicting parked entries under memory pressure.
-If reserving space for growth would evict another conversation, parking uses a
-full capture instead.
 Oldest parked entries are evicted first.
 Oversized snapshots or host allocation failures fall back to ordinary prompt processing.
 `--conversation-cache-min-free-mib N` (default 2560) additionally requires that
