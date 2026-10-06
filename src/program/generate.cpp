@@ -2707,7 +2707,7 @@ int main(int argc, char** argv) {
     int64_t node_lb = 0, node_le = g.n_layers;   // this node's layers
     auto pool_essentials = [](const strata::pool::KV& c) {
         std::string e;
-        for (const char* k : {"lb", "le", "max_context", "kv", "spec", "batch", "prefill_chunk", "prefill_auto", "rope_type",
+        for (const char* k : {"lb", "le", "max_context", "kv", "spec", "batch", "batch_mtp", "prefill_chunk", "prefill_auto", "rope_type",
                               "rope_freq_base", "rope_factor", "rope_freq_scale_in", "rope_orig_ctx", "rope_ext_factor",
                               "rope_attn_factor", "rope_beta_fast", "rope_beta_slow"})
             e += std::string(k) + "=" + c.str(k) + ";";
