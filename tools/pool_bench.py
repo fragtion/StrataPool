@@ -37,6 +37,8 @@ CODE = ("Write a complete Python module `ttl_cache.py` implementing a thread-saf
         "get/set/delete, a maximum size, an optional loader callback for misses, statistics (hits, misses, evictions, "
         "expirations), and a decorator that memoizes a function with it. Include docstrings and a unittest test class "
         "covering eviction order, expiry with a fake clock, thread safety and the decorator.")
+# in the pair, the code request once answered with a tool call after ~100 tokens (no tools are offered): asked plainly
+PAIR_NOTE = " Write the whole module in your reply as one code block; do not call any tools."
 PROSE = ("Explain in detail how TCP works: the three-way handshake, sequence and acknowledgement numbers, the sliding "
          "window, retransmission and timeouts, slow start and congestion avoidance, fast retransmit and recovery, and "
          "connection teardown. Use headings and keep it accurate.")
@@ -80,6 +82,8 @@ def ask(url: str, messages: list, max_tokens: int, name: str, results: list, loc
             results.append(rec)
     else:
         results.append(rec)
+    if rec["finish"] not in ("length", "stop"):
+        print(f"  ! {name}: finished with {rec['finish']!r} - not a full answer; its speed is not comparable")
     print(f"  {name:<22} prompt {rec['prompt_tokens']} (reused {rec['reused']}, read {rec['read']} at "
           f"{rec['prompt_tok_s']} tok/s), {rec['generated']} generated at {rec['decode_tok_s']} tok/s, "
           f"{rec['wall_s']} s", flush=True)
@@ -144,7 +148,7 @@ def main() -> int:
         t0 = time.perf_counter()
         th = [threading.Thread(target=ask, args=(a.url, [{"role": "user", "content": tag + "(pair) " + p}], m,
                                                  f"pair: {n}", results, lock))
-              for n, p, m in (("code", CODE, 1200), ("prose", PROSE, 1000))]
+              for n, p, m in (("code", CODE + PAIR_NOTE, 1200), ("prose", PROSE, 1000))]
         for t in th:
             t.start()
         for t in th:
