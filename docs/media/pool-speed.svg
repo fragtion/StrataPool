@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="372" viewBox="0 0 760 372" role="img" aria-labelledby="t d">
+<title id="t">StrataPool on a desktop + laptop pool: tokens per second</title>
+<desc id="d">Measured 2026-10-06, Qwen3.8-Flash-Next coder IQ1_M, StrataPool on Strata 0.1.40. Bars are tokens per second written; ranges are the runs measured.</desc>
+<style>
+  .bg { fill: #fcfcfb; }
+  .h { font: 600 14px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #0b0b0b; }
+  .l { font: 13px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #52514e; }
+  .v { font: 600 13px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #0b0b0b; }
+  .s { font: 12px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #52514e; }
+  .b { fill: #2a78d6; }
+  .axis { stroke: #c3c2b7; stroke-width: 1; }
+  @media (prefers-color-scheme: dark) {
+    .bg { fill: #1a1a19; }
+    .h, .v { fill: #ffffff; }
+    .l, .s { fill: #c3c2b7; }
+    .b { fill: #3987e5; }
+    .axis { stroke: #52514e; }
+  }
+</style>
+<rect class="bg" x="0" y="0" width="760" height="372" rx="8"/>
+<text class="s" x="16" y="22">Tokens per second written (higher is better); ranges are the runs measured</text>
+<text class="h" x="16" y="44">One chat, 7.6K-token prompt, 2-3K-token answer</text>
+<text class="l" x="320" y="75.0" text-anchor="end">Split, default settings</text>
+<path class="b" d="M330,62 H617.7 Q621.7,62 621.7,66 V76 Q621.7,80 617.7,80 H330 Z"><title>Split, default settings: 44 tokens/s</title></path>
+<text class="v" x="629.7" y="75.0">44</text>
+<text class="l" x="320" y="103.0" text-anchor="end">+ Overlap the PCs</text>
+<path class="b" d="M330,90 H600.6 Q604.6,90 604.6,94 V104 Q604.6,108 600.6,108 H330 Z"><title>+ Overlap the PCs: 41-42 tokens/s</title></path>
+<text class="v" x="612.6" y="103.0">41-42</text>
+<text class="l" x="320" y="131.0" text-anchor="end">+ Several chats at once (one chat running)</text>
+<path class="b" d="M330,118 H566.9 Q570.9,118 570.9,122 V132 Q570.9,136 566.9,136 H330 Z"><title>+ Several chats at once (one chat running): 35-39 tokens/s</title></path>
+<text class="v" x="578.9" y="131.0">35-39</text>
+<line class="axis" x1="330" y1="58" x2="330" y2="140"/>
+<text class="h" x="16" y="164">One chat, long agent prompts (40-80K tokens)</text>
+<text class="l" x="320" y="195.0" text-anchor="end">Desktop alone (RTX 3060)</text>
+<path class="b" d="M330,182 H504.2 Q508.2,182 508.2,186 V196 Q508.2,200 504.2,200 H330 Z"><title>Desktop alone (RTX 3060): 21-33 tokens/s</title></path>
+<text class="v" x="516.2" y="195.0">21-33</text>
+<text class="l" x="320" y="223.0" text-anchor="end">Split: desktop + laptop</text>
+<path class="b" d="M330,210 H570.2 Q574.2,210 574.2,214 V224 Q574.2,228 570.2,228 H330 Z"><title>Split: desktop + laptop: 34-40 tokens/s</title></path>
+<text class="v" x="582.2" y="223.0">34-40</text>
+<line class="axis" x1="330" y1="178" x2="330" y2="232"/>
+<text class="h" x="16" y="256">Two chats at the same time, both together</text>
+<text class="l" x="320" y="287.0" text-anchor="end">One after the other (Several chats Off)</text>
+<path class="b" d="M330,274 H616.4 Q620.4,274 620.4,278 V288 Q620.4,292 616.4,292 H330 Z"><title>One after the other (Several chats Off): 44 tokens/s</title></path>
+<text class="v" x="628.4" y="287.0">44</text>
+<text class="l" x="320" y="315.0" text-anchor="end">Several chats at once</text>
+<path class="b" d="M330,302 H573.5 Q577.5,302 577.5,306 V316 Q577.5,320 573.5,320 H330 Z"><title>Several chats at once: 36-39 tokens/s</title></path>
+<text class="v" x="585.5" y="315.0">36-39</text>
+<text class="l" x="320" y="343.0" text-anchor="end">+ Drafts in several chats</text>
+<path class="b" d="M330,330 H543.8 Q547.8,330 547.8,334 V344 Q547.8,348 543.8,348 H330 Z"><title>+ Drafts in several chats: about 33 tokens/s</title></path>
+<text class="v" x="555.8" y="343.0">about 33</text>
+<line class="axis" x1="330" y1="270" x2="330" y2="352"/>
+</svg>
