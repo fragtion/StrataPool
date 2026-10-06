@@ -2375,7 +2375,11 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         if (prof_on_) collect_profile();
         ++windows;
         if (le_ < g.n_layers) {
-            if (link_ != nullptr) return link_->run_rows(rows, S, tokens, pos, out, err);   // POOL: the workers + head
+            if (link_ != nullptr) {   // POOL: the workers + head; a finished window is the watchdog's beat (#29)
+                if (!link_->run_rows(rows, S, tokens, pos, out, err)) return false;
+                progress_beat();
+                return true;
+            }
             return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
         }
         if (headless_) return true;   // POOL worker: the rows go back over the network, the head is the coordinator's
@@ -2438,7 +2442,11 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     if (prof_on_) collect_profile();
     ++windows;
     if (le_ < g.n_layers) {
-        if (link_ != nullptr) return link_->run_rows(rows, S, tokens, pos, out, err);   // POOL: the workers + head
+        if (link_ != nullptr) {   // POOL: the workers + head; a finished window is the watchdog's beat (#29)
+                if (!link_->run_rows(rows, S, tokens, pos, out, err)) return false;
+                progress_beat();
+                return true;
+            }
         return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
     }
     if (headless_) return true;   // POOL worker: the rows go back over the network, the head is the coordinator's
