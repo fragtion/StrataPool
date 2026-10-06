@@ -8411,6 +8411,26 @@ int main(int argc, char** argv) {
                                      it->second.live.ids.size(),
                                      std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                         if (!ack()) { why = "the coordinator went away"; break; }
+                    } else if (t == strata::pool::Msg::ConvBorrow) {
+                        // #1164 in a pool: a sibling conversation starts with this parked one's checkpoint - its first
+                        // n tokens' K/V come over, the image stays (the checkpoint's own CKPT_RESTORE follows)
+                        uint64_t id = 0;
+                        int64_t n = 0;
+                        const auto it = u.get(id) && u.get(n) ? w_convs.find(id) : w_convs.end();
+                        if (it == w_convs.end()) {
+                            fail("this worker has no parked conversation " + std::to_string((unsigned long long) id));
+                            continue;
+                        }
+                        std::string pe;
+                        const auto rr = strata::core::conversation_snapshot_restore_prefix(it->second, n, ss, g, nullptr, pe);
+                        if (rr == strata::core::ConversationRestore::invalid) { fail("borrowing: " + pe); continue; }
+                        if (rr != strata::core::ConversationRestore::restored || cudaDeviceSynchronize() != cudaSuccess) {
+                            fail("borrowing a parked conversation's start failed: " + pe);
+                            fatal = true;
+                            break;
+                        }
+                        std::fprintf(stderr, "strata pool: borrowed %lld tokens from a parked conversation\n", (long long) n);
+                        if (!ack()) { why = "the coordinator went away"; break; }
                     } else if (t == strata::pool::Msg::ConvRetain) {
                         uint32_t n = 0;
                         std::set<uint64_t> keep;
@@ -9745,8 +9765,16 @@ int main(int argc, char** argv) {
                 }
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
             std::optional<strata::core::SavedConversation> incoming;
-            if (parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
-            if (incoming) slot_source = -1;
+            // A checkpoint inside ANOTHER parked conversation (a sibling subagent's system prompt and tools, say) is
+            // borrowed: its K/V up to there and the checkpoint come over, and that conversation stays parked for its
+            // own next turn (ConversationCache::borrows).  Everything else is taken whole, as before.
+            // (a layer split restores whole stage images only, so it never borrows; a batch slot that holds a longer
+            // start of this prompt wins as before)
+            bool borrow = stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
+                          conversations.borrows(parked);
+            if (parked.tokens > std::max(resume, slot_tokens) && !borrow)
+                incoming.emplace(conversations.take(parked.index));
+            if (incoming || borrow) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
             if (incoming && incoming->stage_images.size() != stages.size()) {
@@ -9770,6 +9798,19 @@ int main(int argc, char** argv) {
                 incoming.reset();
                 err.clear();
             }
+            if (borrow) {
+                const strata::core::SavedConversation* donor = conversations.find(parked.serial);
+                if (donor == nullptr ||
+                    !strata::core::conversation_snapshot_validate(*donor, ss, g, use_mtp ? &mtp.kv_state() : nullptr,
+                                                                  err)) {
+                    std::fprintf(stderr, "strata serve: conversation cache: cannot borrow from a parked conversation "
+                                         "(%s)\n", err.empty() ? "gone" : err.c_str());
+                    borrow = false;
+                    err.clear();
+                } else if (pool_coord && donor->pool_id == 0) {
+                    borrow = false;   // POOL: the workers hold no part of it
+                }
+            }
             if (incoming && pool_coord && incoming->pool_id == 0) {
                 std::fprintf(stderr, "strata serve: conversation cache: discard snapshot (no worker part)\n");
                 incoming.reset();
@@ -9777,7 +9818,31 @@ int main(int argc, char** argv) {
             pool_keep_conv = incoming ? incoming->pool_id : 0;   // its worker images stay until it is restored
             // Preserve the outgoing branch before any checkpoint rewind, reset,
             // or incoming restore overwrites the positional state it requires.
-            if ((!from_live || incoming || slot_source >= 0) && !park_current(incoming ? incoming->bytes() : 0)) {
+            if (borrow) {
+                conversations.pin(parked.serial);   // parking the outgoing conversation must not evict the donor
+                const bool parked_ok = park_current(0);
+                const bool blocked = conversations.pin_blocked();
+                conversations.unpin();
+                if (!parked_ok) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
+                if (blocked) {
+                    // the outgoing conversation fits only in the donor's room: it keeps its place, the donor is
+                    // taken whole as before (it was validated above)
+                    std::fprintf(stderr, "strata serve: conversation cache: no room beside the parked conversation "
+                                         "this request starts with; taking it instead of borrowing\n");
+                    borrow = false;
+                    if (const size_t at = conversations.index_of(parked.serial); at != SIZE_MAX)
+                        incoming.emplace(conversations.take(at));
+                    if (incoming && pool_coord && incoming->pool_id == 0) incoming.reset();
+                    pool_keep_conv = incoming ? incoming->pool_id : 0;
+                    if (!park_current(incoming ? incoming->bytes() : 0)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                }
+            } else if ((!from_live || incoming || slot_source >= 0) && !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
@@ -9834,6 +9899,47 @@ int main(int argc, char** argv) {
                     resume = 0;
                     from_live = false;   // (a lost link fails the reset below)
                 }
+            }
+            if (borrow && pool_coord) {
+                // POOL: every worker takes the same prefix of its layers' K/V from its part of the parked conversation
+                // (which stays parked); the checkpoint mounted below restores their running state (CKPT_RESTORE)
+                const strata::core::SavedConversation* donor = conversations.find(parked.serial);
+                std::string pe;
+                if (donor == nullptr || !pool_link.conv_borrow(donor->pool_id, parked.tokens, pe)) {
+                    std::fprintf(stderr, "strata serve: conversation cache: a worker could not borrow its part (%s); "
+                                         "reading the prompt\n", pe.empty() ? "gone" : pe.c_str());
+                    borrow = false;
+                    resume = 0;
+                    from_live = false;
+                }
+            }
+            if (borrow) {
+                const auto t0 = Clock::now();
+                const strata::core::SavedConversation* donor = conversations.find(parked.serial);   // still parked
+                if (donor == nullptr ||
+                    strata::core::conversation_snapshot_restore_prefix(*donor, parked.tokens, ss, g,
+                                                                       use_mtp ? &mtp.kv_state() : nullptr, err) !=
+                        strata::core::ConversationRestore::restored) {
+                    // validated above and pinned while parking: a failure here is fatal, as for a whole restore
+                    std::printf("ERR restoring a borrowed conversation prefix: %s\n",
+                                err.empty() ? "gone" : err.c_str());
+                    return 1;
+                }
+                // the donor's checkpoints on this prompt's path, copied: the donor keeps its own (the one at
+                // parked.tokens is mounted below, as for any checkpoint resume)
+                checks.clear();
+                for (const ConvCheckpoint& c : donor->checkpoints)
+                    if ((int64_t) c.ids.size() <= parked.tokens && starts_with(c.ids, c.imgs)) checks.push_back(c);
+                for (const ConvCheckpoint& c : checks)
+                    if ((int64_t) c.ids.size() == parked.tokens) { live = c.ids; live_imgs = c.imgs; }
+                cvec_cached = donor->cvec;
+                resume = parked.tokens;
+                from_live = false;
+                conversations.count_borrow();
+                std::fprintf(stderr, "strata serve: conversation cache: borrowed %lld tokens from a parked "
+                             "conversation, which stays parked, in %.1f ms; parked=%zu bytes=%zu borrowed=%zu\n",
+                             (long long) resume, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                             conversations.size(), conversations.bytes(), conversations.borrowed());
             }
             if (incoming) {
                 const auto t0 = Clock::now();

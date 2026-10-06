@@ -241,6 +241,69 @@ int main() {
               "an oversized put drops nothing");
     }
     {
+        // borrowing: a NEW conversation that starts with a checkpoint inside a parked one (a sibling subagent with
+        // the same system prompt and tools) restores from it and leaves it parked; the same conversation going on
+        // (its live state, or its deepest checkpoint after the client re-rendered the last reply) is still taken
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        SavedConversation a = image({});
+        a.live.ids = {1, 2, 3, 4, 10, 11, 12, 13};
+        a.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10, 11})};
+        ConversationCache cache(1 << 20, 2);
+        check(cache.put(std::move(a)), "park subagent A");
+        const auto sib = cache.best(std::vector<int64_t>{1, 2, 3, 4, 20, 21}, {}, true);
+        check(sib.tokens == 4 && !sib.live && sib.serial != 0 && cache.borrows(sib), "a sibling on A's root borrows");
+        const auto again = cache.best(std::vector<int64_t>{1, 2, 3, 4, 10, 11, 30}, {}, true);
+        check(again.tokens == 6 && !again.live && !cache.borrows(again),
+              "A re-rendered at its deepest checkpoint is taken");
+        const auto cont = cache.best(std::vector<int64_t>{1, 2, 3, 4, 10, 11, 12, 13, 14}, {}, true);
+        check(cont.live && !cache.borrows(cont), "A going on is taken");
+        check(!cache.borrows(cache.best(std::vector<int64_t>{5, 6, 7}, {}, true)), "no match, nothing to borrow");
+        // while the outgoing conversations are parked, the pinned donor is neither evicted nor dropped
+        cache.pin(sib.serial);
+        check(cache.put(image({7, 7, 7})) && cache.put(image({8, 8, 8})), "two outgoing conversations park");
+        check(cache.find(sib.serial) != nullptr && cache.size() == 2 && cache.evictions() == 1 && !cache.pin_blocked(),
+              "the slot limit evicts the other entry, not the pinned donor");
+        check(cache.best(std::vector<int64_t>{7, 7, 7, 1}, {}, true).tokens == 0, "the unpinned one went");
+        SavedConversation rewritten = image({1, 2, 3, 4, 10, 11, 40});   // holds A's deepest checkpoint: supersedes A
+        rewritten.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10, 11})};
+        check(cache.put(std::move(rewritten)) && cache.find(sib.serial) != nullptr && cache.superseded() == 0,
+              "a pinned donor is not dropped as superseded");
+        cache.unpin();
+        // identity survives index shifts: take an older entry, the donor's serial still finds it
+        const auto donor_index = cache.index_of(sib.serial);
+        check(donor_index != SIZE_MAX, "donor indexed by its serial");
+        check(cache.best(std::vector<int64_t>{1, 2, 3, 4, 10, 11, 12, 13, 14}, {}, true).serial == sib.serial,
+              "matches report the entry's serial");
+    }
+    {
+        // the outgoing conversation fits only in the pinned donor's room: make_room refuses before evicting anything
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        SavedConversation a = image({1, 2, 3, 4, 10, 11});
+        a.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10})};
+        const size_t a_bytes = a.bytes();
+        const size_t out_bytes = image({9, 9, 9}).bytes();
+        ConversationCache tight(a_bytes + out_bytes - 1, 4);
+        check(tight.put(std::move(a)), "park the donor");
+        const auto m = tight.best(std::vector<int64_t>{1, 2, 3, 4, 50}, {}, true);
+        check(tight.borrows(m), "a sibling would borrow");
+        tight.pin(m.serial);
+        check(!tight.put(image({9, 9, 9})) && tight.pin_blocked(), "no room beside the pinned donor: refused");
+        check(tight.size() == 1 && tight.evictions() == 0, "nothing evicted by the refusal");
+        tight.unpin();
+        auto taken = tight.take(tight.index_of(m.serial));   // what the caller does then: take it, as before
+        check(taken.live.ids.size() == 6 && taken.checkpoints.size() == 2 && tight.size() == 0,
+              "the taken donor is whole");
+        ConversationCache one_slot(1 << 20, 1);
+        SavedConversation b = image({1, 2, 3, 4, 10, 11});
+        b.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10})};
+        check(one_slot.put(std::move(b)), "park in a single slot");
+        const auto mb = one_slot.best(std::vector<int64_t>{1, 2, 3, 4, 50}, {}, true);
+        one_slot.pin(mb.serial);
+        check(!one_slot.put(image({9, 9, 9})) && one_slot.pin_blocked() && one_slot.size() == 1,
+              "one slot: the pinned donor blocks, nothing evicted");
+        one_slot.unpin();
+    }
+    {
         ConversationCache disabled(0,4), no_slots(1024,0);
         check(!disabled.enabled() && !no_slots.enabled(), "both disable switches");
         check(!disabled.put(image({1,2,3})) && !no_slots.put(image({1,2,3})), "disabled cache stores nothing");

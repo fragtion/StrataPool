@@ -932,6 +932,14 @@ bool PoolLink::conv_restore(uint64_t id, std::string& err) {
     return ask_all(ch_, workers_, Msg::ConvRestore, pk.b, err);
 }
 
+bool PoolLink::conv_borrow(uint64_t id, int64_t n, std::string& err) {
+    std::lock_guard<std::mutex> lk(mu_);
+    Packer pk;
+    pk.put<uint64_t>(id);
+    pk.put<int64_t>(n);
+    return ask_all(ch_, workers_, Msg::ConvBorrow, pk.b, err);
+}
+
 bool PoolLink::conv_retain(const std::vector<uint64_t>& ids, std::string& err) {
     std::lock_guard<std::mutex> lk(mu_);
     Packer pk;

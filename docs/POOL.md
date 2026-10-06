@@ -162,9 +162,11 @@ no longer make the main conversation read again everything after the part they s
 it comes back. Each PC keeps its own part in its own RAM: the coordinator its layers and the draft layer, under the
 budget and slot count of its config; each worker its layers, as long as that leaves
 `--conversation-cache-min-free-mib` (default 2,560 MiB) of its RAM free. A worker that cannot park its part says so in
-the coordinator's log (`skip parking`), and that conversation is read again when it comes back, as before. The
-worker's log shows each park and restore and how much it holds. Every PC must run an engine with this (an older worker
-turns it off, with a note in the coordinator's log).
+the coordinator's log (`skip parking`), and that conversation is read again when it comes back, as before. A new
+conversation that starts like a parked one (a sibling subagent with the same system prompt and tools) borrows that
+start on every PC and leaves the parked one in place (Strata PR #1164). The worker's log shows each park, restore and
+borrow, and how much it holds. Every PC must run an engine with this (an older worker turns it off, with a note in the
+coordinator's log).
 
 ## The split learns from its timings
 

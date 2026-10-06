@@ -190,6 +190,12 @@ struct FakeWorker {
                         { std::lock_guard<std::mutex> g(mu); have = convs.count(id) != 0; }
                         if (have) ch.send(Msg::Ack, e);
                         else { KV no; no.set("message", "no parked conversation " + std::to_string(id)); ch.send(Msg::Err, no, e); }
+                    } else if (t == Msg::ConvBorrow) {
+                        uint64_t id; int64_t n; u.get(id); u.get(n);
+                        bool have;
+                        { std::lock_guard<std::mutex> g(mu); have = convs.count(id) != 0; }
+                        if (have) ch.send(Msg::Ack, e);
+                        else { KV no; no.set("message", "no parked conversation " + std::to_string(id)); ch.send(Msg::Err, no, e); }
                     } else if (t == Msg::ConvRetain) {
                         uint32_t n; u.get(n);
                         std::set<uint64_t> keep;
@@ -260,6 +266,11 @@ static void test_two_workers(Wire wire) {
     CHECK(!link.conv_restore(41, err) && err.find("no parked conversation 41") != std::string::npos);
     err.clear();
     CHECK(link.conv_restore(42, err));
+    CHECK(link.conv_borrow(42, 100, err));                  // the image stays: borrowed again, then restored
+    CHECK(link.conv_borrow(42, 50, err));
+    CHECK(link.conv_restore(42, err));
+    CHECK(!link.conv_borrow(41, 10, err) && err.find("no parked conversation 41") != std::string::npos);
+    err.clear();
     // a pipelined batch group (slots 1-2) through both workers, without the head; slot copies on both (the fake
     // workers read and write f32 rows)
     if (wire == Wire::F32) {

@@ -64,6 +64,7 @@ enum class Msg : uint16_t {
     ConvPark = 32,   // u64 id, i64 n: keep the session's first n tokens (K/V and running state) under id  (ACK / Err)
     ConvRestore = 33,// u64 id: put that image back into the session                                     (ACK / Err)
     ConvRetain = 34, // u32 n, u64 ids[n]: drop every other image                                        (lazy ACK)
+    ConvBorrow = 35, // u64 id, i64 n: the first n tokens' K/V from that image into the session; it stays (ACK / Err)
     Ack = 30,
     Err = 31,        // message=<text>
     Bye = 40,        // the coordinator is leaving; the worker keeps its load for the next one

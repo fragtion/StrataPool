@@ -155,6 +155,8 @@ public:
     bool conv_park(uint64_t id, int64_t n, std::string& err);
     bool conv_restore(uint64_t id, std::string& err);
     bool conv_retain(const std::vector<uint64_t>& ids, std::string& err);
+    /// a new conversation that starts with a parked one's checkpoint: the first n tokens' K/V from that image (#1164)
+    bool conv_borrow(uint64_t id, int64_t n, std::string& err);
     /// every worker said "<key>=1" in READY (a capability an older worker lacks)
     bool all_ready(const char* key) const;
     uint64_t new_ckpt_id() { return ++ckpt_seq_; }
