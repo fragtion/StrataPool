@@ -230,9 +230,14 @@ is accepted whole and what its next word is; when the verdict says otherwise, th
 back and runs the right window. The workers only ever get verified windows, in order, so nothing changes on them (a
 worker started with an older engine works too). It helps most when the workers' part and the network are a large share
 of a window and the drafts are usually right. Upstream measured +14-16% on two GPUs in one PC; on the desktop + laptop
-pool it was about 6% slower (41-42 against 44 tok/s, 41 against 38 ms a window: 1,907 of 1,908 windows ran
-overlapped, but too many guessed windows were thrown away). Compare a few long replies with it on and off. It needs the draft layer and is off while several chats run (the log says so). Requests with repetition
-penalties (`penalty_last_n`) overlap too: the head on the coordinator sees each window after the one before it.
+pool it was about 6% slower (41-42 against 44 tok/s, 41 against 38 ms a window: 1,907 of 1,908 windows ran overlapped,
+but too many guessed windows were thrown away). It needs the draft layer and is off while several chats run (the log
+says so). Requests with repetition penalties (`penalty_last_n`) overlap too: the head on the coordinator sees each
+window after the one before it. Since that measurement the coordinator serves the verified window's layers before a
+guessed one's (a guessed window one layer at a time while the workers run the verified one), guesses more often (the
+gate went from 0.20 to 0.10), and keeps copying from the prompt lookup across windows when the text repeats an earlier
+stretch (all three from architectds' fork, which measured +8.9% on a two-GPU PC). That has not been measured on the
+desktop + laptop pool yet: compare a few long replies with it on and off.
 
 ## Drafts in several chats
 

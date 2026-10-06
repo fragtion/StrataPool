@@ -273,7 +273,9 @@ public:
     /// `ss.ple_prev` equal to `ple_prev` by then) skips the staging; anything else stages again.
     bool prestage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err);
     /// 1: every layer served; 0: the GPU has not reached the next layer yet; -1: an error (`err`).
-    int service(PoolMultiFn pool, void* user, std::string& err);
+    /// `max_layers` > 0: serve at most that many layers this call (0 back when the limit is reached), so the
+    /// pipelined decode can turn to the verified window in between (architectds' STRATA_PIPELINE_YIELD)
+    int service(PoolMultiFn pool, void* user, std::string& err, int max_layers = 0);
     bool in_flight() const { return pr_ ? pr_->pl_in_flight(pr_par_) : fl_active_; }
     /// The window's graph (and its profile copy) completed; false while it runs.  An error sets `err`.
     bool done(std::string& err);
