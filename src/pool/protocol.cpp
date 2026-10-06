@@ -44,6 +44,8 @@ const char* msg_name(Msg m) {
     case Msg::BatchRows: return "BATCH_ROWS";
     case Msg::SlotLoad: return "SLOT_LOAD";
     case Msg::SlotStore: return "SLOT_STORE";
+    case Msg::BatchRun: return "BATCH_RUN";
+    case Msg::BatchCommit: return "BATCH_COMMIT";
     case Msg::Ack: return "ACK";
     case Msg::Err: return "ERR";
     case Msg::Bye: return "BYE";

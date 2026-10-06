@@ -71,6 +71,37 @@ public:
     virtual void set_head_sampling(bool on) = 0;
     /// POOL: how long this window took here before the hand-off (the earlier stage's own layers), just before `run`
     virtual void stage_ms(double ms) { (void) ms; }
+    /// POOL + --batch-mtp: the rest of a batch window over `rows` (slot of each row; hand-off rows [0, S)) and its
+    /// picks; then each slot's accepted prefix (`keep` by slot id, `n` slots)
+    virtual bool run_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out,
+                          std::string& err) {
+        (void) rows; (void) S; (void) tokens; (void) pos; (void) out;
+        err = "this link has no batch rows";
+        return false;
+    }
+    virtual bool commit_rows(const int* keep, int n, std::string& err) {
+        (void) keep; (void) n;
+        err = "this link has no batch rows";
+        return false;
+    }
+};
+
+/// POOL + --pipeline-windows: the later stage of a pipelined decode on other PCs.  A Verifier given one
+/// (`set_pipe_remote`, with its window parity) has no layers of its own: its pipelined calls (pl_launch, service,
+/// done, pl_finish, pl_commit_async, final_R, stream, capture_all) go to the remote stage, which sends the hand-off
+/// that parity's first-stage verifier wrote, runs the head here when the rows are back, and commits on the workers.
+/// One window at a time is in flight on it (the pipelined loop never launches a later stage speculatively).
+class PipeRemote {
+public:
+    virtual ~PipeRemote() = default;
+    virtual bool pl_launch(int parity, int T, const int32_t* tokens, int64_t pos0, std::string& err) = 0;
+    /// 1: the picks are ready; 0: not yet; -1: an error
+    virtual int pl_poll(int parity, std::string& err) = 0;
+    virtual bool pl_finish(int parity, int32_t* out, std::string& err) = 0;
+    virtual bool pl_commit(int parity, int n_keep, std::string& err) = 0;
+    virtual bool pl_in_flight(int parity) const = 0;
+    virtual const float* pl_final_R(int parity, int t) const = 0;
+    virtual cudaStream_t pl_stream() const = 0;
 };
 
 class Verifier {
@@ -150,6 +181,9 @@ public:
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
     /// POOL: the rest of the window runs elsewhere (see StageLink).  Set before the first `run`.
     void set_link(StageLink* link) { link_ = link; }
+    /// POOL + --pipeline-windows: this verifier stands for the remote later stage's windows of `parity` (no init)
+    void set_pipe_remote(PipeRemote* r, int parity) { pr_ = r; pr_par_ = parity; }
+    bool pipe_remote() const { return pr_ != nullptr; }
     /// POOL worker: no head even when this stage ends at the last layer - the window's final residual goes to
     /// `handoff_out` (R already holds the last layer's write) and the coordinator runs the head.  Before `init`.
     void set_headless(bool on) { headless_ = on; }
@@ -229,7 +263,7 @@ public:
     /// expert evicted on the host (the pool then computes it on the CPU) before the device table follows.  Also turns
     /// the device-planned layers (E-6) off.  Before `init`.
     void set_always_publish(bool on) { always_publish_ = on; }
-    cudaStream_t stream() const { return cs_; }
+    cudaStream_t stream() const { return pr_ ? pr_->pl_stream() : cs_; }
     int device() const { return device_; }
     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
     bool capture_all(std::string& err);
@@ -240,7 +274,7 @@ public:
     bool prestage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err);
     /// 1: every layer served; 0: the GPU has not reached the next layer yet; -1: an error (`err`).
     int service(PoolMultiFn pool, void* user, std::string& err);
-    bool in_flight() const { return fl_active_; }
+    bool in_flight() const { return pr_ ? pr_->pl_in_flight(pr_par_) : fl_active_; }
     /// The window's graph (and its profile copy) completed; false while it runs.  An error sets `err`.
     bool done(std::string& err);
     /// After `done`: the profile, the last stage's host sampling and picks (`out` may be null on an earlier stage).
@@ -371,6 +405,8 @@ private:
     Verifier* next_ = nullptr;
     void* next_user_ = nullptr;
     StageLink* link_ = nullptr;          ///< POOL: the remote rest of the model
+    PipeRemote* pr_ = nullptr;           ///< POOL + --pipeline-windows: the remote later stage (set_pipe_remote)
+    int pr_par_ = 0;
     bool headless_ = false;              ///< POOL worker: hand off instead of running the head
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     void stage_inputs(int T, const int32_t* tokens, int64_t pos0);

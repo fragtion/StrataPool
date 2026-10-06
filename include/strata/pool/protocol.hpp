@@ -57,6 +57,9 @@ enum class Msg : uint16_t {
     BatchRows = 23,  // rows[S x handoff]
     SlotLoad = 24,   // i32 slot, i64 n, i32 last2[2]: the main session's first n tokens -> the slot   (lazy ACK)
     SlotStore = 25,  // i32 slot, i64 n, i32 last2[2]: the slot's first n tokens -> the main session (lazy ACK)
+    // --batch-mtp: one window over every live slot's rows (a slot's token and its draft), committed after the verdict
+    BatchRun = 26,   // i32 S, i32 slot[S], i32 tokens[S], i64 pos[S], rows[S x handoff] -> BatchRows (no commit)
+    BatchCommit = 27,// i32 n, i32 keep[n]: each slot keeps that prefix of its rows in the last BatchRun (lazy ACK)
     Ack = 30,
     Err = 31,        // message=<text>
     Bye = 40,        // the coordinator is leaving; the worker keeps its load for the next one

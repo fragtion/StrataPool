@@ -312,6 +312,26 @@
               cached and a chat on its own runs a little slower too; with a long context, each extra chat locks
               gigabytes of RAM on every PC. Leave it off if you run one chat at a time.</span>
           </div>
+          <div class="st-field" id="pool-chat-drafts-field">
+            <span class="st-label">Drafts in several chats</span>
+            <div class="seg seg--2" id="pool-chat-drafts" role="radiogroup" aria-label="Drafts in several chats">
+              <button type="button" role="radio" data-v="off">Off</button>
+              <button type="button" role="radio" data-v="on">On</button>
+            </div>
+            <span class="muted small">With several chats at once: each chat's window also checks a guessed next word,
+              so a chat can get two words a window. The chats then share one window instead of taking turns on the PCs.
+              New; try both and keep the faster.</span>
+          </div>
+          <div class="st-field">
+            <span class="st-label">Overlap the PCs</span>
+            <div class="seg seg--2" id="pool-overlap" role="radiogroup" aria-label="Overlap the PCs">
+              <button type="button" role="radio" data-v="off">Off</button>
+              <button type="button" role="radio" data-v="on">On</button>
+            </div>
+            <span class="muted small">One chat: this PC starts the next window on a guess while the workers run the
+              current one, and undoes it when the guess was wrong. Upstream measured +14-16% with two GPUs in one PC; it
+              is new in a pool. Off while several chats run.</span>
+          </div>
         </div>
       </div>
 

@@ -208,6 +208,25 @@ What it costs:
   split's slots suit a pool that only works as a split (a model too big for one PC, or one fast PC with a slower
   helper).
 
+## Overlap the PCs (one chat)
+
+**Overlap the PCs** in the Pool tab (coordinator; Strata's `--pipeline-windows 2`) lets the coordinator start the next
+decode window on a guess while the workers still run the current one. The draft layer guesses that the current window
+is accepted whole and what its next word is; when the verdict says otherwise, the coordinator puts its layers' state
+back and runs the right window. The workers only ever get verified windows, in order, so nothing changes on them (a
+worker started with an older engine works too). It helps most when the workers' part and the network are a large share
+of a window. Upstream measured +14-16% on two GPUs in one PC; in a pool it is new, so compare a few long replies with it
+on and off. It needs the draft layer and is off while several chats run (the log says so); requests with repetition
+penalties decode serially.
+
+## Drafts in several chats
+
+**Drafts in several chats** (shown when Several chats at once is on; Strata's `--batch-mtp`) gives each chat's window
+its draft too: a window then holds two rows per chat, and the head keeps the draft where it agrees, so a chat can get two
+words a window. The PCs then run one window over every chat (the coordinator's layers, then the workers', then the head
+here) and commit after the verdict, instead of the chats taking turns on the PCs. Which is faster depends on how often
+the drafts are right; try both.
+
 ## Which PCs make good workers
 
 The pool runs its layers one after the other, so a token waits for every PC's part in turn. A worker helps when its
@@ -235,9 +254,9 @@ out of the pool. The automatic split would give it as few layers as it can.
 - **Conversation parking** (whole-chat snapshots in RAM). The per-chat checkpoints (`--prompt-cache`) work across
   the pool: each worker keeps its own layers' part.
 - **Several GPUs in one pool PC.** Each pool PC uses one GPU, and the pool is the split.
-- From Strata 0.1.40: **`--pipeline-windows`** and **`--batch-mtp`** (they say they are off), **`--kv-grow`** (the
-  elastic K/V; off with a note) and **session files** (`/slots/0?action=save|restore` answers that a pool does not
-  support them yet).
+- From Strata 0.1.40: **`--kv-grow`** (the elastic K/V; off with a note - it also needs the whole K/V in VRAM, which a
+  long context with `--kv-resident` does not have) and **session files** (`/slots/0?action=save|restore` answers that
+  a pool does not support them yet: the other PCs hold their layers' part of the conversation).
 
 ## Engine flags
 

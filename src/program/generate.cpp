@@ -761,12 +761,13 @@ void usage() {
                  "  --batch N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..8\n"
                  "                       normally; --batch-mtp waves more through eight-row windows),\n"
                  "                       each slot with its own session (VRAM like the main one); docs/BATCHING.md\n"
-                 "  --batch-mtp          --batch (opt-in, one GPU, needs --mtp and --spec): each slot also verifies one MTP\n"
+                 "  --batch-mtp          --batch (opt-in, one GPU or a pool coordinator, needs --mtp and --spec): each slot also verifies one MTP\n"
                  "                       proposal per window (STRATA_BATCH_MTP=1 does the same); needs VRAM per slot\n"
                  "  --batch-groups G     --batch with a layer split: the slots in G groups pipelined through the GPUs\n"
                  "  --pipeline-windows N --serve with a layer split on two GPUs (opt-in): one conversation's verify windows\n"
                  "                       with the GPUs overlapped - 1 = the prompt's short reads, 2 = decode as well\n"
-                 "                       (stage 0 runs the next window while stage 1 verifies this one); docs/MULTI_GPU.md\n"
+                 "                       (stage 0 runs the next window while stage 1 verifies this one); docs/MULTI_GPU.md.\n"
+                 "                       On a pool coordinator: 2 runs this PC's next window beside the workers' (docs/POOL.md)\n"
                  "  --trim-stage-weights an explicit --layer-split: each GPU loads only its own layers' dense weights\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
                  "  --prompt-cache-tail  --serve, single GPU: one extra checkpoint near the prompt's end, at an existing\n"
@@ -1890,6 +1891,7 @@ int main(int argc, char** argv) {
     const bool pool_coord = !o.pool_peers.empty();
     const bool pool_worker = !o.pool_listen.empty();
     const bool pool_any = pool_coord || pool_worker;
+    bool pool_wide_rows = false;   // --batch-mtp in a pool: batch windows carry each slot's draft row (CONFIG batch_mtp)
     strata::pool::Wire pool_wire = strata::pool::Wire::F32, pool_draft_wire = strata::pool::Wire::F16;
     if (o.pool_secret.empty())
         if (const char* v = std::getenv("STRATA_POOL_SECRET")) o.pool_secret = v;
@@ -2850,6 +2852,7 @@ int main(int argc, char** argv) {
         strata::core::qsa_set_kv_resident(o.kv_resident);
         o.spec = (int) pool_cfg.i64("spec", o.spec);
         o.batch = (int) std::clamp<int64_t>(pool_cfg.i64("batch", 0), 0, strata::kernels::kVerifyMaxT);   // slot sessions
+        pool_wide_rows = pool_cfg.i64("batch_mtp", 0) != 0;   // --batch-mtp: a slot's rows carry its draft too
         o.prefill_chunk = pool_cfg.i64("prefill_chunk", o.prefill_chunk);
         o.prefill_auto = pool_cfg.i64("prefill_auto", o.prefill_auto ? 1 : 0) != 0;
         {
@@ -3066,6 +3069,13 @@ int main(int argc, char** argv) {
         common.set("kv", o.kv);
         common.set("spec", (int64_t) o.spec);
         common.set("batch", (int64_t) std::max(o.batch, 0));   // the slot sessions each worker carves (--batch)
+        {   // --batch-mtp: every window carries each slot's draft row too (decided again below, where it may go off)
+            const char* bm = std::getenv("STRATA_BATCH_MTP");
+            const bool want = (o.batch_mtp || (bm != nullptr && bm[0] != '\0' && bm[0] != '0')) && o.batch >= 2 &&
+                              !o.mtp.empty() && o.spec >= 2;
+            common.set("batch_mtp", (int64_t) (want ? 1 : 0));
+            pool_wide_rows = want;
+        }
         common.set("prefill_chunk", o.prefill_chunk);
         common.set("prefill_auto", (int64_t) (o.prefill_auto ? 1 : 0));
         common.set("rope_type", (int64_t) rope_cfg.type);
@@ -3454,6 +3464,9 @@ int main(int argc, char** argv) {
     if (o.pipeline_windows > 0) {
         const bool helpers = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
         const char* off = !o.serve ? "it needs --serve"
+                        : pool_worker ? "a pool worker runs the windows the coordinator sends (set it on the coordinator)"
+                        : pool_coord ? (o.mtp.empty() || o.spec < 2 ? "it needs the MTP drafter (--mtp, --spec)"
+                                        : o.batch != 0 ? "not with batch slots (Several chats at once)" : nullptr)
                         : split_same ? "it needs each stage of the layer split on its own GPU"
                         : !multi_gpu ? "it needs a layer split on two GPUs"
                         : split_devs.size() != 1 ? "it needs a layer split into exactly two stages"
@@ -4046,11 +4059,22 @@ int main(int argc, char** argv) {
         const char* why = o.batch < 2 ? "it needs --batch 2 or more" : o.mtp.empty() ? "it needs --mtp"
                         : o.spec < 2 ? "it needs --spec T (T >= 2)" : (multi_gpu || split_same || !stages.empty())
                         ? "it is for one GPU (no layer split or helper) for now" : !o.serve ? "it needs --serve"
-                        : pool_any ? "not in a pool yet" : nullptr;
+                        : pool_worker ? "a pool worker follows its coordinator" : nullptr;
         if (why != nullptr) {
-            std::fprintf(stderr, "strata generate: WARNING: --batch-mtp is off: %s\n", why);
+            if (!pool_worker) std::fprintf(stderr, "strata generate: WARNING: --batch-mtp is off: %s\n", why);
             batch_mtp = false;
         }
+    }
+    if (pool_coord && batch_mtp != pool_wide_rows) {   // the workers were told otherwise in CONFIG: keep them in step
+        std::fprintf(stderr, "strata pool: --batch-mtp is off (the workers were configured without it)\n");
+        batch_mtp = false;
+    }
+    if (pool_coord && batch_mtp && o.batch_groups > 1) {
+        // POOL: a slot's draft is accepted only after the head has seen the whole window, so the coordinator and the
+        // workers commit after the verdict: one window over every slot at a time (no pipelined groups)
+        std::fprintf(stderr, "strata pool: --batch-mtp: one window over all %d slots (with their drafts) instead of %d "
+                             "pipelined groups\n", o.batch, o.batch_groups);
+        o.batch_groups = 1;
     }
     std::vector<std::vector<std::unique_ptr<strata::core::SessionState>>> bslot_ss;
     if (o.batch != 0) {
@@ -6147,7 +6171,7 @@ int main(int argc, char** argv) {
                     o.batch = wb >= 2 ? (int) wb : 0;
                     if (o.batch == 0) bslot_ss.clear();
                     else for (auto& v : bslot_ss) if ((int) v.size() > o.batch) v.resize((size_t) o.batch);
-                    o.batch_groups = std::max(o.batch, 1);
+                    o.batch_groups = batch_mtp ? 1 : std::max(o.batch, 1);
                 }
             }
         }
@@ -6635,13 +6659,16 @@ int main(int argc, char** argv) {
         // --pipeline-windows (decided where the split was): two verifiers per stage, one for the even windows and one
         // for the odd ones, sharing one stream of their card, and a hand-off per parity - so stage 0 can run window
         // K+1 while stage 1 still reads window K's hand-off
-        const bool pipe = o.pipeline_windows > 0 && n_stages == 2 && !split_same && stages.size() == 1;
+        // POOL: the coordinator's layers are stage 0 and the workers stage 1 (PoolLink, a PipeRemote): only verified
+        // windows ever reach the workers, so they run their serial loop as before
+        const bool pool_pipe = o.pipeline_windows > 0 && pool_coord && n_stages == 1 && stages.empty();
+        const bool pipe = (o.pipeline_windows > 0 && n_stages == 2 && !split_same && stages.size() == 1) || pool_pipe;
         strata::core::Verifier ver_b;
         SplitDrive split_drive_b;
         cudaStream_t pl_stream[2] = {nullptr, nullptr};
         if (pipe) {
             bool ok_p = cudaStreamCreateWithFlags(&pl_stream[0], cudaStreamNonBlocking) == cudaSuccess;
-            {
+            if (!pool_pipe) {
                 const strata::core::OnDevice on(stages[0]->dev);
                 ok_p = ok_p && cudaStreamCreateWithFlags(&pl_stream[1], cudaStreamNonBlocking) == cudaSuccess;
             }
@@ -6650,10 +6677,11 @@ int main(int argc, char** argv) {
                 v->set_stream(pl_stream[0]);
                 v->set_always_publish(true);
             }
-            for (strata::core::Verifier* v : {&stages[0]->ver, &stages[0]->ver_b}) {
-                v->set_stream(pl_stream[1]);
-                v->set_always_publish(true);
-            }
+            if (!pool_pipe)
+                for (strata::core::Verifier* v : {&stages[0]->ver, &stages[0]->ver_b}) {
+                    v->set_stream(pl_stream[1]);
+                    v->set_always_publish(true);
+                }
         }
         if (n_stages > 1) {
             const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
@@ -6713,7 +6741,7 @@ int main(int argc, char** argv) {
         // --pipeline-windows: the odd windows' verifiers and their hand-off (initialized before `ver`, which stays the
         // watchdog's verifier), and the drafter's own row buffer, which either parity's rows are copied into
         float* pl_mtp_R = nullptr;
-        if (pipe) {
+        if (pipe && !pool_pipe) {
             const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             float *hh = nullptr, *hand_b = nullptr;
@@ -6778,7 +6806,8 @@ int main(int argc, char** argv) {
                 ver.set_stage(0, node_le, nullptr, dev_out);
                 ver.set_link(&pool_link);
                 if (!pool_link.init_device(wt, g, ss.block, native_head.loaded() ? &native_head : nullptr,
-                                           std::max(o.spec, o.batch), n_vocab, o.prefill_chunk, pool_hand_out, err)) {
+                                           batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), n_vocab,
+                                           o.prefill_chunk, pool_hand_out, err)) {
                     std::fprintf(stderr, "strata pool: %s\n", err.c_str());
                     return 1;
                 }
@@ -6787,10 +6816,39 @@ int main(int argc, char** argv) {
                 ver.set_headless(true);
             }
         }
+        // POOL + --pipeline-windows: the odd windows' verifier for this PC's layers, its own hand-off (the link sends
+        // whichever parity's the window has), and the drafter's row buffer here (the head is here)
+        if (pool_pipe) {
+            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
+                              (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
+            float *hh = nullptr, *hand_b = nullptr;
+            if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                cudaHostGetDevicePointer((void**) &hand_b, hh, 0) != cudaSuccess) {
+                std::fprintf(stderr, "strata pool: --pipeline-windows: the second hand-off allocation failed\n");
+                return 1;
+            }
+            std::memset(hh, 0, hb);
+            ver_b.set_stage(0, node_le, nullptr, hand_b);
+            if (!ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
+                std::fprintf(stderr, "strata pool: --pipeline-windows: the second verifier: %s (raise --vram-reserve-mib "
+                                     "by ~200, or --pipeline-windows 0)\n", err.c_str());
+                return 1;
+            }
+            if (cudaMalloc((void**) &pl_mtp_R, (size_t) strata::kernels::kVerifyMaxT * (size_t) (g.hc * g.n_embd) *
+                                                   sizeof(float)) != cudaSuccess) {
+                std::fprintf(stderr, "strata pool: --pipeline-windows: the drafter's row buffer does not fit\n");
+                return 1;
+            }
+            if (!pool_link.pipe_init(hh, err)) {
+                std::fprintf(stderr, "strata pool: --pipeline-windows: %s\n", err.c_str());
+                return 1;
+            }
+        }
         ver.set_remote_expert_opt(remote_opt.get());
-        if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+        const bool wide_rows = batch_mtp || (pool_worker && pool_wide_rows);   // a pool worker: the coordinator's rows
+        if (wide_rows) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
-                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
+                      wide_rows ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
             (use_mtp && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
@@ -6836,7 +6894,19 @@ int main(int argc, char** argv) {
                 stage_ver(st).set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
             }
         }
-        if (pipe) {   // the odd windows' pool routing: the same as the even ones', with their plans
+        if (pool_pipe) {   // POOL: one local stage, routed per parity (the plan sink of the window's own verifier)
+            split_drive.base = &drive;
+            split_drive.n = 1;
+            split_drive.end[0] = g.n_layers;
+            split_drive.cache_base[0] = drive.d.cache_base;
+            split_drive.cache_slot_off[0] = drive.d.cache_slot_off;
+            split_drive.pcie_num[0] = pcie_num_of(o.pcie_frac);
+            split_drive.plan[0] = ver.plan_sink();
+            split_drive_b = split_drive;
+            split_drive_b.plan[0] = ver_b.plan_sink();
+            ver_b.set_split(o.spec_split);
+            ver_b.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        } else if (pipe) {   // the odd windows' pool routing: the same as the even ones', with their plans
             split_drive_b = split_drive;
             split_drive_b.plan[0] = ver_b.plan_sink();
             split_drive_b.plan[1] = stages[0]->ver_b.plan_sink();
@@ -6846,8 +6916,8 @@ int main(int argc, char** argv) {
             ver_b.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
         }
         // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
-        const strata::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
-        void* const win_pool_user = n_stages > 1 ? (void*) &split_drive : (void*) &drive;
+        const strata::core::PoolMultiFn win_pool_fn = n_stages > 1 || pool_pipe ? &drive_pool_split : &drive_pool_multi;
+        void* const win_pool_user = n_stages > 1 || pool_pipe ? (void*) &split_drive : (void*) &drive;
         mem_mark("the verifier and the drafter's binding");
         ver.set_split(o.spec_split);
         // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
@@ -6886,7 +6956,13 @@ int main(int argc, char** argv) {
                                                                        : " (decode too; the GDN snapshot on the critical path)");
         // the verifiers by [stage][parity], their pool routing, and the drafter's events (in a pipelined prompt read, a
         // stage-1 window waits until the drafter has read the rows of the same parity's previous window)
-        strata::core::Verifier* PV[2][2] = {{&ver, &ver_b}, {pipe ? &stages[0]->ver : nullptr, pipe ? &stages[0]->ver_b : nullptr}};
+        // POOL: stage 1 is the workers - two stand-ins that send each parity's window through PoolLink
+        strata::core::Verifier pl_remote[2];
+        pl_remote[0].set_pipe_remote(&pool_link, 0);
+        pl_remote[1].set_pipe_remote(&pool_link, 1);
+        strata::core::Verifier* PV[2][2] = {{&ver, &ver_b},
+                                            {pool_pipe ? &pl_remote[0] : pipe ? &stages[0]->ver : nullptr,
+                                             pool_pipe ? &pl_remote[1] : pipe ? &stages[0]->ver_b : nullptr}};
         SplitDrive* PSD[2] = {&split_drive, &split_drive_b};
         cudaEvent_t pl_mtp_ev[2] = {nullptr, nullptr};
         bool pl_mtp_live[2] = {false, false};
@@ -8060,6 +8136,67 @@ int main(int argc, char** argv) {
                             fatal = true;
                             break;
                         }
+                    } else if (t == strata::pool::Msg::BatchRun) {
+                        // --batch-mtp: this PC's layers over every live slot's rows (a slot's token and its draft),
+                        // kept until BATCH_COMMIT says how many rows of each slot the head accepted
+                        int32_t S = 0;
+                        int rows_b[strata::kernels::kVerifyMaxT] = {};
+                        int32_t toks[strata::kernels::kVerifyMaxT] = {};
+                        int64_t poss[strata::kernels::kVerifyMaxT] = {};
+                        bool okb = u.get(S) && S >= 1 && S <= strata::kernels::kVerifyMaxT && !bslot_ss.empty();
+                        for (int r = 0; okb && r < S; ++r) {
+                            int32_t b = 0;
+                            okb = u.get(b) && b >= 0 && b < (int) bslot_ss[0].size();
+                            rows_b[r] = b;
+                        }
+                        okb = okb && u.get_bytes(toks, (size_t) S * 4) && u.get_bytes(poss, (size_t) S * 8) &&
+                              u.left() == (size_t) S * (size_t) HB * strata::pool::wire_bytes(pool_wire);
+                        if (!okb) {
+                            fail("a malformed batch window (are the slot counts the same on every PC?)");
+                            fatal = true;
+                            break;
+                        }
+                        strata::pool::decode_rows(pool_wire, u.here(), (size_t) S * (size_t) HB, pool_hand_in);
+                        if (!w_refill(e)) { fail("refilling a lent slot: " + e); fatal = true; break; }
+                        const auto tv = Clock::now();
+                        apply_pending(false);
+                        drive.d.layers = 0;
+                        drive.d.experts = 0;
+                        drive.d.failed = false;
+                        strata::core::progress_at("pool worker: batch window with drafts, rows", (int64_t) S);
+                        int32_t outw[strata::kernels::kVerifyMaxT] = {};
+                        if (!ver.run_slot_rows(rows_b, S, toks, poss, win_pool_fn, win_pool_user, outw, e) || drive.d.failed) {
+                            fail(drive.d.failed && drive.d.fail ? drive.d.fail : e.empty() ? "a batch window failed" : e);
+                            fatal = true;
+                            break;
+                        }
+                        const size_t n = (size_t) S * (size_t) HB;
+                        w_enc.resize(n * strata::pool::wire_bytes(pool_wire));
+                        strata::pool::encode_rows(pool_wire, pool_hand_out, n, w_enc.data());
+                        if (!pool_ch.send(strata::pool::Msg::BatchRows, w_enc, e)) { why = e; break; }
+                        ++w_bwindows;
+                        w_ms_batch += std::chrono::duration<double, std::milli>(Clock::now() - tv).count();
+                    } else if (t == strata::pool::Msg::BatchCommit) {
+                        int32_t nk = 0;
+                        std::vector<int> keep;
+                        bool okc = u.get(nk) && nk >= 1 && nk <= 64;
+                        for (int i = 0; okc && i < nk; ++i) {
+                            int32_t k = 0;
+                            okc = u.get(k);
+                            keep.push_back(k);
+                        }
+                        if (okc && !bslot_ss.empty()) keep.resize(std::max<size_t>(keep.size(), bslot_ss[0].size()), 0);
+                        if (!okc || !ver.commit_slot_prefixes(keep.data(), e)) {
+                            fail(e.empty() ? "a malformed batch commit" : e);
+                            fatal = true;
+                            break;
+                        }
+                        if (!drive.d.usage.empty() && o.adapt_every > 0 && ((++w_rounds) % o.adapt_every) == 0 && !adapt()) {
+                            fail("an adaptive refill failed");
+                            fatal = true;
+                            break;
+                        }
+                        if (!ack()) { why = "the coordinator went away"; break; }
                     } else if (t == strata::pool::Msg::SlotLoad || t == strata::pool::Msg::SlotStore) {
                         int32_t b = 0, p2 = -1, p1 = -1;
                         int64_t n = 0;
@@ -9836,7 +9973,7 @@ int main(int argc, char** argv) {
             // tokens [a, b) through the windows: commit all of them, then give the draft layer their residuals
             auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
                 // (STRATA_LOGPOS reads every window's logits: the serial loop)
-                if (pipe && pl_pw >= 1 && std::getenv("STRATA_LOGPOS") == nullptr) return read_windows_pl(a, b, e);
+                if (pipe && !pool_pipe && pl_pw >= 1 && std::getenv("STRATA_LOGPOS") == nullptr) return read_windows_pl(a, b, e);
                 strata::core::progress_at("reading the prompt (verify windows), from token", a);   // #217: not "batched"
                 // every token is committed and the picks are discarded: no head sampling (see set_head_sampling)
                 struct NoHeadSampling {
@@ -10429,8 +10566,9 @@ int main(int argc, char** argv) {
                     cudaEventCreateWithFlags(&fence_ev[0], cudaEventDisableTiming);
                     cudaEventCreateWithFlags(&exch_ev[0], cudaEventDisableTiming);
                 }
+                const int dev1 = pool_pipe ? dev0 : stages[0]->dev;   // POOL: the head's stream is on this GPU
                 {
-                    const strata::core::OnDevice on1(stages[0]->dev);
+                    const strata::core::OnDevice on1(dev1);
                     cudaEventCreateWithFlags(&fence_ev[1], cudaEventDisableTiming);
                     cudaEventCreateWithFlags(&exch_ev[1], cudaEventDisableTiming);
                 }
@@ -10440,7 +10578,7 @@ int main(int argc, char** argv) {
                         cudaEventRecord(ev[0], s0);
                         (void) cudaStreamQuery(s0);
                     }
-                    const strata::core::OnDevice on(stages[0]->dev);
+                    const strata::core::OnDevice on(dev1);
                     cudaEventRecord(ev[1], PV[1][0]->stream());
                     (void) cudaStreamQuery(PV[1][0]->stream());
                 };
@@ -10843,6 +10981,7 @@ int main(int argc, char** argv) {
                 }
                 while (mtp.chain_live() && mtp.chain_poll(err) == 0) {}
                 mtp.set_source_R(ver.final_R_all());   // the serial loop's rows again
+                if (pool_pipe) drive.d.plan = ver.plan_sink();   // POOL: the odd windows' routing left ver_b's plan there
                 const double pl_ms = std::chrono::duration<double, std::milli>(Clock::now() - pl_t0).count();
                 dt_run += pl_ms;
                 if (dec_timing) {
