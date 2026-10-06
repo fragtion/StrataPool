@@ -5,15 +5,17 @@ StrataPool has two ways to use more than one PC. Pick one in the **Pool** tab, o
 | | **Share requests** (routing) | **Split layers** (coordinator + workers) |
 | --- | --- | --- |
 | Each PC holds | the whole model, as it would alone | only its own layers (experts, dense weights, context) |
-| One chat | as fast as one PC | about as fast as one PC (the PCs take turns per token) |
+| One chat | as fast as one PC | often faster than the stronger PC alone (more experts cached), never the sum |
 | Two chats at once | both run at full speed, one per PC | one waits for the other |
 | What it adds | throughput, and a spare when a PC is off | room: a model, context or expert cache too big for one PC |
 | Network | only the request and the answer | every token crosses it; wired is best |
 | A PC goes away | the others carry on alone | the pool stops until it is back |
 
-**Neither makes one chat faster.** Each token passes through the 48 layers in order and needs the token before it.
-Two GPUs can work on one token only by taking turns (the layer split) or by exchanging results at every layer, which
-over a network costs more time than it saves.
+**Neither adds up the PCs' compute for one chat.** Each token passes through the 48 layers in order and needs the
+token before it. Two GPUs can work on one token only by taking turns (the layer split) or by exchanging results at
+every layer, which over a network costs more time than it saves. A split can still be faster than its stronger PC
+alone, because the two GPUs together cache far more of the model's experts: on an RTX 3060 desktop + RTX 5060 Laptop
+pool, long agent prompts went from 21-33 tok/s on the desktop alone to 34-40 split (the README has the full table).
 
 ## Share requests (routing mode)
 
@@ -190,18 +192,19 @@ chats: with two PCs, two chats already keep both busy. A chat alone still runs a
 in slots: one word per step each, without drafts, and the steps are pipelined across the PCs. While the laptop runs
 chat A's layers, the desktop runs chat B's, so neither PC waits for the other.
 
-Measured on the desktop (RTX 3060) + laptop (RTX 5060 Laptop) pool, split 33, one chat with drafts off (the cost of
-one slot's step): 31.8 ms a step = desktop 21.9 ms + laptop 8.2 ms + network 1.6 ms. Pipelined, two chats should get
-about one word per desktop step between them, about 45 words/s in total against 37 for one chat with drafts. That
-is an estimate from those numbers, not yet a measurement of the pipeline.
+Measured on the desktop (RTX 3060) + laptop (RTX 5060 Laptop) pool (October 2026, the README's table): two chats
+at once wrote 36-39 words/s together, against 44 for the same two chats one after the other, and a chat alone ran
+35-39 instead of 44. On that pool it is a loss; it can pay where one PC's step is much shorter than the window (a
+fast worker, or more PCs).
 
 What it costs:
 
 - Every slot has its own state on every PC (its layers' KV and recurrent state), in VRAM the expert cache would
   otherwise use, so a chat alone runs a little slower than with one slot. With KV streaming (`--kv-resident`) each
   slot's whole context also takes pinned RAM.
-- A slot's conversation is not kept when its reply ends (as with `--batch-groups` on one PC), and a request left
-  alone in a slot finishes there (one word per step) rather than going back to the drafted path.
+- Chats in slots get no repetition penalties (Strata's batch windows never apply them). With the shipped sampling
+  (presence penalty 1.0) the model then sometimes loops in its thinking until the token limit, and the reply ends
+  without an answer. A chat left alone goes back to the drafted path, with its penalties.
 - The PCs' slot counts must match: the coordinator uses as many as every worker could carve.
 - Leave it off if you run one chat at a time: the slots then cost speed and memory for nothing.
 - For two chats at once, *Share requests* runs each at one PC's full speed (each PC holds the whole model). The
@@ -215,8 +218,9 @@ decode window on a guess while the workers still run the current one. The draft 
 is accepted whole and what its next word is; when the verdict says otherwise, the coordinator puts its layers' state
 back and runs the right window. The workers only ever get verified windows, in order, so nothing changes on them (a
 worker started with an older engine works too). It helps most when the workers' part and the network are a large share
-of a window. Upstream measured +14-16% on two GPUs in one PC; in a pool it is new, so compare a few long replies with it
-on and off. It needs the draft layer and is off while several chats run (the log says so). Requests with repetition
+of a window and the drafts are usually right. Upstream measured +14-16% on two GPUs in one PC; on the desktop + laptop
+pool it was about 6% slower (41-42 against 44 tok/s, 41 against 38 ms a window: 1,907 of 1,908 windows ran
+overlapped, but too many guessed windows were thrown away). Compare a few long replies with it on and off. It needs the draft layer and is off while several chats run (the log says so). Requests with repetition
 penalties (`penalty_last_n`) overlap too: the head on the coordinator sees each window after the one before it.
 
 ## Drafts in several chats
@@ -224,8 +228,8 @@ penalties (`penalty_last_n`) overlap too: the head on the coordinator sees each 
 **Drafts in several chats** (shown when Several chats at once is on; Strata's `--batch-mtp`) gives each chat's window
 its draft too: a window then holds two rows per chat, and the head keeps the draft where it agrees, so a chat can get two
 words a window. The PCs then run one window over every chat (the coordinator's layers, then the workers', then the head
-here) and commit after the verdict, instead of the chats taking turns on the PCs. Which is faster depends on how often
-the drafts are right; try both.
+here) and commit after the verdict, instead of the chats taking turns on the PCs. On the desktop + laptop pool it was no
+faster: about 33 words/s for two chats together, against 36-39 without the drafts.
 
 ## Which PCs make good workers
 

@@ -10,9 +10,44 @@
 > - **Split layers**: the PCs divide one model's layers, each holding its layers' experts in its own RAM and VRAM and
 >   its share of the context, so the pool caches more experts and fits what one PC cannot.
 >
-> Neither adds up the PCs' speed for one chat: see **[docs/POOL.md](docs/POOL.md)** for what each does.
+> Neither adds up the PCs' compute for one chat, but a split can still beat its faster PC alone: together the GPUs
+> cache far more of the model's experts. See **[docs/POOL.md](docs/POOL.md)** for what each mode does.
 > Everything below is Strata's own README and applies unchanged, with one difference: StrataPool compiles its engine at
 > the first `START-HERE.bat` (10-20 minutes, once), because Strata's ready-made engines do not include the layer split.
+
+### What a split pool did on our two PCs
+
+| | Coordinator (desktop) | Worker (laptop) |
+| --- | --- | --- |
+| GPU | RTX 3060, 12 GB | RTX 5060 Laptop GPU, 8 GB |
+| CPU | Core i5-12600KF | Core i7-14650HX |
+| RAM | 64 GB | 32 GB |
+| Layers (automatic split) | 0-24 (0-28 with Several chats on) | 25-47 (29-47) |
+
+Both on Windows, on a home LAN with a 0.6-0.8 ms round trip (200-800 KiB cross it per decode window). Model:
+Qwen3.8-Flash-Next **coder IQ1_M**, 256K context with the K/V streamed from RAM (`--kv int8 --kv-resident`), the
+sampling in the shipped config (temperature 0.6, presence penalty 1.0). StrataPool on Strata 0.1.40, October 2026.
+Measured through a coding agent (dsh); a run's speed moves about ±10% with the text it writes, so read ranges, not
+decimals.
+
+<p align="center"><img src="docs/media/pool-speed.svg" width="760" alt="Tokens per second: one chat 44 with the default split settings, 41-42 with Overlap the PCs, 35-39 with Several chats at once; long agent prompts 21-33 on the desktop alone and 34-40 split; two chats at the same time 44 one after the other, 36-39 with Several chats at once, about 33 with drafts in several chats"></p>
+
+| Setup (Pool tab) | Writes (tok/s) | Window | Notes |
+| --- | ---: | ---: | --- |
+| Desktop alone, long agent prompts (40-80K tokens) | 21-33 | | 50-67% of the routed experts cached in VRAM |
+| **Split, defaults**, the same prompts | **34-40** | 49-56 ms | 81-84% cached: the laptop's VRAM holds its layers' experts |
+| **Split, defaults**, 7.6K-token prompt, 2-3K-token answer | **44** | 38 ms | reads the prompt at ~600 tok/s (940-980 tok/s on 40K prompts) |
+| + Overlap the PCs | 41-42 | 41 ms | slower here: too many guessed windows are thrown away |
+| + Several chats at once, one chat running | 35-39 | 44-49 ms | the extra chat's VRAM costs the laptop 4 layers |
+| Two chats at once, one after the other | 44 | | the default: the second chat waits |
+| Two chats at once, Several chats at once | 36-39 together | | each chat about half that; no repetition penalties in slots |
+| + Drafts in several chats | ~33 together | | |
+| Very predictable text (a TCP explainer) | up to 54 | 95 ms | 5 accepted words per window |
+
+**What to expect:** the defaults (Several chats Off, Overlap Off) were the fastest on this pair. A split is worth it
+when the model is too big for one PC's VRAM to cache well, as here: the laptop turned a 21-33 tok/s desktop into
+34-44. The other switches are there for pools with different balance (a fast worker, slow network, many agents), so
+measure them on your own PCs before keeping one on.
 
 ---
 
