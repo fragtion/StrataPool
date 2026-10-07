@@ -155,6 +155,19 @@ public:
         if (next_) next_->set_history(history, history_len);
         if (link_) link_->set_history(history, history_len);
     }
+    /// PROBABILISTIC DRAFT ACCEPTANCE (core/spec_prob.hpp, STRATA_SPEC_PROB=1): for the NEXT run() only, judge the
+    /// window's first `n_q` drafts against the drafter's distributions `q` (host memory, n_q rows of kSpecQStride
+    /// int32: ids, -1 terminated, then probabilities as float bits) with rejection sampling instead of exact match; the
+    /// drafts past `n_q` (a lookup chain's tail) are point masses.  Has no effect on a greedy request, a window of one
+    /// token, or where the split sampler cannot run - those take the exact-match path.  Cleared by run().
+    void set_spec_q(const int32_t* q, int n_q) {
+        spec_q_ = q;
+        spec_nq_ = n_q;
+        if (next_) next_->set_spec_q(q, n_q);
+    }
+    /// Counters of the rejection path (windows judged, drafts kept / offered over its rows with a q list).
+    int64_t spec_windows = 0;
+
     /// Off: `run` skips the request's head sampling and `out` is the recorded greedy pick.  For windows whose
     /// picks are discarded - a prompt read through windows commits every token - so they cost no sampler launch
     /// or sync and never read a history staged for another position.
@@ -388,6 +401,9 @@ private:
         return s;
     }();   ///< greedy by default; per-request via set_sampling
     const int32_t* hist_d_ = nullptr;   ///< penalty-history row (set_history); null = no penalties apply
+    const int32_t* spec_q_ = nullptr;   ///< set_spec_q: the drafter's q rows for the next window (host)
+    int spec_nq_ = 0;
+    int32_t* d_spec_ = nullptr;          ///< device: kVerifyMaxT draft ids, then kVerifyMaxT q rows
     int hist_len_ = 0;
     bool head_sampling_ = true;          ///< set_head_sampling
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
@@ -450,6 +466,12 @@ private:
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
+    // STRATA_DF_BRANCH: a layer's mixer work that reads only the layer's input, captured as parallel graph branches
+    // on these side streams (record_window); the same kernels on the same inputs, only their order is freer
+    bool df_branch_ = false;
+    cudaStream_t df_side_[2] = {};
+    cudaEvent_t df_fork_ = nullptr;
+    cudaEvent_t df_join_[2] = {};
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t exec_nr_[9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
     cudaGraphExec_t commit_exec_ = nullptr;
@@ -491,6 +513,7 @@ private:
     float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
     float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;
     uint8_t* xq_ = nullptr;                                   // T columns of q8_1
+    uint8_t* xil_ = nullptr;                                  // fork F4: the interleaved copy of xq_'s 2-4 columns
     uint8_t* sh_xq_ = nullptr;                                // T columns of q8_1 for shared expert branch
     float *qkv_L_ = nullptr, *h_L_ = nullptr, *gate_L_ = nullptr, *beta_L_ = nullptr;   // per GDN layer
     float *z_ = nullptr, *y_ = nullptr, *y_dummy_ = nullptr;
