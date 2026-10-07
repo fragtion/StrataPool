@@ -182,17 +182,23 @@ were not measured on their own.
 | Guillaume Putier ([gputier/StrataGP](https://github.com/gputier/StrataGP)), with benoit lange - [PR #567](https://github.com/Niko1221/Strata/pull/567) | the prompt tokenized from the last shared prefix | a 110K-token conversation's turn tokenized in 13 ms instead of 601 ms (measured on the Qwen vocabulary) |
 | BlueKingMuch - [#1163](https://github.com/Niko1221/Strata/pull/1163), [#1164](https://github.com/Niko1221/Strata/pull/1164) | a parked conversation's reserve kept small; a sibling subagent borrows a parked conversation's start | extended to the split: each PC borrows its own part; sibling subagents stop re-reading each other's history |
 | Vadim / tirex999 ([DACAN](https://github.com/tirex999/DACAN)) | parked conversations with KV streaming (the idea) | led to parked conversations across the split (above) |
-| Francesco Albano / Hardin22 ([Strata-DualGPU](https://github.com/Hardin22/Strata-DualGPU)) - [#851](https://github.com/Niko1221/Strata/pull/851), [#1166](https://github.com/Niko1221/Strata/pull/1166) | an AVX2 Q8_K quantizer for the CPU experts; `--host-core sibling` for hybrid Intel CPUs (opt-in) | the activations of the CPU experts quantized with AVX2 (not measured on its own here); his pipelined windows, now in Strata, are what Overlap the PCs runs on |
+| Francesco Albano / Hardin22 ([Strata-DualGPU](https://github.com/Hardin22/Strata-DualGPU)) - [#1166](https://github.com/Niko1221/Strata/pull/1166) | `--host-core sibling` for hybrid Intel CPUs (opt-in) | his AVX2 Q8_K quantizer (#851) and pipelined windows, both in Strata now, are what the CPU experts and Overlap the PCs run on |
 | AncientMystic - [#855](https://github.com/Niko1221/Strata/pull/855) | the PLE page cache without its 45x read amplification | the lookup table's page cache no longer reads the same pages many times over |
-| InB4DevOps - [#789](https://github.com/Niko1221/Strata/pull/789) | prompt reading overlaps routed-expert uploads with the shared work | |
 | Anon - [#652](https://github.com/Niko1221/Strata/pull/652) | only the tokens a verify window hands out are committed | |
-| Fringe210 - [#813](https://github.com/Niko1221/Strata/pull/813) | `--ple-io ram` on Windows (opt-in) | |
 | ATIVX928 - [#1019](https://github.com/Niko1221/Strata/pull/1019) | the int8 K/V gather decodes 8 values per thread | |
-| imanu - [#1063](https://github.com/Niko1221/Strata/pull/1063) | batch-MTP drafters keep the draft head's type | fixed a crash with **Drafts in several chats** |
-| win10ogod - [#1102](https://github.com/Niko1221/Strata/pull/1102), wOvAN - [#1201](https://github.com/Niko1221/Strata/pull/1201) | the batch paths serve their layers per window | fixed a stall in **Several chats at once** while a prompt is read |
-| Chen Cheng - [#1185](https://github.com/Niko1221/Strata/pull/1185) | a window graph that finds no VRAM frees older slot graphs | Several chats at once on a full 12 GB card |
-| uncle daddy - [#1101](https://github.com/Niko1221/Strata/pull/1101) | prompt staging threads sleep instead of spinning | they no longer compete with the CPU help |
 | Maxim Shipko - [#1064](https://github.com/Niko1221/Strata/pull/1064) | commit limits applied after an allocation failure | |
+| sergiywith - [#1368](https://github.com/Niko1221/Strata/pull/1368), [#1283](https://github.com/Niko1221/Strata/pull/1283), [#1372](https://github.com/Niko1221/Strata/pull/1372), [#1370](https://github.com/Niko1221/Strata/pull/1370), [#1367](https://github.com/Niko1221/Strata/pull/1367), [#1231](https://github.com/Niko1221/Strata/pull/1231), [#1284](https://github.com/Niko1221/Strata/pull/1284) | each token's MoE input quantized once for the prompt's experts (the same bytes); three opt-in prompt kernels (`STRATA_GDN_CHUNKED=1`, `STRATA_HC_UPMIX=1`, `STRATA_PROMPT_ATTN_IMMA=1`); prompt buffers and the elastic K/V sized right | a split reads a prompt at the slower PC's pace, so each PC's own prompt speed is the pool's (not yet measured here) |
+| Yxmura - [#1374](https://github.com/Niko1221/Strata/pull/1374) | IQ1_S on the GPU and on AVX2; IQ1_S and IQ1_M on AVX-512 | Unsloth's UD-IQ1_S models run, on every PC of a pool |
+| Thig - [#1251](https://github.com/Niko1221/Strata/pull/1251) | a second GPU's share of the prompt without P2P (most GeForce pairs) | for a pool PC with two cards |
+| bsvinay - [#1120](https://github.com/Niko1221/Strata/pull/1120), Evan - [#1190](https://github.com/Niko1221/Strata/pull/1190), anon761 - [#1247](https://github.com/Niko1221/Strata/pull/1247) | a layer split inside one PC: overlapped hand-offs (opt-in), each stage's lent experts kept in the RAM copy, `--prefill-help` | for a pool PC with two cards |
+| Jeremiah Ritchey - [#1290](https://github.com/Niko1221/Strata/pull/1290) | batch-MTP drafters share their weights fully; at most 16 slot graphs kept | **Drafts in several chats** holds less VRAM |
+| Zhong Uncle - [#1237](https://github.com/Niko1221/Strata/pull/1237), Zack - [#1305](https://github.com/Niko1221/Strata/pull/1305), Ethan - [#1332](https://github.com/Niko1221/Strata/pull/1332), Alekperov Fuad - [#1359](https://github.com/Niko1221/Strata/pull/1359), Saber - [#1362](https://github.com/Niko1221/Strata/pull/1362), Arthur031221 - [#1314](https://github.com/Niko1221/Strata/pull/1314) | the cache fill's stage buffers page-locked; `--lookup-chain`'s window cap; the calibration's PCIe sweep up to 1.0; the build links the CUDA toolkit of its own compiler; two tool-call text fixes | |
+
+Strata 0.1.40.2 took in [#851](https://github.com/Niko1221/Strata/pull/851), [#789](https://github.com/Niko1221/Strata/pull/789),
+[#813](https://github.com/Niko1221/Strata/pull/813), [#1063](https://github.com/Niko1221/Strata/pull/1063),
+[#1201](https://github.com/Niko1221/Strata/pull/1201), [#1185](https://github.com/Niko1221/Strata/pull/1185) and
+[#1101](https://github.com/Niko1221/Strata/pull/1101), which StrataPool carried before - thanks to Francesco Albano,
+InB4DevOps, Fringe210, imanu, win10ogod, wOvAN, Chen Cheng and uncle daddy.
 
 ## Contributing
 
