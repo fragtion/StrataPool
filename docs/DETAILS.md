@@ -242,11 +242,23 @@ the staging variant is worth trying only on a 32 GB-class box. **iGPU caveat:** 
 adaptive tier (`--adapt-every`, on by default) under memory pressure reset the GPU in about 7 of 9 runs (the engine
 prints a warning and runs as asked); with `--adapt-every 100000` there were no resets in ~40 runs. The cause is not found.
 
+**IQ1_S experts:** Unsloth's UD-IQ1_S keeps the routed gate/up experts in IQ1_S (GGML type 19, 1.5625 bpw, 50 bytes per
+256-value block), which earlier engines could not run on the GPU: the dequantizer, the MMVQ dot and the grouped expert
+kernels now cover it (`src/kernels/cuda/iq_kernels.cu`), and so does the AVX-2 multi-token kernel for AVX2 CPUs
+(`src/kernels/cpu/iq_avx2.cpp`, IQ1_S and IQ1_M both). `iq_parity` measures 0.00e+00 dequant relative error against
+gguf-py; `iq_multi_parity` and `native_grouped_parity` are bitwise equal to the per-column and v1 kernels. Its down
+experts are IQ4_NL and its PLE table `per_layer_token_embd.weight` (IQ4_NL) is read by the n-gram reader
+(`src/kernels/ngram.cpp`), already supported.
+
 **A RAM budget (engine 0.1.31, `--resident-budget-gib N`):** the resident variant for a model whose experts do not all
 fit: the N GiB of experts the GPU cache does not hold that the expert profile ranks hottest are copied into RAM at
 start (locked; page-locked when the driver allows the whole budget), and the rest are read from the files.
-It implies `--mmap-experts` and leaves 4 GiB of headroom. On Windows, available commit capacity also
-limits the budget; a larger N is clamped to the smaller limit less 4 GiB and a 256 MiB margin, with a message.
+It implies `--mmap-experts`. The first allocation is sized against available RAM, leaving 4 GiB of headroom
+(`STRATA_RESIDENT_HEADROOM_GIB` overrides it), so Windows can grow a system-managed page file to satisfy the request.
+If the pinned allocation and ordinary-memory fallback fail on Windows, the engine reads RAM and commit capacity
+again and retries once with a smaller positive budget. The retry applies headroom to the smaller limit; a clamped
+budget leaves another 256 MiB. A successful first allocation does not enforce a separate commit reserve. Page-file
+growth and allocation success are not guaranteed; other programs can consume memory after the snapshot.
 A clamped budget no longer fails the safety check that follows (#403). A budget that cannot be kept at all is a
 warning, with every expert read from the files. Setup sets N with `--resident-budget-gib N`. With
 the GGUF read in place it also warms the next layer's likely experts: while the CPU works on a layer, a thread applies
@@ -262,7 +274,11 @@ RTX 5070, against ~3 tokens/s before these changes.
   and with `--batch`, `--vram-elastic` or `--peer-device`, the engine says so and stays off.
 - `--host-core last` (or `STRATA_HOST_CORE=last`, Windows): the host thread runs on the last physical core and the
   workers take the first. Windows sends a GPU's interrupts to the first core, where a host spinning on the GPU's flags
-  waits for them (`--host-core first` is the default; the startup log names the cores).
+  waits for them (`--host-core first` is the default; the startup log names the cores). It leaves a hybrid CPU as it
+  is. `--host-core sibling` (or `STRATA_HOST_CORE=sibling`) keeps the host on the first core but on its other
+  hardware thread (SMT), so the interrupts keep the first logical processor and the workers keep every core; it works
+  on hybrid CPUs too, and is `first` on a core without SMT. On a 4060 Ti + 5080 layer split with an i9-14900KF it
+  turned a decode that swung by ±6% from run to run into a steady one, 8% faster on average.
 - `STRATA_ADAPT_LAG=2` (#764): a window takes the adaptive tier's swaps once they are two windows old (default 1,
   as 0.1.39). `STRATA_PREFILL_EQUAL=1` (#693): a prompt segment is read in chunks of equal size, not full chunks and a
   short last one (changes the rounding). `STRATA_OWNED_PRICE=exact` (#796): the cache sizing prices the prompt path's
@@ -920,12 +936,19 @@ Snapshots contain running state, checkpoints, used K/V pages, and draft-layer K/
 They add host RAM, not another model or VRAM allocation. The byte budget also counts
 an incoming snapshot during a switch. After a restore, unchanged K/V pages can be
 retained for the next parking operation; growth appends storage without copying
-the existing pages. Rewinds refresh the affected pages, and running state and
+the existing pages, with room for the next turns of at most an eighth of each
+buffer (and at most 16 MiB), which the budget counts like the rest of the snapshot.
+Rewinds refresh the affected pages, and running state and
 checkpoints are captured again. Retained active K/V counts against the same byte
 budget and is discarded before evicting parked entries under memory pressure.
-If reserving space for growth would evict another conversation, parking uses a
-full capture instead.
-Oldest parked entries are evicted first.
+Oldest parked entries are evicted first. A new conversation that starts with a
+checkpoint inside a parked one (subagents that share a system prompt and tool
+list, a compacted history) restores that prefix and leaves the parked
+conversation where it is, so its next turn still resumes in full; the engine
+log says "borrowed". A match on a parked conversation's live state or its newest
+checkpoint is that conversation going on and moves it into the session as
+before. When the outgoing conversation fits only in the parked one's room, it
+keeps its place and the parked one is moved in whole, as before.
 Oversized snapshots or host allocation failures fall back to ordinary prompt processing.
 `--conversation-cache-min-free-mib N` (default 2560) additionally requires that
 physical-RAM headroom remain available: the engine checks before allocation and

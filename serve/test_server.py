@@ -1165,8 +1165,31 @@ class UnfinishedToolCall(unittest.TestCase):
                         self.assertEqual(len(calls), 1)
                         self.assertEqual(json.loads(streamed), {"path": "notes.txt", "content": content})
 
-    def answers(self, script, max_tokens=500):
-        """(finish reason, the call's arguments) from OpenAI and Anthropic, whole and streamed, for the model's `script`."""
+    def test_parser_returns_unfinished_call_text(self):
+        from serve.frontend import CALL_START, THINK_END, OutputParser
+        schema = [{"name": "terminal", "parameters": {"properties": {"command": {"type": "string"}}}}]
+        chunks = [CALL_START, "<function=terminal>", "<parameter=command>", "echo ready"]
+        for thinking in (False, True):
+            for stream_tools in (False, True):
+                for step in (1, 7, 10_000):
+                    with self.subTest(thinking=thinking, stream_tools=stream_tools, step=step):
+                        p = OutputParser(thinking=thinking, tools=schema, stream_tools=stream_tools)
+                        events = []
+                        if thinking:
+                            events.extend(p.feed(THINK_END))
+                        for c in chunks:
+                            for i in range(0, len(c), step):
+                                events.extend(p.feed(c[i:i + step]))
+                        events.extend(p.finish())
+                        self.assertEqual("".join(e.text for e in events if e.kind == "content"), "".join(chunks))
+                        self.assertFalse([e for e in events if e.kind == "tool_call"])
+                        if stream_tools:
+                            self.assertEqual("".join(e.text for e in events if e.kind == "tool_args"),
+                                             '{"command":"echo ready')
+                        self.assertEqual(p.finish(), [])
+
+    def answers(self, script, max_tokens=500, content=False):
+        """Return the finish reason and arguments (or content) from both APIs, whole and streamed."""
         tok = ByteTokenizer()
         svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         httpd = serve(svc, port=0)
@@ -1184,6 +1207,25 @@ class UnfinishedToolCall(unittest.TestCase):
                         "Content-Type": "application/json", "anthropic-version": "2023-06-01"})
                     with urllib.request.urlopen(req, timeout=30) as r:
                         raw = r.read().decode()
+                    if content:
+                        if stream:
+                            evs = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
+                            if api == "openai":
+                                text = "".join(e["choices"][0]["delta"].get("content") or "" for e in evs)
+                                finish = evs[-1]["choices"][0]["finish_reason"]
+                            else:
+                                text = "".join(e["delta"].get("text") or "" for e in evs
+                                               if e["type"] == "content_block_delta")
+                                finish = evs[-2]["delta"]["stop_reason"]
+                        elif api == "openai":
+                            c = json.loads(raw)["choices"][0]
+                            text, finish = c["message"]["content"], c["finish_reason"]
+                        else:
+                            m = json.loads(raw)
+                            text = "".join(b["text"] for b in m["content"] if b["type"] == "text")
+                            finish = m["stop_reason"]
+                        out[api, stream] = (finish, text)
+                        continue
                     if stream:
                         evs = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
                         if api == "openai":
@@ -1212,6 +1254,18 @@ class UnfinishedToolCall(unittest.TestCase):
             ("openai", False): ("stop", []), ("openai", True): ("stop", cut),    # whole answers leave the cut
             ("anthropic", False): ("end_turn", []),                      # call out: it has no arguments to give
             ("anthropic", True): ("end_turn", cut)})
+
+    def test_apis_return_unfinished_call_text(self):
+        text = self.CUT[len("</think>\n\n"):]
+        for limited in (False, True):
+            with self.subTest(limited=limited):
+                script = self.CUT + "rest of the file, never reached" * 40 if limited else self.CUT
+                max_tokens = len(self.CUT) if limited else 500
+                self.assertEqual(self.answers(script, max_tokens=max_tokens, content=True), {
+                    ("openai", False): ("length" if limited else "stop", text),
+                    ("openai", True): ("length" if limited else "stop", text),
+                    ("anthropic", False): ("max_tokens" if limited else "end_turn", text),
+                    ("anthropic", True): ("max_tokens" if limited else "end_turn", text)})
 
     def test_a_call_cut_at_the_token_limit(self):
         """The same cut by max_tokens: "length" / "max_tokens", and the whole (non-streamed) answers leave the call
@@ -1670,6 +1724,67 @@ class RecordingPrompt(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_ids = list(ids)
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+
+class IncrementalPrompts(unittest.TestCase):
+    """The prompt encoder: every request's ids are those of a full encode, and a turn reuses the previous one's."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.engine = RecordingPrompt(tok, "Thinking.\n</think>\n\nThe answer.", max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    post = ClientShapes.post
+
+    def test_turns(self):
+        self.assertIsNotNone(self.svc.prompts)
+        full = Service(self.engine, self.svc.tok, self.svc.template)
+        full.prompts = None                                  # the reference: the same prompt, encoded in full
+        msgs = [{"role": "system", "content": "Be brief."}]
+        for turn in range(6):
+            msgs.append({"role": "user", "content": f"question {turn} <|im_end|> é你 " * (turn + 1)})
+            status, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 64, "messages": msgs})
+            self.assertEqual(status, 200, b)
+            prompt = self.svc.template.render(msgs)
+            self.assertEqual(self.engine.last_ids, full.encode_prompt(msgs, None, {}))
+            if turn:
+                self.assertGreater(self.svc.prompts.last_reused, len(prompt) // 3)
+            msgs.append({"role": "assistant", "content": b["choices"][0]["message"]["content"]})
+
+    def test_same_ids_as_a_full_encode_on_varied_conversations(self):
+        import random
+        sys.path.insert(0, str(ROOT / "tools"))
+        from test_strata_tokenizer import conversation_prompts, load_tokenizer
+        toks = [("byte", ByteTokenizer())]
+        if load_tokenizer() is not None:
+            toks.append(("qwen35", load_tokenizer()))
+        for name, tok in toks:
+            svc = Service(self.engine, tok, self.svc.template)
+            for seed in range(3):
+                for what, prompt in conversation_prompts(self.svc.template, random.Random(seed)):
+                    with self.subTest(tokenizer=name, seed=seed, what=what):
+                        self.assertEqual(svc.prompts.encode(prompt), tok.encode(prompt, parse_special=True))
+
+    def test_a_tokenizer_without_resume_points_encodes_in_full(self):
+        class Plain:
+            """ByteTokenizer without the resume points."""
+            def __getattr__(self, name):
+                if name in ("encode_marked", "max_special_len"):
+                    raise AttributeError(name)
+                return getattr(ByteTokenizer(), name)
+        svc = Service(self.engine, Plain(), self.svc.template)
+        self.assertIsNone(svc.prompts)
+        msgs = [{"role": "user", "content": "hi"}]
+        self.assertEqual(svc.encode_prompt(msgs, None, {}),
+                         ByteTokenizer().encode(svc.render_prompt(msgs, None, {}), parse_special=True))
 
 
 class DyingEngine(MockEngine):

@@ -8,6 +8,14 @@
 # below refuses anything older: silently building for a pre-Ampere arch would produce a binary that runs
 # and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
+# The compiler probe that project() runs compiles a test program with the DEBUG flags; the MSVC default
+# (/Zi + /RTC1) asks cl.exe to bring up c1xx.dll with debug records, which some process monitors refuse
+# outright (D8050: "failed to get command line into debug records").  The probe needs no debug info, and
+# these builds are Release anyway; set BEFORE project() so the probe sees them.
+if(WIN32)
+  set(CMAKE_C_FLAGS_DEBUG "-MDd" CACHE STRING "")
+  set(CMAKE_CXX_FLAGS_DEBUG "-MDd" CACHE STRING "")
+endif()
 project(strata VERSION 0.1.40.2 LANGUAGES CXX)
 # EXPERIMENTAL: the Intel Arc engine, the SYCL port in sycl/ (PR #423; icpx + oneMKL, docs/INTEL_ARC.md). It is its
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
@@ -23,9 +31,13 @@ endif()
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 # issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
 # be read back to the exact source line
+option(STRATA_RELEASE_PDB "keep a PDB beside the Release exe (needs /Zi + /DEBUG)" ON)
 if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
-  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zi>)
-  add_link_options(/DEBUG /OPT:REF /OPT:ICF)
+  if(STRATA_RELEASE_PDB)   # OFF where cl.exe cannot create its PDB folders: only the debug symbols are skipped
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zi>)
+    add_link_options(/DEBUG)
+  endif()
+  add_link_options(/OPT:REF /OPT:ICF)
 endif()
 
 # The prebuilt release (setup.py downloads it, so users need no compiler): ggml's CPU backend for any AVX2 CPU
@@ -468,6 +480,21 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(vmm_test PRIVATE strata_engine)
     add_test(NAME vmm_test COMMAND vmm_test)
     set_tests_properties(vmm_test PROPERTIES TIMEOUT 60)
+    # The resident RAM mode with a layer split: the copy keeps each stage's lend region, and the experts the
+    # prompt path borrows are served from RAM (the file source reads none of them).  The device calls are
+    # wrapped - conversation_transfer_test's pattern - and `pin = false` keeps the copy pageable, so this
+    # runs on a CPU-only PC.
+    if(NOT STRATA_ENABLE_HIP AND UNIX AND NOT APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+      add_executable(split_lend_complement_test tests/core/split_lend_complement_test.cpp)
+      target_link_libraries(split_lend_complement_test PRIVATE strata_engine)
+      target_link_options(split_lend_complement_test PRIVATE
+        -Wl,--wrap=cudaMalloc -Wl,--wrap=cudaFree -Wl,--wrap=cudaMemset -Wl,--wrap=cudaMemcpy
+        -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap=cudaStreamSynchronize -Wl,--wrap=cudaDeviceSynchronize
+        -Wl,--wrap=cudaGetLastError -Wl,--wrap=cudaGetDevice -Wl,--wrap=cudaSetDevice
+        -Wl,--wrap=cudaMemGetInfo -Wl,--wrap=cudaHostAlloc -Wl,--wrap=cudaFreeHost)
+      add_test(NAME split_lend_complement_test COMMAND split_lend_complement_test)
+      set_tests_properties(split_lend_complement_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
+    endif()
   endif()
   # #477: the learned expert profile (--expert-profile-save): its order and make_profile.py's file format (CPU only)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/expert_profile_save_test.cpp")
@@ -546,9 +573,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(tune_hipblaslt PRIVATE hip::host roc::hipblas roc::hipblaslt)
   endif()
 
-  add_executable(strata src/program/generate.cpp)
+  # POOL: the coordinator's link against scripted workers (no GPU needed)
+  add_executable(strata-pool-link-test src/pool/pool_link_test.cpp src/pool/link.cpp)
+  target_include_directories(strata-pool-link-test PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(strata-pool-link-test PRIVATE strata_engine strata_pool ${_strata_gpu_runtime_target})
+  add_executable(strata src/program/generate.cpp src/pool/link.cpp)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+  target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec strata_pool ${_strata_gpu_runtime_target})
 
   if(STRATA_ENABLE_HIP)
     enable_testing()
@@ -766,6 +797,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(gemm_bf16_parity src/prefill/gemm_bf16_parity.cu)
     target_link_libraries(gemm_bf16_parity PRIVATE strata_prefill )
     add_test(NAME gemm_bf16_parity COMMAND gemm_bf16_parity)
+    # the hyper-connection read's fused up projection + mix (gr_upmix, STRATA_HC_UPMIX) against cuBLAS + gr_mix_r,
+    # bitwise where cuBLAS sums K in the same order, else within FP32 rounding and as close to FP64 (GPU, synthetic,
+    # no model; --bench adds timings)
+    add_executable(gr_upmix_parity src/prefill/gr_upmix_parity.cu)
+    target_link_libraries(gr_upmix_parity PRIVATE strata_prefill )
+    add_test(NAME gr_upmix_parity COMMAND gr_upmix_parity)
   endif()
   # native_expert_grouped's group stride and fused SwiGLU + q8_1, bitwise vs the launches before them (GPU, synthetic,
   # no model; --bench adds v1/new timings of a window's 48 calls in a graph)
@@ -1038,6 +1075,21 @@ endif()
 #     test drivers must NOT be in it - otherwise the fallback is not a fallback, it is the same bet with
 #     worse opt-out.  `cpu_require_expert_support()` therefore refuses at startup on a CPU without the
 #     features, and the fallback exists for tests, exactly as P2.S3 specifies.
+# POOL: the network between pool nodes (sockets, the handshake, the wire formats, the split search).  No GPU.
+add_library(strata_pool STATIC src/pool/net.cpp src/pool/protocol.cpp src/pool/split.cpp src/pool/worker.cpp)
+target_include_directories(strata_pool PUBLIC include)
+find_package(Threads REQUIRED)
+target_link_libraries(strata_pool PUBLIC Threads::Threads)
+if(WIN32)
+  target_link_libraries(strata_pool PUBLIC ws2_32)
+endif()
+add_executable(strata-pool-test src/pool/pool_test.cpp)
+target_link_libraries(strata-pool-test PRIVATE strata_pool)
+if(STRATA_BUILD_TESTS)
+  enable_testing()
+  add_test(NAME strata_pool_test COMMAND strata-pool-test)
+endif()
+
 # Plan v0.3 P6: speculation components that need no GPU.
 add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp
             src/spec/draft_source.cpp)
@@ -1300,6 +1352,12 @@ if(STRATA_NATIVE_EXPERTS)
       target_link_libraries(prefill_fused_iq_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
       add_test(NAME prefill_fused_iq_test COMMAND prefill_fused_iq_test)
       set_tests_properties(prefill_fused_iq_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+      # the MoE input quantized per token and scattered to its rows (mmq::quantize_scatter) against the per-row
+      # gather: the same q8_1 bytes for every MMQ layout (--bench: both at 2K, 8K and 32K tokens)
+      add_executable(prefill_mmq_scatter_test tests/cuda/prefill_mmq_scatter_test.cpp)
+      target_link_libraries(prefill_mmq_scatter_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
+      add_test(NAME prefill_mmq_scatter_test COMMAND prefill_mmq_scatter_test)
+      set_tests_properties(prefill_mmq_scatter_test PROPERTIES TIMEOUT 120)
     endif()
     if(STRATA_BUILD_TESTS AND STRATA_MMQ_KQUANTS)
       # the UD-Q4_K_XL expert formats through MMQ against ggml's dequantized weights (synthetic, a few seconds)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -21,8 +22,11 @@ public:
     NativeDense& operator=(const NativeDense&) = delete;
     /// With layer_hi >= 0, only the `blk.<l>.` matrices with layer_lo <= l < layer_hi are uploaded (a layer
     /// split's stage holds its own layers' projections, not the whole model's); the others keep data == nullptr.
+    /// `skip`: names not to upload (POOL: the layers another PC runs, and a worker's embedding and head); they are
+    /// still validated.
     bool load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-              bool include_ple_key = false, int64_t layer_lo = 0, int64_t layer_hi = -1);
+              bool include_ple_key = false, int64_t layer_lo = 0, int64_t layer_hi = -1,
+              const std::set<std::string>* skip = nullptr);
     /// Plan v0.3 P1: the canonical tensor names `load` would serve natively from these shards (eligible name,
     /// supported type, 2-D), read from the GGUF headers only - so the canonical arena can skip them.
     static bool served_names(const std::vector<std::string>& shards, bool include_ple_key,
@@ -30,6 +34,9 @@ public:
     /// Layer split: load only blocks [lb, le) (every other `blk.N.` projection belongs to another GPU's stage; the
     /// PLE tensors are loaded everywhere).  Process-wide, read by the next `load`; (-1, -1) = all layers.
     static void set_layer_range(int lb, int le);
+    /// POOL: the device bytes `load` would upload for each served name (to price a node's layer range).
+    static bool served_bytes(const std::vector<std::string>& shards, bool include_ple_key,
+                             std::map<std::string, uint64_t>& out, std::string& err);
     /// Layer split: the device bytes `load` would allocate for the matrices of layers [lb, le) - the same walk and
     /// filters, each matrix rounded up to the granule cudaMalloc backs it with - reading the GGUF headers and `table`
     /// only, so it allocates nothing and needs no device (#1238).  `table` must hold every tensor the shards carry.

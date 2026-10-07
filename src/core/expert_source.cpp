@@ -88,6 +88,31 @@ uint64_t clamp_resident_budget(uint64_t requested, uint64_t physical, uint64_t c
     return room > margin ? room - margin : 0;
 }
 
+bool try_resident_allocation(const ResidentAttempt& attempt, const std::function<bool(HostMemory&)>& read_memory,
+                             uint64_t headroom, std::string& err) {
+    err.clear();
+    uint64_t failed_bytes = 0;
+    if (attempt(nullptr, failed_bytes, err)) return true;
+    if (failed_bytes == 0 || !read_memory) return false;
+    ResidentRetry retry;
+    if (!read_memory(retry.memory)) return false;
+    retry.limit = clamp_resident_budget(failed_bytes, retry.memory.available, retry.memory.commit, headroom);
+    if (retry.limit == 0 || retry.limit >= failed_bytes) return false;
+
+    const std::string first_error = err;
+    std::fprintf(stderr, "FileExpertSource: initial allocation failed (%s); retrying with at most %.2f GiB "
+                         "(available RAM %.2f GiB, commit %.2f GiB, %.0f GiB headroom)\n",
+                 first_error.c_str(), (double) retry.limit / 1073741824.0,
+                 (double) retry.memory.available / 1073741824.0, (double) retry.memory.commit / 1073741824.0,
+                 (double) headroom / 1073741824.0);
+    std::fflush(stderr);
+    failed_bytes = 0;
+    err.clear();
+    if (attempt(&retry, failed_bytes, err)) return true;
+    err = first_error + "; smaller retry failed: " + err;
+    return false;
+}
+
 bool pin_depends_on_reclaim(uint64_t free_now, uint64_t bytes, uint64_t reserve) {
     return bytes > 0 && free_now < bytes + reserve;
 }
@@ -206,6 +231,46 @@ int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint6
         --keep;
     }
     return keep;
+}
+
+int64_t append_stage_lend_regions(int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
+                                  std::vector<uint64_t>& offsets, uint64_t& bytes, uint64_t cap_bytes,
+                                  const std::vector<std::vector<std::pair<int32_t, int32_t>>>& regions,
+                                  std::string& err) {
+    const size_t blobs = (size_t) (n_layers * n_expert);
+    if (n_layers <= 0 || n_expert <= 0 || layer_blob_bytes.size() != (size_t) n_layers || offsets.size() != blobs) {
+        err = "append_stage_lend_regions: the plan does not match the geometry";
+        return -1;
+    }
+    std::vector<std::pair<int32_t, int32_t>> sorted;
+    for (const auto& region : regions) {   // validate the whole request before touching the plan
+        for (const auto& pair : region)
+            if (pair.first < 0 || pair.first >= n_layers || pair.second < 0 || pair.second >= n_expert) {
+                err = "append_stage_lend_regions: a lend-region expert is outside the model";
+                return -1;
+            }
+        sorted = region;
+        std::sort(sorted.begin(), sorted.end());
+        for (size_t i = 1; i < sorted.size(); ++i)
+            if (sorted[i] == sorted[i - 1]) {
+                err = "append_stage_lend_regions: a stage's lend region repeats an expert";
+                return -1;
+            }
+    }
+    int64_t kept = 0;
+    for (const auto& region : regions) {
+        for (const auto& pair : region) {
+            const size_t index = (size_t) pair.first * (size_t) n_expert + (size_t) pair.second;
+            if (offsets[index] != kNoCacheComplement) continue;   // already in the copy: the complement, or a
+                                                                  // CUDA0 lend slot the region is asked to skip
+            const uint64_t b = layer_blob_bytes[(size_t) pair.first];
+            if (b > cap_bytes - bytes) break;                     // this stage's rest keeps the file fallback
+            offsets[index] = bytes;
+            bytes += b;
+            ++kept;
+        }
+    }
+    return kept;
 }
 
 bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t out) {
@@ -1140,6 +1205,11 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
     return true;
 }
 
+void FileExpertSource::StageBufFree::operator()(uint8_t* p) const noexcept {
+    if (pinned) (void) cudaFreeHost(p);
+    else delete[] p;
+}
+
 // A blob assembled from the three role slices.  The buffer of a (layer, expert) is reused for another only once
 // its blob has not been asked for during `kStageAge` layers (begin_layer) or 256 assemblies, whichever comes
 // first, and never while it is being filled: the pool computes a layer's misses before it starts the next, and a
@@ -1168,8 +1238,24 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
             v = i;
         }
     if (v == stage_buf_.size()) {
-        stage_buf_.emplace_back(new (std::nothrow) uint8_t[(size_t) stage_blob_]);
-        if (!stage_buf_.back()) { stage_buf_.pop_back(); return false; }
+        // Pinned, where the driver allows: a stage buffer is the source of the cache fill's cudaMemcpyAsync,
+        // and a pageable source is staged through the driver's bounce buffer - an extra copy at a fraction of
+        // the transfer rate, on the calling thread.  A failure falls back to pageable for this buffer.
+        void* p = nullptr;
+        const cudaError_t pin_err = cudaHostAlloc(&p, (size_t) stage_blob_, cudaHostAllocDefault);
+        const bool pinned = pin_err == cudaSuccess && p != nullptr;
+        if (!pinned) (void) cudaGetLastError();   // the failed alloc's sticky error is ours, not the caller's
+        uint8_t* raw = pinned ? (uint8_t*) p : new (std::nothrow) uint8_t[(size_t) stage_blob_];
+        if (raw == nullptr) return false;
+        stage_buf_.emplace_back(raw, StageBufFree{pinned});
+        if (pinned && !stage_pin_said_) {
+            stage_pin_said_ = true;
+            std::fprintf(stderr, "FileExpertSource: the stage buffers are pinned (cudaHostAlloc)\n");
+        } else if (!pinned && !stage_pin_failed_said_) {
+            stage_pin_failed_said_ = true;
+            std::fprintf(stderr, "FileExpertSource: cudaHostAlloc failed for a stage buffer (%s) - pageable it is\n",
+                         cudaGetErrorString(pin_err));
+        }
         stage_key_.push_back(-1);
         stage_epoch_.push_back(0);
         stage_used_.push_back(0);
@@ -2039,7 +2125,26 @@ bool FileExpertSource::pin_cache_complement(
     const ExpertCache& cache, std::string& err, bool pin,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
     uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank) {
+    const auto attempt = [&](const detail::ResidentRetry* retry, uint64_t& failed_bytes, std::string& reason) {
+        return pin_cache_complement_attempt(cache, reason, pin, additional_gpu_pairs, lend_from_slot,
+                                             headroom_bytes, budget_bytes, rank, retry, failed_bytes);
+    };
+#if defined(_WIN32)
+    return detail::try_resident_allocation(attempt, [](detail::HostMemory& m) { return detail::host_available_memory(m); },
+                                            headroom_bytes, err);
+#else
+    uint64_t failed_bytes = 0;
+    return attempt(nullptr, failed_bytes, err);
+#endif
+}
+
+bool FileExpertSource::pin_cache_complement_attempt(
+    const ExpertCache& cache, std::string& err, bool pin,
+    const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
+    uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank,
+    const detail::ResidentRetry* retry, uint64_t& failed_bytes) {
     err.clear();
+    failed_bytes = 0;
     const auto pin_t0 = std::chrono::steady_clock::now();
     if (base_ == nullptr) { err = "FileExpertSource: open the mapped experts before pinning a complement"; return false; }
     if (complement_ready_) { err = "FileExpertSource: the cache complement is already pinned"; return false; }
@@ -2080,7 +2185,7 @@ bool FileExpertSource::pin_cache_complement(
     // counts those file pages in this process's working set, not as available: a 32 GB PC read 0.44 GiB here
     // (20.7 GiB before the start).  Trimmed, they move to the standby list (still cached, counted as available).
     // Resident mode only: nothing else calls this function.  Locked/pinned pages stay; the rest fault back softly.
-    {
+    if (retry == nullptr) {
         uint64_t before = 0, after = 0;
         const bool read_before = available_memory_bytes(before);
         (void) SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T) -1, (SIZE_T) -1);
@@ -2091,20 +2196,21 @@ bool FileExpertSource::pin_cache_complement(
     }
 #endif
     const bool what_fits = budget_bytes == kResidentWhatFits;   // #467: the soft mode's second try
-    uint64_t budget_physical = 0;   // #403: reuse the memory snapshot a budget was sized from
-    uint64_t budget_commit = std::numeric_limits<uint64_t>::max();
+    uint64_t budget_physical = retry ? retry->memory.available : 0;   // #403: reuse the sizing snapshot
+    const uint64_t budget_commit = retry ? retry->memory.commit : std::numeric_limits<uint64_t>::max();
     if (budget_bytes > 0) {
         // CS-T: a RAM budget.  The complement's experts in `rank` order (the expert profile, hottest first) while
-        // they fit, the rest left on the mapped files; Windows commit capacity also limits the allocation (#730).
-        uint64_t physical = 0;
-        if (!available_memory_bytes(physical, &budget_commit)) {
+        // they fit, the rest left on the mapped files. Commit limits only the retry, so a page file can grow (#730).
+        uint64_t physical = budget_physical;
+        if (retry == nullptr && !available_memory_bytes(physical)) {
             err = "FileExpertSource: cannot determine available memory for --resident-budget-gib";
             return false;
         }
         budget_physical = physical;
         const uint64_t available = std::min(physical, budget_commit);
         const char* limit = budget_commit < physical ? "commit" : "RAM";
-        const uint64_t clamped = detail::clamp_resident_budget(budget_bytes, physical, budget_commit, headroom_bytes);
+        uint64_t clamped = detail::clamp_resident_budget(budget_bytes, physical, budget_commit, headroom_bytes);
+        if (retry != nullptr) clamped = std::min(clamped, retry->limit);
         if (budget_bytes > clamped) {
             // #403: 256 MiB under the room, so the engine's own allocations after this reading still leave the
             // headroom (a budget clamped to exactly the room failed the safety check below on a reading a few MB
@@ -2135,7 +2241,7 @@ bool FileExpertSource::pin_cache_complement(
                 at += b;
                 ++held;
             }
-        if (what_fits && held == 0) {   // #467: nothing to keep - the caller's plain mmap fallback, not an empty copy
+        if ((what_fits || retry != nullptr) && held == 0) {   // no empty cache after a failed allocation
             err = "FileExpertSource: available memory cannot hold any expert of the complement";
             return false;
         }
@@ -2153,20 +2259,22 @@ bool FileExpertSource::pin_cache_complement(
         // #403: with a budget, the reading it was sized from - a second reading a few MB lower (the engine's own
         // allocations, the file cache) failed a budget the first one had clamped.  (A budget turns `lend` off.)
         uint64_t physical = budget_physical;
-        uint64_t commit = budget_commit;
-        if (physical == 0 && !available_memory_bytes(physical, &commit)) {
+        const uint64_t commit = budget_commit;
+        if (retry == nullptr && physical == 0 && !available_memory_bytes(physical)) {
             err = "FileExpertSource: cannot determine available memory for the resident-memory safety check";
             return false;
         }
         const uint64_t available = std::min(physical, commit);
         budget = available > headroom_bytes ? available - headroom_bytes : 0;
+        if (retry != nullptr) budget = std::min(budget, retry->limit);
         if (bytes > budget) {
             char message[320];
             std::snprintf(message, sizeof message,
-                          "FileExpertSource: resident complement %.2f GiB exceeds available %s (%.2f GiB) minus the "
-                          "%.0f GiB safety headroom",
-                          (double) bytes / 1073741824.0, commit < physical ? "commit" : "RAM",
-                          (double) available / 1073741824.0, (double) headroom_bytes / 1073741824.0);
+                          "FileExpertSource: resident complement %.2f GiB exceeds the %.2f GiB memory budget "
+                          "(available %s %.2f GiB, %.0f GiB headroom%s)",
+                          (double) bytes / 1073741824.0, (double) budget / 1073741824.0,
+                          commit < physical ? "commit" : "RAM", (double) available / 1073741824.0,
+                          (double) headroom_bytes / 1073741824.0, retry ? ", retry margin included" : "");
             err = message;
             return false;
         }
@@ -2186,6 +2294,36 @@ bool FileExpertSource::pin_cache_complement(
             if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, core,
                                                     additional_gpu_pairs, offsets, bytes, err)) return false;
         }
+    }
+
+    // A layer split: generate hands the copy every stage's lend region (`stage_lend_regions`, set before the
+    // call).  The prompt path borrows the tail slots of EVERY part's cache, and with `additional_gpu_pairs`
+    // non-empty the single lend region above is off - so without this the borrowed experts sat in neither
+    // VRAM nor RAM during a prompt and came back through page faults from the mapped shards: measured
+    // 2026-10-06 on an RTX 2000 Ada + 5060 Ti rig (17/48 split, IQ3_S mapped from the GGUF, --prefill auto,
+    // one 73K-token prompt) 3.7 GiB read from the NVMe for the one prompt (arena mode reads 1.1 GiB), and one
+    // 8192-token chunk spent 1.5 s of its 3.9 s on host staging (arena: 0.37 s).  The regions walk each
+    // stage's highest slots first, as the borrowing does; the whole copy - complement and regions
+    // together - stays within one budget, and experts past it keep the file fallback they had.
+    int64_t stage_lent = 0;
+    uint64_t stage_lent_bytes = 0;
+    if (!stage_lend_regions_.empty()) {
+        if (budget == std::numeric_limits<uint64_t>::max()) {   // #403: the one reading, taken now
+            uint64_t physical = budget_physical, commit = budget_commit;
+            if (physical == 0 && !available_memory_bytes(physical, &commit)) {
+                err = "FileExpertSource: cannot determine available memory for the stage lend regions";
+                return false;
+            }
+            const uint64_t available = std::min(physical, commit);
+            budget = available > headroom_bytes ? available - headroom_bytes : 0;
+        }
+        uint64_t cap = budget;   // an explicit --resident-budget-gib caps the whole copy, regions included
+        if (budget_bytes > 0 && budget_bytes != kResidentWhatFits && budget_bytes < cap) cap = budget_bytes;
+        const uint64_t before = bytes;
+        stage_lent = detail::append_stage_lend_regions(n_layers_, n_expert_, layer_blob_bytes_, offsets, bytes, cap,
+                                                       stage_lend_regions_, err);
+        if (stage_lent < 0) return false;
+        stage_lent_bytes = bytes - before;
     }
 
     void* arena = nullptr;
@@ -2306,6 +2444,7 @@ bool FileExpertSource::pin_cache_complement(
                       std::to_string(allocation_errno) + ": " + std::strerror(allocation_errno) + ")";
                 if (!note.empty()) err += "; " + note;
                 log_complement_memory("after pageable allocation failure", bytes);
+                failed_bytes = bytes;
                 return false;
             }
             if (pin) {
@@ -2557,6 +2696,7 @@ bool FileExpertSource::pin_cache_complement(
     complement_locked_ = locked;
     complement_lock_off_ = lock_off;
     complement_lent_slots_ = lend ? n_slots - keep_from : 0;
+    complement_lent_slots_ += stage_lent;   // and the split stages' regions: pairs the copy kept of them
     complement_ready_ = true;
     std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB in %.0f s%s%s\n",
                  complement_pinned_ ? "mapped pinned" : pin ? "locked resident" : "pageable resident",
@@ -2568,6 +2708,14 @@ bool FileExpertSource::pin_cache_complement(
                              "too%s\n", (long long) complement_lent_slots_, (long long) (n_slots - lend_from_slot),
                      complement_lent_slots_ < n_slots - lend_from_slot
                          ? " (the others are read from the file when lent: not enough RAM for them)" : "");
+    if (!stage_lend_regions_.empty()) {
+        int64_t offered = 0;
+        for (const auto& region : stage_lend_regions_) offered += (int64_t) region.size();
+        std::fprintf(stderr, "FileExpertSource: the split stages lend %lld slots to the prompt path: %lld keep "
+                             "their experts in RAM too (%.2f GiB)%s\n",
+                     (long long) offered, (long long) stage_lent, (double) stage_lent_bytes / 1073741824.0,
+                     stage_lent < offered ? " (the rest are read from the file when lent: not enough RAM for them)" : "");
+    }
     if (!additional_gpu_pairs.empty()) {
         std::fprintf(stderr, "FileExpertSource: %zu verified additional-GPU experts remain on the mmap fallback\n",
                      additional_gpu_pairs.size());
@@ -3522,17 +3670,19 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
 // `unbuffered` (Windows, experts_unbuffered): each chunk's 4 KiB-aligned window is read with FILE_FLAG_NO_BUFFERING into
 // an aligned buffer and scattered into the blobs - no copy through the file cache when the drive is read anyway.
 LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
-                            int threads, bool unbuffered, const std::atomic<int>* ready) {
+                            int threads, bool unbuffered, const std::atomic<int>* ready, int64_t lb, int64_t le) {
     // `ready`: layer l is written only once *ready > l + 1 (a PinnedArena registering its slices meanwhile; the next
-    // slice too, since its registration starts on the page that may hold this layer's tail)
-    auto wait_ready = [ready](int64_t l) {
+    // slice too, since its registration starts on the page that may hold this layer's tail).  POOL: the slices are
+    // the range's, so layer l is slice l - lb
+    auto wait_ready = [ready, lb](int64_t l) {
         if (ready != nullptr)
-            while (ready->load(std::memory_order_acquire) <= l + 1) std::this_thread::yield();
+            while (ready->load(std::memory_order_acquire) <= l - lb + 1) std::this_thread::yield();
     };
     LoadStats st;
-    st.layers = (uint64_t) lay.n_layers;
+    if (le < 0) le = lay.n_layers;
+    st.layers = (uint64_t) (le - lb);
     const auto t0 = std::chrono::steady_clock::now();
-    std::atomic<int64_t> next{0};
+    std::atomic<int64_t> next{lb};   // POOL: only the layers [lb, le)
     std::atomic<bool> bad{false};
 #if defined(_WIN32)
     if (unbuffered) {
@@ -3557,7 +3707,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
             if (buf == nullptr) fail("cannot allocate a read buffer");
             for (;;) {
                 const int64_t l = next.fetch_add(1);
-                if (l >= lay.n_layers || bad) break;
+                if (l >= le || bad) break;
                 wait_ready(l);
                 const auto& fm = lay.fmt[(size_t) l];
                 const uint64_t blob = lay.bytes[(size_t) l];
@@ -3617,7 +3767,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
             st.error = err.empty() ? "unreadable shard while reading the experts from the GGUF" : err;
             return st;
         }
-        st.bytes = lay.total;
+        st.bytes = (le == lay.n_layers ? lay.total : lay.layer_offset(le)) - lay.layer_offset(lb);   // POOL: the range
         st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         return st;
     }
@@ -3636,7 +3786,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
         std::vector<uint8_t> buf;
         for (;;) {
             const int64_t l = next.fetch_add(1);
-            if (l >= lay.n_layers || bad) break;
+            if (l >= le || bad) break;
             wait_ready(l);
             const auto& fm = lay.fmt[(size_t) l];
             const uint64_t blob = lay.bytes[(size_t) l];
@@ -3679,7 +3829,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
         st.error = "short read or unreadable shard while reading the experts from the GGUF";
         return st;
     }
-    st.bytes = lay.total;
+    st.bytes = (le == lay.n_layers ? lay.total : lay.layer_offset(le)) - lay.layer_offset(lb);
     st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     return st;
 }
@@ -3698,7 +3848,14 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         return false;
     }
     const int64_t blob = (int64_t) lay.max_blob;
-    const uint64_t want = lay.total;
+    const uint64_t total = lay.total;
+    // POOL: a node of a pool holds only its own layers' experts
+    const int64_t rlb = std::max<int64_t>(0, range_lb_);
+    const int64_t rle = range_le_ < 0 || range_le_ > n_layers ? n_layers : range_le_;
+    if (rlb >= rle) { err = "ArenaExpertSource: the layer range is empty"; return false; }
+    const uint64_t off0 = lay.layer_offset(rlb);
+    const uint64_t off1 = rle == n_layers ? total : lay.layer_offset(rle);
+    const uint64_t want = off1 - off0;
 
     // plan v0.3 P6: no experts.bin in a native pack -> the experts come straight from the GGUF
     const bool from_gguf = !std::ifstream(path, std::ios::binary) && lay.native && !lay.gguf_off.empty() && !gguf_.empty();
@@ -3713,13 +3870,13 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         std::ifstream f(path, std::ios::binary | std::ios::ate);
         if (!f) { err = "ArenaExpertSource: cannot open " + path; return false; }
         const uint64_t got = (uint64_t) f.tellg();
-        if (got != want && got != want + (uint64_t) blob) {   // + one blob: STRATA_ARENA_MMAP's padded file
+        if (got != total && got != total + (uint64_t) blob) {   // + one blob: STRATA_ARENA_MMAP's padded file
             char buf[400];
             std::snprintf(buf, sizeof buf,
                           "ArenaExpertSource: %s is %llu B but %lld layers x %lld experts (blobs up to %lld B) "
                           "make %llu B - this is not the pack this geometry came from",
                           path.c_str(), (unsigned long long) got, (long long) n_layers, (long long) n_expert,
-                          (long long) blob, (unsigned long long) want);
+                          (long long) blob, (unsigned long long) total);
             err = buf;
             return false;
         }
@@ -3735,7 +3892,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     static const bool arena_mmap = false;   // POSIX mmap/madvise: Linux only for now
 #else
     static const bool arena_mmap = [] { const char* v = std::getenv("STRATA_ARENA_MMAP"); return v && v[0] == '1'; }();
-    if (arena_mmap) {
+    if (arena_mmap && rlb == 0 && rle == n_layers) {   // POOL: a node's range is not the pack's file
         const uint64_t file_bytes = want + (uint64_t) blob;
         uint64_t have = 0;
         {
@@ -3803,9 +3960,9 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // one layer per registration slice, so no expert straddles two registrations.  The arena is one blob
     // longer than the file: a copy of a whole VRAM slot (the largest blob) may then start at any expert.
     std::vector<uint64_t> bounds, loff, lbytes;
-    for (int64_t l = 0; l < n_layers; ++l) {
-        bounds.push_back(lay.layer_offset(l));
-        loff.push_back(lay.layer_offset(l));
+    for (int64_t l = rlb; l < rle; ++l) {
+        bounds.push_back(lay.layer_offset(l) - off0);   // the registration slices, relative to the range
+        loff.push_back(lay.layer_offset(l));            // where the layer sits in the file
         lbytes.push_back(lay.blob_bytes(l) * (uint64_t) n_expert);
     }
     bounds.push_back(want);
@@ -3833,11 +3990,14 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
               (why.empty() ? std::string{} : ": " + why);
         return false;
     }
+    // the loaders write each layer at its layout offset: hand them the range's base biased back by the offset of its
+    // first layer, so layer rlb lands at the start of this (range-sized) arena (POOL)
+    uint8_t* const biased = (uint8_t*) ((uintptr_t) a->data() - (uintptr_t) off0);
     // #285: unbuffered when the drive is read anyway and the file cache could not keep the experts for the next
     // start either (a 64 GB PC); otherwise the buffered readers, which a warm restart serves from the cache
     std::vector<std::string> files;
     if (from_gguf) {
-        for (int64_t l = 0; l < n_layers; ++l)
+        for (int64_t l = rlb; l < rle; ++l)
             for (int r = 0; r < 3; ++r) {
                 const std::string f = expert_gguf_file(gguf_, lay, l, r);
                 if (std::find(files.begin(), files.end(), f) == files.end()) files.push_back(f);
@@ -3861,11 +4021,11 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     }
     const std::atomic<int>* rp = deferred ? &ready : nullptr;
     if (from_gguf) {
-        st = load_experts_gguf(gguf_, a->data(), lay, readers, unbuffered, rp);
+        st = load_experts_gguf(gguf_, biased, lay, readers, unbuffered, rp, rlb, rle);
     } else {
-        if (unbuffered) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20, rp);
+        if (unbuffered) st = load_experts_direct(path, biased, loff, lbytes, readers, /*chunk=*/8u << 20, rp);
         if (!unbuffered || (!st.ok && st.error.empty()))   // unaligned ranges: the buffered reader
-            st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20, rp);
+            st = load_experts_ranges(path, biased, loff, lbytes, threads, /*chunk=*/8u << 20, rp);
     }
     if (reg.joinable()) reg.join();
     std::fprintf(stderr, "strata generate: expert arena read %s (%s)\n", unbuffered ? "unbuffered" : "through the file cache",
@@ -3887,14 +4047,15 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // the first start: write experts.bin for the mapped starts after this one - only when the drive has room for it
     // and 2 GiB more (a full drive fails other writes too); otherwise this start says so and runs pinned as before
     std::error_code space_ec;
-    const uint64_t free_disk = arena_mmap && from_gguf ? (uint64_t) std::filesystem::space(
+    const bool mmap_write = arena_mmap && rlb == 0 && rle == n_layers;   // POOL: never a range's part
+    const uint64_t free_disk = mmap_write && from_gguf ? (uint64_t) std::filesystem::space(
         std::filesystem::path(path).parent_path(), space_ec).available : 0;
     const bool room = !space_ec && free_disk >= want + (uint64_t) blob + (2ull << 30);
-    if (arena_mmap && from_gguf && !room)
+    if (mmap_write && from_gguf && !room)
         std::fprintf(stderr, "strata generate: STRATA_ARENA_MMAP: NOT writing %s - %.1f GiB free on that drive, it needs "
                              "%.1f GiB plus 2 GiB to spare; this start keeps the arena in RAM\n", path.c_str(),
                      (double) free_disk / 1073741824.0, (double) (want + (uint64_t) blob) / 1073741824.0);
-    if (arena_mmap && from_gguf && room) {
+    if (mmap_write && from_gguf && room) {
         const std::string tmp = path + ".tmp";
         std::FILE* f = std::fopen(tmp.c_str(), "wb");
         bool ok = f != nullptr && std::fwrite(a->data(), 1, (size_t) want, f) == (size_t) want;
@@ -3909,7 +4070,11 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
                      ok ? "wrote" : "could NOT write", path.c_str());
     }
     arena_ = a;
-    base_ = a->data();
+    range_off_ = off0;
+    range_lb_ = rlb;
+    range_le_ = rle;
+    held_bytes_ = want;
+    base_ = biased;                                  // blob(): base_ + the layout offset, as before
     pinned_bytes_ = a->registered_bytes;
     // plan v0.3 P6: device aliases of the mapped registration, for the PCIe share of the misses
     dev_slice_.clear();
@@ -3918,7 +4083,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         std::vector<uint64_t> starts = a->slice_bytes > 0 ? a->slice_starts : std::vector<uint64_t>{0};
         for (uint64_t off : starts) {
             void* d = nullptr;
-            if (cudaHostGetDevicePointer(&d, (void*) (base_ + off), 0) != cudaSuccess) {
+            if (cudaHostGetDevicePointer(&d, (void*) (a->data() + off), 0) != cudaSuccess) {
                 (void) cudaGetLastError();
                 dev_slice_.clear();
                 break;
@@ -3988,23 +4153,24 @@ uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
 }
 
 bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
-    if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return false;
+    if (base_ == nullptr || layer < range_lb_ || layer >= range_le_ || expert < 0 || expert >= n_expert_) return false;
     const auto& lay = strata::kernels::cpu::expert_layout();
-    return lay.blob_offset(layer, expert) + lay.blob_bytes(layer) <= pinned_bytes_;
+    return lay.blob_offset(layer, expert) - range_off_ + lay.blob_bytes(layer) <= pinned_bytes_;
 }
 
 const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) const {
     if (dev_slice_.empty() || !pinned(layer, expert)) return nullptr;
     const auto& lay = strata::kernels::cpu::expert_layout();
-    if (slice_bytes_ == 0) return dev_slice_[0] + lay.blob_offset(layer, expert);
-    // one registration slice per layer
-    if ((size_t) layer >= dev_slice_.size()) return nullptr;
-    return dev_slice_[(size_t) layer] + (uint64_t) expert * lay.blob_bytes(layer);
+    if (slice_bytes_ == 0) return dev_slice_[0] + (lay.blob_offset(layer, expert) - range_off_);
+    // one registration slice per layer (of the range)
+    const int64_t s = layer - range_lb_;
+    if (s < 0 || (size_t) s >= dev_slice_.size()) return nullptr;
+    return dev_slice_[(size_t) s] + (uint64_t) expert * lay.blob_bytes(layer);
 }
 
 const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     if (base_ == nullptr) return nullptr;
-    if (layer < 0 || expert < 0 || expert >= n_expert_) return nullptr;
+    if (layer < range_lb_ || layer >= range_le_ || expert < 0 || expert >= n_expert_) return nullptr;
     const int64_t idx = layer * n_expert_ + expert;
     if (idx < 0 || idx >= blobs_) return nullptr;
     ++reads_;

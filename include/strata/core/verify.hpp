@@ -55,6 +55,55 @@ struct VerifyHits {
     int64_t blob = 0;
 };
 
+/// POOL: the rest of the model on other PCs.  A verifier whose stage ends before the last layer and has a
+/// link (set_link) hands its window to the link instead of a local next stage: the link sends the hand-off rows to
+/// the pool's workers, gets the final residual back and runs the head, the sampler and the draft layer's binding
+/// here (strata/pool/link.hpp).  `run` is called after this stage's hand-off is complete in its host buffer.
+class StageLink {
+public:
+    virtual ~StageLink() = default;
+    virtual bool run(int T, const int32_t* tokens, int64_t pos0, int32_t* out, std::string& err) = 0;
+    virtual bool commit(int n_keep, std::string& err) = 0;
+    /// The final residual of the last window, (T, hc*n_embd) on this device (the drafter reads it).
+    virtual const float* final_R_all() const = 0;
+    virtual void set_sampling(const strata::kernels::SamplerParams& sp) = 0;
+    virtual void set_history(const int32_t* history, int history_len) = 0;
+    virtual void set_head_sampling(bool on) = 0;
+    /// POOL: how long this window took here before the hand-off (the earlier stage's own layers), just before `run`
+    virtual void stage_ms(double ms) { (void) ms; }
+    /// POOL + --batch-mtp: the rest of a batch window over `rows` (slot of each row; hand-off rows [0, S)) and its
+    /// picks; then each slot's accepted prefix (`keep` by slot id, `n` slots)
+    virtual bool run_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out,
+                          std::string& err) {
+        (void) rows; (void) S; (void) tokens; (void) pos; (void) out;
+        err = "this link has no batch rows";
+        return false;
+    }
+    virtual bool commit_rows(const int* keep, int n, std::string& err) {
+        (void) keep; (void) n;
+        err = "this link has no batch rows";
+        return false;
+    }
+};
+
+/// POOL + --pipeline-windows: the later stage of a pipelined decode on other PCs.  A Verifier given one
+/// (`set_pipe_remote`, with its window parity) has no layers of its own: its pipelined calls (pl_launch, service,
+/// done, pl_finish, pl_commit_async, final_R, stream, capture_all) go to the remote stage, which sends the hand-off
+/// that parity's first-stage verifier wrote, runs the head here when the rows are back, and commits on the workers.
+/// One window at a time is in flight on it (the pipelined loop never launches a later stage speculatively).
+class PipeRemote {
+public:
+    virtual ~PipeRemote() = default;
+    virtual bool pl_launch(int parity, int T, const int32_t* tokens, int64_t pos0, std::string& err) = 0;
+    /// 1: the picks are ready; 0: not yet; -1: an error
+    virtual int pl_poll(int parity, std::string& err) = 0;
+    virtual bool pl_finish(int parity, int32_t* out, std::string& err) = 0;
+    virtual bool pl_commit(int parity, int n_keep, std::string& err) = 0;
+    virtual bool pl_in_flight(int parity) const = 0;
+    virtual const float* pl_final_R(int parity, int t) const = 0;
+    virtual cudaStream_t pl_stream() const = 0;
+};
+
 class Verifier {
 public:
     Verifier() = default;
@@ -91,6 +140,7 @@ public:
     void set_sampling(const strata::kernels::SamplerParams& sp) {
         sampling_ = sp;   // row t of a window at pos0 draws Philox(seed, pos0 + t): see run()
         if (next_) next_->set_sampling(sp);
+        if (link_) link_->set_sampling(sp);
     }
 
     /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len`
@@ -103,6 +153,7 @@ public:
         hist_d_ = history;
         hist_len_ = history_len;
         if (next_) next_->set_history(history, history_len);
+        if (link_) link_->set_history(history, history_len);
     }
     /// PROBABILISTIC DRAFT ACCEPTANCE (core/spec_prob.hpp, STRATA_SPEC_PROB=1): for the NEXT run() only, judge the
     /// window's first `n_q` drafts against the drafter's distributions `q` (host memory, n_q rows of kSpecQStride
@@ -120,7 +171,11 @@ public:
     /// Off: `run` skips the request's head sampling and `out` is the recorded greedy pick.  For windows whose
     /// picks are discarded - a prompt read through windows commits every token - so they cost no sampler launch
     /// or sync and never read a history staged for another position.
-    void set_head_sampling(bool on) { head_sampling_ = on; if (next_) next_->set_head_sampling(on); }
+    void set_head_sampling(bool on) {
+        head_sampling_ = on;
+        if (next_) next_->set_head_sampling(on);
+        if (link_) link_->set_head_sampling(on);
+    }
 
     /// LAYER SPLIT (multi-GPU): this verifier runs layers [layer_begin, layer_end) of every window.  A stage that
     /// does not start at layer 0 takes its residual from `handoff_in` instead of embedding the tokens; a stage that
@@ -132,11 +187,27 @@ public:
     void set_stage(int64_t layer_begin, int64_t layer_end, const float* handoff_in, float* handoff_out) {
         lb_ = layer_begin; le_ = layer_end; hand_in_ = handoff_in; hand_out_ = handoff_out;
     }
+    /// STRATA_SPLIT_OVERLAP=1 (opt-in; stages on DIFFERENT devices only): the hand-off carries a ready flag (one
+    /// mapped word per hand-off buffer: host and device addresses).  The writing stage raises it from the GPU when
+    /// its hand-off is out (handoff_publish); the reading stage's window graph waits on it (wait_flag_ge) - so the
+    /// next stage's graph is launched while this stage is still running, and the host no longer syncs between the
+    /// stages.  Null (the default): the old order - sync, then launch the next stage.  Set before `init`.
+    void set_handoff_flags(uint32_t* in_host, uint32_t* in_dev, uint32_t* out_host, uint32_t* out_dev) {
+        hflag_in_h_ = in_host; hflag_in_d_ = in_dev; hflag_out_h_ = out_host; hflag_out_d_ = out_dev;
+    }
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
+    /// POOL: the rest of the window runs elsewhere (see StageLink).  Set before the first `run`.
+    void set_link(StageLink* link) { link_ = link; }
+    /// POOL + --pipeline-windows: this verifier stands for the remote later stage's windows of `parity` (no init)
+    void set_pipe_remote(PipeRemote* r, int parity) { pr_ = r; pr_par_ = parity; }
+    bool pipe_remote() const { return pr_ != nullptr; }
+    /// POOL worker: no head even when this stage ends at the last layer - the window's final residual goes to
+    /// `handoff_out` (R already holds the last layer's write) and the coordinator runs the head.  Before `init`.
+    void set_headless(bool on) { headless_ = on; }
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
@@ -213,7 +284,7 @@ public:
     /// expert evicted on the host (the pool then computes it on the CPU) before the device table follows.  Also turns
     /// the device-planned layers (E-6) off.  Before `init`.
     void set_always_publish(bool on) { always_publish_ = on; }
-    cudaStream_t stream() const { return cs_; }
+    cudaStream_t stream() const { return pr_ ? pr_->pl_stream() : cs_; }
     int device() const { return device_; }
     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
     bool capture_all(std::string& err);
@@ -223,8 +294,10 @@ public:
     /// `ss.ple_prev` equal to `ple_prev` by then) skips the staging; anything else stages again.
     bool prestage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err);
     /// 1: every layer served; 0: the GPU has not reached the next layer yet; -1: an error (`err`).
-    int service(PoolMultiFn pool, void* user, std::string& err);
-    bool in_flight() const { return fl_active_; }
+    /// `max_layers` > 0: serve at most that many layers this call (0 back when the limit is reached), so the
+    /// pipelined decode can turn to the verified window in between (architectds' STRATA_PIPELINE_YIELD)
+    int service(PoolMultiFn pool, void* user, std::string& err, int max_layers = 0);
+    bool in_flight() const { return pr_ ? pr_->pl_in_flight(pr_par_) : fl_active_; }
     /// The window's graph (and its profile copy) completed; false while it runs.  An error sets `err`.
     bool done(std::string& err);
     /// After `done`: the profile, the last stage's host sampling and picks (`out` may be null on an earlier stage).
@@ -248,7 +321,7 @@ public:
 
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
-    const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
+    const float* final_R_all() const { return next_ ? next_->final_R_all() : link_ ? link_->final_R_all() : R_; }
 
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
@@ -360,8 +433,27 @@ private:
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
     const float* hand_in_ = nullptr;
     float* hand_out_ = nullptr;
+    uint32_t* hflag_in_h_ = nullptr;     ///< set_handoff_flags: the incoming hand-off's ready word (host / device)
+    uint32_t* hflag_in_d_ = nullptr;
+    uint32_t* hflag_out_h_ = nullptr;    ///< ... and the outgoing one's
+    uint32_t* hflag_out_d_ = nullptr;
+    uint32_t* hcount_d_ = nullptr;       ///< handoff_publish's block counter (device memory)
+    uint32_t* herr_h_ = nullptr;         ///< the bounded hand-off wait gave up (mapped; the reading stage's)
+    uint32_t* herr_d_ = nullptr;
+    uint32_t* hdrop_h_ = nullptr;        ///< STRATA_TEST_HANDOFF_DROP: the writing stage withholds its flag (mapped)
+    uint32_t* hdrop_d_ = nullptr;
+    bool handoff_failed(std::string& err) const;   ///< the bounded hand-off wait timed out in the last window
+    int prelaunched_ = 0;                ///< prelaunch ran for a window of this size: run skips staging + launch
+    /// The overlapped split: stage this window's inputs and launch its graph now (the graph waits on the hand-off
+    /// flag); `run` then only serves the host side.  Called on a helper thread while the previous stage runs.
+    bool prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string& err);
+    bool chain_overlap() const;          ///< this stage hands off through a flag to a next stage that waits on it
     Verifier* next_ = nullptr;
     void* next_user_ = nullptr;
+    StageLink* link_ = nullptr;          ///< POOL: the remote rest of the model
+    PipeRemote* pr_ = nullptr;           ///< POOL + --pipeline-windows: the remote later stage (set_pipe_remote)
+    int pr_par_ = 0;
+    bool headless_ = false;              ///< POOL worker: hand off instead of running the head
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     void stage_inputs(int T, const int32_t* tokens, int64_t pos0);
     bool staged_ = false;

@@ -1,0 +1,51 @@
+{
+ "label": "upstream-laptop-pair",
+ "run": "407194ba",
+ "url": "http://192.168.10.81:8080",
+ "at": "2026-10-06 21:53:29",
+ "sampling": {
+  "temperature": 0,
+  "presence_penalty": 1.0,
+  "penalty_last_n": 512,
+  "reasoning_effort": "none"
+ },
+ "total_s": 83.2,
+ "results": [
+  {
+   "test": "pair: code",
+   "wall_s": 41.22,
+   "prompt_tokens": 132,
+   "reused": 0,
+   "read": 132,
+   "prompt_ms": 3143.4,
+   "prompt_tok_s": 42.0,
+   "generated": 1200,
+   "decode_ms": 38008.1,
+   "decode_tok_s": 31.6,
+   "drafts": 1164,
+   "accepted": 802,
+   "finish": "length"
+  },
+  {
+   "test": "pair: prose",
+   "wall_s": 80.29,
+   "prompt_tokens": 78,
+   "reused": 0,
+   "read": 78,
+   "prompt_ms": 1466.2,
+   "prompt_tok_s": 53.2,
+   "generated": 1000,
+   "decode_ms": 37596.3,
+   "decode_tok_s": 26.6,
+   "drafts": 1063,
+   "accepted": 610,
+   "finish": "length"
+  },
+  {
+   "test": "pair: both",
+   "wall_s": 80.29,
+   "generated": 2200,
+   "decode_tok_s": 27.4
+  }
+ ]
+}

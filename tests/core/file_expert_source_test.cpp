@@ -291,6 +291,51 @@ void test_resident_lend_region() {
     require(choose_resident_keep_from({}, 0, 0, 0) == 0, "an empty cache");
 }
 
+void test_split_lend_regions() {
+    using namespace strata::core::detail;
+    // two layers, three experts; a layer-0 blob is 5 bytes and a layer-1 blob 3.  The plan under
+    // construction already holds the (0,1) expert (an expert no cache holds); stage 0's region lends
+    // (0,2) and (0,1) from its highest slots, stage 1's lends (1,2), (1,0), (1,1) in that order.
+    const std::vector<uint64_t> blobs{5, 3};
+    const std::vector<std::vector<std::pair<int32_t, int32_t>>> regions = {{{0, 2}, {0, 1}}, {{1, 2}, {1, 0}, {1, 1}}};
+    std::string err;
+    std::vector<uint64_t> offsets;
+    uint64_t bytes = 0;
+
+    // room for everything: (0,1) is already in the copy and is passed over, not counted twice
+    offsets = {kNoCacheComplement, 0, kNoCacheComplement, kNoCacheComplement, kNoCacheComplement, kNoCacheComplement};
+    bytes = 5;
+    require(append_stage_lend_regions(2, 3, blobs, offsets, bytes, 100, regions, err) == 4,
+            "both stage lend regions must be kept");
+    require(bytes == 19 &&
+                offsets == std::vector<uint64_t>{kNoCacheComplement, 0, 5, 13, 16, 10},
+            "the stage lend regions got wrong compact offsets");
+
+    // the cap is the whole copy's: the stage-0 walk fits (0,2) and stage 1 stops at the first pair that
+    // does not fit; that stage's rest stays on the file
+    offsets = {kNoCacheComplement, 0, kNoCacheComplement, kNoCacheComplement, kNoCacheComplement, kNoCacheComplement};
+    bytes = 5;
+    require(append_stage_lend_regions(2, 3, blobs, offsets, bytes, 10, regions, err) == 1, "cap 10 keeps only (0,2)");
+    require(bytes == 10 && offsets[2] == 5 && offsets[3] == kNoCacheComplement && offsets[5] == kNoCacheComplement,
+            "the walk placed experts past the cap");
+
+    // (0,2)'s 5 bytes do not fit in the 4 left: stage 0 keeps nothing, and stage 1's own walk still runs -
+    // its (1,2) fits, its (1,0) stops that stage
+    offsets = {kNoCacheComplement, 0, kNoCacheComplement, kNoCacheComplement, kNoCacheComplement, kNoCacheComplement};
+    bytes = 5;
+    require(append_stage_lend_regions(2, 3, blobs, offsets, bytes, 9, regions, err) == 1,
+            "a stage refused at the cap must not stop the next stage's walk");
+    require(bytes == 8 && offsets[2] == kNoCacheComplement && offsets[5] == 5 && offsets[3] == kNoCacheComplement,
+            "the refused stage's experts entered the copy, or the next stage's did not");
+
+    // a pair outside the geometry is an error, and the plan is left untouched: validate before appending
+    offsets = {kNoCacheComplement, 0, kNoCacheComplement, kNoCacheComplement, kNoCacheComplement, kNoCacheComplement};
+    bytes = 5;
+    require(append_stage_lend_regions(2, 3, blobs, offsets, bytes, 100, {{{0, 2}, {2, 0}}}, err) == -1 &&
+                !err.empty() && bytes == 5 && offsets[2] == kNoCacheComplement,
+            "an out-of-range lend-region pair was accepted, or a rejected walk touched the plan");
+}
+
 void test_resident_exchange() {
     using namespace strata::core;
     using namespace strata::core::detail;
@@ -344,6 +389,8 @@ void test_resident_memory_budget() {
     using strata::core::detail::clamp_resident_budget;
     constexpr uint64_t GiB = 1ull << 30, margin = 256ull << 20, headroom = 4 * GiB;
     constexpr uint64_t unlimited = std::numeric_limits<uint64_t>::max();
+    require(clamp_resident_budget(66 * GiB, 69 * GiB, unlimited, headroom) == 65 * GiB - margin,
+            "the initial allocation did not retain the RAM-only budget");
     // #730: RAM can hold the requested cache, but Windows cannot commit it.
     require(clamp_resident_budget(66 * GiB, 69 * GiB, 47 * GiB, headroom) == 43 * GiB - margin,
             "a RAM budget exceeded available commit capacity");
@@ -367,6 +414,94 @@ void test_resident_memory_budget() {
     require(clamp_resident_budget(66 * GiB, 69 * GiB, headroom + margin - 1, headroom) == 0 &&
                 clamp_resident_budget(66 * GiB, 69 * GiB, headroom + margin, headroom) == 0,
             "subtracting the clamping margin underflowed");
+}
+
+void test_resident_allocation_retry() {
+    using namespace strata::core::detail;
+    constexpr uint64_t GiB = 1ull << 30, headroom = 4 * GiB, margin = 256ull << 20;
+    int attempts = 0, probes = 0;
+    std::string err = "stale error";
+    HostMemory current;
+    current.available = 69 * GiB;
+    current.commit = 20 * GiB;
+    const auto probe = [&](HostMemory& m) { ++probes; m = current; return true; };
+
+    // A successful initial allocation may have grown the page file: do not cap or retry it.
+    require(try_resident_allocation([&](const ResidentRetry* retry, uint64_t&, std::string& reason) {
+        ++attempts;
+        require(retry == nullptr && reason.empty(), "initial attempt was constrained by a retry or stale error");
+        return true;
+    }, probe, headroom, err), "successful initial allocation was refused");
+    require(attempts == 1 && probes == 0 && err.empty(), "success read commit capacity or retried");
+
+    attempts = probes = 0;
+    require(try_resident_allocation([&](const ResidentRetry* retry, uint64_t& failed_bytes, std::string& reason) {
+        ++attempts;
+        if (retry == nullptr) {
+            require(probes == 0, "commit was read before the allocation failed");
+            current.commit = 47 * GiB;   // changed during the unsuccessful allocation
+            failed_bytes = 65 * GiB;
+            reason = "initial allocation failed";
+            return false;
+        }
+        require(failed_bytes == 0 && reason.empty(), "retry inherited failure state");
+        require(retry->memory.available == 69 * GiB && retry->memory.commit == 47 * GiB &&
+                    retry->limit == 43 * GiB - margin, "retry did not use the fresh snapshot and headroom");
+        return true;
+    }, probe, headroom, err), "smaller allocation was not retried");
+    require(attempts == 2 && probes == 1 && err.empty(), "successful retry left stale errors or read memory twice");
+
+    const auto fail_allocation = [&](const ResidentRetry* retry, uint64_t& failed_bytes, std::string& reason) {
+        ++attempts;
+        failed_bytes = retry ? retry->limit : 65 * GiB;
+        reason = retry ? "retry allocation failed" : "initial allocation failed";
+        return false;
+    };
+    attempts = probes = 0;
+    require(!try_resident_allocation(fail_allocation, probe, headroom, err), "two failed allocations succeeded");
+    require(attempts == 2 && probes == 1 && err.find("initial allocation failed") != std::string::npos &&
+                err.find("retry allocation failed") != std::string::npos, "retry was unbounded or lost an error");
+
+    attempts = probes = 0;
+    require(!try_resident_allocation([&](const ResidentRetry*, uint64_t&, std::string& reason) {
+        ++attempts;
+        reason = "file read failed";
+        return false;
+    }, probe, headroom, err), "a file-read error succeeded");
+    require(attempts == 1 && probes == 0 && err == "file read failed", "a non-allocation error triggered a retry");
+
+    attempts = probes = 0;
+    require(!try_resident_allocation(fail_allocation, [&](HostMemory&) { ++probes; return false; }, headroom, err),
+            "a failed memory probe succeeded");
+    require(attempts == 1 && probes == 1 && err == "initial allocation failed", "failed probe retried or lost the error");
+
+    // No room, only headroom/margin, or enough commit already: do not retry zero or the same size.
+    current.available = 80 * GiB;
+    for (uint64_t commit : {uint64_t{0}, headroom, headroom + margin, 70 * GiB}) {
+        current.commit = commit;
+        attempts = probes = 0;
+        require(!try_resident_allocation(fail_allocation, probe, headroom, err), "an unusable retry succeeded");
+        require(attempts == 1 && probes == 1 && err == "initial allocation failed", "zero or unchanged size was retried");
+    }
+    attempts = probes = 0;
+    require(!try_resident_allocation(fail_allocation, {}, headroom, err) && attempts == 1 && probes == 0,
+            "a platform without a commit retry attempted one");
+
+    current.commit = 47 * GiB;
+    attempts = probes = 0;
+    require(!try_resident_allocation([&](const ResidentRetry* retry, uint64_t& failed_bytes, std::string& reason) {
+        ++attempts;
+        if (retry == nullptr) {
+            failed_bytes = 65 * GiB;
+            reason = "initial allocation failed";
+        } else {
+            require(retry->limit < 45 * GiB, "retry unexpectedly fit the mandatory complement");
+            reason = "mandatory complement does not fit";
+        }
+        return false;
+    }, probe, headroom, err), "a strict complement silently became partial");
+    require(attempts == 2 && probes == 1 && err.find("mandatory complement does not fit") != std::string::npos,
+            "strict retry did not preserve its failure");
 }
 
 void test_cgroup_memory_budget() {
@@ -686,8 +821,10 @@ int main(int argc, char** argv) {
     try {
         test_complement_plan();
         test_resident_lend_region();
+        test_split_lend_regions();
         test_resident_exchange();
         test_resident_memory_budget();
+        test_resident_allocation_retry();
         test_pin_pacing();
         test_cgroup_memory_budget();
         test_host_memory();

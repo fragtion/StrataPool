@@ -1,0 +1,334 @@
+# StrataPool: several PCs as one
+
+StrataPool has two ways to use more than one PC. Pick one in the **Pool** tab, on each PC.
+
+| | **Share requests** (routing) | **Split layers** (coordinator + workers) |
+| --- | --- | --- |
+| Each PC holds | the whole model, as it would alone | only its own layers (experts, dense weights, context) |
+| One chat | as fast as one PC | often faster than the stronger PC alone (more experts cached), never the sum |
+| Two chats at once | both run at full speed, one per PC | one waits for the other |
+| What it adds | throughput, and a spare when a PC is off | room: a model, context or expert cache too big for one PC |
+| Network | only the request and the answer | every token crosses it; wired is best |
+| A PC goes away | the others carry on alone | the pool stops until it is back |
+
+**Neither adds up the PCs' compute for one chat.** Each token passes through the 48 layers in order and needs the
+token before it. Two GPUs can work on one token only by taking turns (the layer split) or by exchanging results at
+every layer, which over a network costs more time than it saves. A split can still be faster than its stronger PC
+alone, because the two GPUs together cache far more of the model's experts: on an RTX 3060 desktop + RTX 5060 Laptop
+pool, long agent prompts went from 21-33 tok/s on the desktop alone to 34-40 split (the README has the full table).
+
+## Share requests (routing mode)
+
+Every PC runs the whole model as an ordinary Strata server, with its own conversation cache. A chat request that
+reaches **any** of them runs on the PC that suits it:
+
+- **The PC that holds the conversation.** A PC keeps a chat's context (its prompt cache and parked chats), so the
+  next turn runs there and reads only the new part. Moving a chat means reading it all again on the other PC, which
+  takes minutes for a long one. The router recognises a conversation from its messages (a chain of hashes; the
+  prompt-caching markers clients move from turn to turn are ignored).
+- **If that PC is busy** and another is idle, the chat moves only when the other PC would read at most *Move a busy
+  PC's conversation* tokens again (8,000 by default, about 10 seconds of reading). A long chat waits for its own PC.
+- **A new conversation** goes to an idle PC: the **primary** first, then the PC it arrived at, then any other. When
+  every PC is busy, it joins the shortest queue.
+- **A PC whose context window is too small for the request is skipped.** Each PC keeps its own window (set in its own
+  config) and tells its own clients that number. A PC with a 192K window never gets a 230K-token chat; it can still
+  send one to a PC with a 256K window. You do not need to make the windows equal.
+- **When the other PCs cannot be reached**, each PC answers its own requests and checks for the others every few
+  seconds. A request in flight to a PC that stops answering before it starts is run on this PC instead.
+
+Switching between PCs never loses context: the API is stateless, so every request carries the whole conversation.
+The answers are the same model's. The sampling defaults (temperature, thinking budget, ...) are those of the PC that
+runs the request, so keep the configs alike; the Pool tab marks a PC whose defaults differ.
+
+Setting it up, on **each** PC: choose **Share requests**, give every PC the same **pool secret**, and add the other
+PCs' web app addresses (`192.168.1.20` or `laptop:8080`; they also appear under *Found on your network*). Turn on
+**This PC is the primary** on the PC new conversations should prefer. Apply. The model keeps running (switching
+between *Off* and *Share requests* does not restart it). Point your apps at any PC; the response header
+`X-Strata-Pool-Ran-On` names the PC that answered a routed request.
+
+The PCs prove themselves to each other with the pool secret: a routed request carries an HMAC over the time, a nonce,
+the path and the body. A routed request skips the receiving PC's own API key; nothing else does.
+
+## Split layers (coordinator + workers)
+
+The model is cut **by layers**. Each PC runs a contiguous range of the 48 layers on its own GPU, and for those layers
+it keeps:
+
+- **their experts**, in its own RAM and in its own VRAM cache, and
+- **their share of the context**: the KV cache and recurrent state of those layers for every token.
+
+So the pool holds more experts on GPUs than any one of its PCs could, and a long context is divided between them. A
+PC whose RAM could not hold the whole model can still take part: it only holds its own layers' experts.
+
+```
+ Coordinator (your main PC)              Worker (another PC)
+ ┌──────────────────────────┐            ┌──────────────────────────┐
+ │ layers 0..K-1            │  rows ──►  │ layers K..47             │
+ │ + output head, sampler   │  ◄── rows  │ its experts: RAM + VRAM  │
+ │ + draft layer (MTP)      │            │ its KV / GDN state       │
+ │ + the server you chat to │            └──────────────────────────┘
+ └──────────────────────────┘
+```
+
+The **coordinator** is the PC you chat with. It runs the first layers, the output head, the sampler and the draft
+layer (speculative decoding), and every decision of the serve loop: checkpoints, the conversation cache, sampling.
+A **worker** is a plain function of what it receives. It gets each verify window's residual rows (12,804 floats per
+token, about 300 KB for a 6-token window), runs its layers, and sends the rows back. It does the same with each prompt
+chunk. It keeps its own layers' state and checkpoints under the ids the coordinator gives it.
+
+This is pipeline parallelism, the same cut as Strata's [multi-GPU layer split](MULTI_GPU.md), with a network in
+place of pinned RAM. A token crosses the network once out and once back per verify window, not once per layer. The
+experts of one layer are never split across PCs: that would cost a network round trip at each of the 48 layers for
+every token.
+
+### What you need
+
+- Two or more PCs on the same local network, each with a supported NVIDIA card (RTX 20 or newer, 8 GB or more).
+- **The same model and size installed on every PC** (for example the Coder IQ1_M on both). Each PC reads its own
+  layers from its own copy. The coordinator refuses a worker whose model differs, and says how.
+- A wired network is best. At 1 Gbit/s a decode window adds about 3-5 ms (two crossings of ~300 KB plus latency).
+  A 6,144-token prompt chunk is ~250 MB each way in exact mode, about 2 s at 1 Gbit/s, and it overlaps with the
+  coordinator's own work. Wi-Fi works, but slower.
+- StrataPool's engine on each PC. `START-HERE.bat` compiles it the first time (10-20 minutes, once; it installs the
+  compiler and the CUDA toolkit itself): Strata's ready-made engines do not include the layer split. An engine
+  without it says so in the Pool tab. Share requests (routing) works with any engine: only the server takes part.
+
+### Setting it up
+
+1. **On every PC:** install StrataPool with the same model (`START-HERE.bat`; it finds the model files an existing
+   Strata install keeps in `Strata-data`). Then run `POOL-FIREWALL.bat` as administrator, once. It opens TCP
+   7701 (the engines), UDP 7702 (the PCs finding each other) and TCP 8080 (the app) on private networks.
+2. **On the worker PC:** open the app, go to **Pool**, choose **Worker**, and click **Apply**. The chat on that PC
+   turns off and its GPU waits for a coordinator.
+3. **On the coordinator PC:** open **Pool** and copy the **pool secret**. Paste it into the worker's Pool tab and
+   Apply there too. Every PC of a pool must have the same secret.
+4. **On the coordinator PC:** choose **Coordinator**. Add the worker: it shows up under *Found on your network*, or type
+   its address (`192.168.1.20`, or `laptop:7701`). Click **Apply**. The model restarts. The coordinator connects to
+   the worker and places the split. Both PCs then load their layers at the same time, which takes a minute or two.
+   The **Layer map** shows which PC runs which layers, and how many experts each holds in VRAM.
+
+Then chat on the coordinator, or point your apps at it, as before (`http://<coordinator>:8080/v1`).
+
+With more than one worker, the order in the Workers table is the layer order. Use the arrows to change it.
+
+## Testing it on one PC first
+
+`POOL-SELFTEST.bat` checks the whole pool path on a single PC. Close Strata first, so the GPU is free.
+The test runs the model alone. Then it runs the same model split between a coordinator and a worker on this same GPU,
+connected over `127.0.0.1`, and uses the same prompts. It prints both answers side by side, how many tokens agree,
+and the decode speed of each run.
+
+Both engines share one GPU, so each gets a small expert cache and a short context (`--cache 400 --ctx 8192` by
+default). The answers need not match token for token. A GPU-computed expert rounds slightly differently from a
+CPU-computed one, and the pair caches different experts than the single engine. The answers should still make sense
+and mostly agree.
+
+```
+POOL-SELFTEST.bat                         (or: .venv\Scripts\python tools\pool_selftest.py strata-<model>.json)
+POOL-SELFTEST.bat --split 30 --wire f16   other options: --ctx, --cache, --chunk, --max-new, --skip-single
+```
+
+## Settings (Pool tab)
+
+| Setting | What it does |
+| --- | --- |
+| **Role** | *Off*: this PC runs the model alone, as Strata. *Share requests*: routing mode (above). *Split: coordinator*: it uses the workers listed. *Split: worker*: it lends its GPU and RAM to a coordinator. |
+| **Pool secret** | Proves to a worker that a coordinator belongs to the pool, and the other way round (HMAC-SHA256 challenge, both ways). The secret itself never crosses the network. |
+| **Worker port** | The TCP port a worker's engine listens on (7701). |
+| **Split** | *Automatic* (the default) weighs each PC's free VRAM after its dense weights, its free RAM for its layers' experts, and its GPU's speed. It uses the same cost model as the multi-GPU split, plus a network hop per PC. *Manual*: the first layer of each worker, e.g. `30`, or `16,32` for two workers. The coordinator keeps at least layers 0 and 1. |
+| **Network precision** | *Exact* (f32) sends 32-bit rows, so the answers match one PC's exactly. *f16* / *bf16* halve the bytes on a slow network, with a small rounding difference. The last worker's prompt rows feed only the draft layer, so they always travel as f16. Drafts are only guesses that the model checks, so this never changes the output. |
+
+The settings live in `strata-<model>.pool.json` next to the model's config. The role is kept between starts.
+`run-<model>.bat --role off` (or `coordinator` / `worker`) overrides it for one start.
+
+## What each PC holds
+
+Each PC loads only its own layers: their experts in RAM, their dense weights and their part of the expert cache in
+VRAM, and their part of the context (KV and state). A worker leaves out the embeddings and the output head, and the
+coordinator leaves out the workers' layers. So the VRAM that the other layers' dense weights would take goes to
+experts instead, and the pool as a whole caches more of them than any one PC.
+
+With `--kv-resident` (KV streaming) each PC also keeps a full copy of its layers' K/V in pinned RAM, one per session:
+the main one, plus one per chat slot when **Several chats at once** is on. The automatic split counts those copies
+next to the experts when it checks a PC's RAM. On Windows it also keeps a PC's experts and K/V copies under about half
+its RAM, less 2 GiB, because that is roughly what Windows lets a program pin (a 32 GB laptop failed at about 14 GiB
+and ran at 12.7). Set `STRATA_POOL_PIN_GIB=<n>` in a PC's config `env` to give its own limit, or `=0` for none.
+
+### Parked conversations
+
+With `--conversation-cache-mib` in the coordinator's config (setup suggests it when there is RAM to spare), a split
+parks a conversation it switches away from, as one PC does: an agent's subtasks, a second client, or a title request
+no longer make the main conversation read again everything after the part they share (usually the system prompt) when
+it comes back. Each PC keeps its own part in its own RAM: the coordinator its layers and the draft layer, under the
+budget and slot count of its config; each worker its layers, as long as that leaves
+`--conversation-cache-min-free-mib` (default 2,560 MiB) of its RAM free. A worker that cannot park its part says so in
+the coordinator's log (`skip parking`), and that conversation is read again when it comes back, as before. A new
+conversation that starts like a parked one (a sibling subagent with the same system prompt and tools) borrows that
+start on every PC and leaves the parked one in place (Strata PR #1164). The worker's log shows each park, restore and
+borrow, and how much it holds. Every PC must run an engine with this (an older worker turns it off, with a note in the
+coordinator's log).
+
+### Reading short prompts
+
+With CPU assist (from architectds' fork, on by default; `STRATA_PREFILL_CPU=0` in a PC's config `env` turns it off),
+each PC's CPU pool computes part of a short prompt chunk's least-routed experts from RAM while its GPU copies in the
+rest. Every PC does this for its own layers, since no other stage shares its CPU. It is not bitwise: the CPU's
+arithmetic differs from the GPU's by about 1-2% per expert (architectds measured the next token's top choice unchanged
+over 60 prompts). On the RTX 3060 desktop it read ~560-token prompts 11% faster (394 / 387 against 349 / 353 tok/s).
+architectds also staged chunks up to 3,072 tokens for it, which paid on a PCIe 3.0 card; on the desktop's PCIe 4.0 x16
+that made 2-3K-token prompts 5-8% slower, so it is opt-in here: `STRATA_PREFILL_CPU_STAGE=3072`.
+
+## The split learns from its timings
+
+After each request the coordinator's log splits a decode window into its parts:
+
+```
+strata pool: <N> windows, <W> ms each = this PC <C> ms + the workers' layers <L> ms + the network <X> ms ...
+strata pool:   this PC: its layers <A> ms + the head, sampling and the drafter <B> ms
+```
+
+The head, the sampling and the draft layer always run on the coordinator, so no split moves that part. The
+coordinator compares each PC's measured layer time with what the built-in estimate predicted for that PC's layers,
+and keeps the ratio per pool in `pool-split-measured.txt`, in the engine's folder. One line per pool: the model, the
+context, the KV format, the window, and the PCs' names. After 200 windows, the next **automatic** split predicts with
+the measured numbers instead of the estimate. One split's numbers cannot tell a PC's own layer time from what its
+cache misses cost, so the search moves at most 3 layers from a split it measured; each split it tries is measured in
+turn. It moves workers that still hold their layers only when the measured numbers say the new split is at least 5%
+faster (they reload once, a minute or two). If a worker cannot load a split the measured numbers chose (it ran
+out of memory on the way), the file notes it (`failed=`), and later automatic splits give that worker less than it
+had there. Delete the file to
+start again from the estimate, or set `STRATA_POOL_CALIB=0` in the config's `env` to turn it off
+(`STRATA_POOL_CALIB=<file>` keeps it elsewhere).
+
+## What each PC's expert cache learns
+
+With `"expert_profile_save"` in the model's config, each PC saves which experts its requests used, so the next
+start fills the cache with them (Strata #477). In a pool, a PC sees only its own layers, so it re-ranks only those
+layers' experts and keeps the order it started with for every other layer. The saved file is still a ranking for the
+whole model: the same PC can start alone, share requests, or take another split without a lopsided cache. A worker
+saves between requests (every `expert_profile_save_every` minutes, 10 by default) and when its coordinator leaves.
+
+## Several chats at once in a split
+
+**Several chats at once** in the Pool tab (coordinator, off by default) gives the split one batch slot per PC
+(Strata's `--batch`, docs/BATCHING.md; fewer when they do not fit). More would only share the same speed among more
+chats: with two PCs, two chats already keep both busy. A chat alone still runs as before, with drafts. When a second one arrives, both continue
+in slots: one word per step each, without drafts, and the steps are pipelined across the PCs. While the laptop runs
+chat A's layers, the desktop runs chat B's, so neither PC waits for the other.
+
+Measured on the desktop (RTX 3060) + laptop (RTX 5060 Laptop) pool (October 2026, the README's table): two chats
+at once wrote 36-39 words/s together, against 44 for the same two chats one after the other, and a chat alone ran
+35-39 instead of 44. On that pool it is a loss; it can pay where one PC's step is much shorter than the window (a
+fast worker, or more PCs).
+
+What it costs:
+
+- Every slot has its own state on every PC (its layers' KV and recurrent state), in VRAM the expert cache would
+  otherwise use, so a chat alone runs a little slower than with one slot. With KV streaming (`--kv-resident`) each
+  slot's whole context also takes pinned RAM.
+- Each chat in a slot keeps its own repetition penalties: the head runs on the coordinator, which keeps every
+  slot's recent tokens and applies them to that slot's rows. (One PC's batch windows still apply none.)
+- The PCs' slot counts must match: the coordinator uses as many as every worker could carve.
+- Leave it off if you run one chat at a time: the slots then cost speed and memory for nothing.
+- For two chats at once, *Share requests* runs each at one PC's full speed (each PC holds the whole model). The
+  split's slots suit a pool that only works as a split (a model too big for one PC, or one fast PC with a slower
+  helper).
+
+## Overlap the PCs (one chat)
+
+**Overlap the PCs** in the Pool tab (coordinator; Strata's `--pipeline-windows 2`) lets the coordinator start the next
+decode window on a guess while the workers still run the current one. The draft layer guesses that the current window
+is accepted whole and what its next word is; when the verdict says otherwise, the coordinator puts its layers' state
+back and runs the right window. The workers only ever get verified windows, in order, so nothing changes on them (a
+worker started with an older engine works too). It helps most when the workers' part and the network are a large share
+of a window and the drafts are usually right. Upstream measured +14-16% on two GPUs in one PC; on the desktop + laptop
+pool it was about 6% slower (41-42 against 44 tok/s, 41 against 38 ms a window: 1,907 of 1,908 windows ran overlapped,
+but too many guessed windows were thrown away). It needs the draft layer and is off while several chats run (the log
+says so). Requests with repetition penalties (`penalty_last_n`) overlap too: the head on the coordinator sees each
+window after the one before it. Since that measurement the coordinator serves the verified window's layers before a
+guessed one's (a guessed window one layer at a time while the workers run the verified one), guesses more often (the
+gate went from 0.20 to 0.10), and keeps copying from the prompt lookup across windows when the text repeats an earlier
+stretch (all three from architectds' fork, which measured +8.9% on a two-GPU PC). Measured on the same pool with
+tools/pool_bench.py (greedy, 2026-10-06), against the defaults: code 55.4 against 51.3 tok/s (+8%), prose 50.5 against
+52.2 (-3%), the answer to a 9.8K-token document 50.1 against 48.8 (+3%). Keep it on if your replies are mostly code;
+compare on your own PCs.
+
+## Drafts in several chats
+
+**Drafts in several chats** (shown when Several chats at once is on; Strata's `--batch-mtp`) gives each chat's window
+its draft too: a window then holds two rows per chat, and the head keeps the draft where it agrees, so a chat can get two
+words a window. The PCs then run one window over every chat (the coordinator's layers, then the workers', then the head
+here) and commit after the verdict, instead of the chats taking turns on the PCs. On the desktop + laptop pool it was no
+faster: about 33 words/s for two chats together, against 36-39 without the drafts.
+
+## Which PCs make good workers
+
+The pool runs its layers one after the other, so a token waits for every PC's part in turn. A worker helps when its
+layers run about as fast as the coordinator's would, and when its RAM and VRAM let the pool cache experts that would
+otherwise miss. A much slower GPU adds its slowness to every token, and the network adds about 1.5 ms each way.
+
+For example, a GTX 1050 (4 GB, Pascal) takes around 10 ms per layer, where an RTX 3060 takes about 1.5 ms. Even one
+layer on it costs more time than the experts it could cache save. Its prompt processing is slow as well, because
+Pascal has no tensor cores. So the engine is built for Turing (RTX 20xx) and newer, and a GPU like that is better left
+out of the pool. The automatic split would give it as few layers as it can.
+
+## When a worker stops, or you change something
+
+- A worker that loses its coordinator **keeps its layers loaded**. When the coordinator comes back with the same
+  settings (it restarted, or it was unloaded while idle), the worker continues at once. If the coordinator asks for
+  other layers, the worker restarts to load them and the coordinator waits for it.
+- If the coordinator cannot reach a worker, the Pool tab says why: not reachable, a different model, a different
+  secret, or busy with another coordinator. **Restart engine** tries again.
+- If a worker fails during a request, the request ends with an error and the next request starts the pool again.
+
+## What is not supported yet
+
+- **Images** (vision), the **experimental speed projection** (control vectors) and the **low-RAM modes**. The Pool tab
+  says when your setup has one of them on.
+- **Several GPUs in one pool PC.** Each pool PC uses one GPU, and the pool is the split.
+- From Strata 0.1.40: **`--kv-grow`** (the elastic K/V; off with a note - it also needs the whole K/V in VRAM, which a
+  long context with `--kv-resident` does not have) and **session files** (`/slots/0?action=save|restore` answers that
+  a pool does not support them yet: the other PCs hold their layers' part of the conversation).
+
+## Engine flags
+
+`run-<model>.bat` gets these from the Pool tab, so you do not normally type them.
+
+```
+--pool-peers H:P[,H:P..]     coordinator: the workers, in layer order (default port 7701)
+--pool-split auto|K1[,K2..]  where each worker's layers start
+--pool-listen [H:]P          worker: wait for a coordinator here
+--pool-secret S              the shared secret (also STRATA_POOL_SECRET; the app passes it in the environment)
+--pool-wire f32|f16|bf16     the rows on the network (f32: exact, the default)
+--pool-draft-wire F          the last worker's prompt rows (default f16; they feed only the draft layer)
+--pool-timeout-s S           a worker's reply (default 300)
+--pool-wait-s S              connecting to and loading the workers at start (default 900)
+```
+
+## How it is built
+
+| Part | Where |
+| --- | --- |
+| Frames, control messages, row codecs (f32/f16/bf16) | `include/strata/pool/protocol.hpp`, `src/pool/protocol.cpp` |
+| Sockets, SHA-256 / HMAC handshake | `include/strata/pool/net.hpp`, `src/pool/net.cpp` |
+| The worker's handshake and its "busy" answer | `src/pool/worker.cpp` |
+| The split search | `src/pool/split.cpp` |
+| The coordinator's link: workers, the head, prompt rows | `src/pool/link.cpp` |
+| The verifier's and prompt path's hand-off to the network | `Verifier::set_link` / `set_headless`, `Prefill::remote_next` / `set_headless` |
+| Each node's experts in RAM for its range only | `ArenaExpertSource::set_layer_range` |
+| The worker's serve loop, and the coordinator's hooks | `src/program/generate.cpp` (search for `POOL`) |
+| The server's side: roles, the worker supervisor, discovery | `serve/pool.py`; the Pool tab: `serve/web/pool.js` |
+
+Tests (no GPU needed): `strata-pool-test` covers hashing, the wire formats, frames, the handshake and the split
+search. `strata-pool-link-test` runs the coordinator against scripted workers: the secret, the model check,
+reloading, busy workers, prompt rows through two workers, and the lazily acknowledged commits.
+`python -m unittest serve.test_pool` covers the config, the supervisor, discovery, and switching a running server
+between roles.
+
+The protocol in one paragraph: one TCP connection per worker. The worker sends `HELLO` (its model, its GPU, its free
+VRAM and RAM, and a nonce). The coordinator answers `AUTH` (an HMAC of the nonce under the secret, plus its own nonce),
+and the worker answers `AUTH_OK` the same way. Then `CONFIG` gives the worker its layer range and the settings that
+must match (context, KV format, window size, rope), and the worker loads and answers `READY`. After that each request
+gets exactly one reply, in order: `VERIFY` gets `VERIFY_ROWS`, and `PREFILL` gets `PREFILL_ROWS`. `COMMIT`, `RESET`,
+`CKPT_SAVE`, `CKPT_RETAIN` and `END_REQUEST` are acknowledged lazily. The coordinator reads those acknowledgements
+before its next request, so a commit costs no round trip of its own.

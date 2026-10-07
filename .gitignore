@@ -61,3 +61,8 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
+
+# StrataPool: the split's measured timings (written by the engine)
+pool-split-measured.txt
+pool-split-measured.txt.tmp
+bench-results/

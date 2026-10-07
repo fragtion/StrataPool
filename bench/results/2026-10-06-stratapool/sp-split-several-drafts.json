@@ -1,0 +1,81 @@
+{
+ "label": "sp-split-several-drafts",
+ "run": "8f6e8956",
+ "url": "http://127.0.0.1:8080",
+ "at": "2026-10-06 22:31:04",
+ "sampling": {
+  "temperature": 0,
+  "presence_penalty": 1.0,
+  "penalty_last_n": 512,
+  "reasoning_effort": "none"
+ },
+ "total_s": 99.4,
+ "results": [
+  {
+   "test": "code",
+   "wall_s": 23.82,
+   "prompt_tokens": 112,
+   "reused": 0,
+   "read": 112,
+   "prompt_ms": 1077.5,
+   "prompt_tok_s": 103.9,
+   "generated": 1200,
+   "decode_ms": 22723.1,
+   "decode_tok_s": 52.8,
+   "drafts": 918,
+   "accepted": 808,
+   "finish": "length"
+  },
+  {
+   "test": "prose",
+   "wall_s": 23.26,
+   "prompt_tokens": 76,
+   "reused": 0,
+   "read": 76,
+   "prompt_ms": 810.4,
+   "prompt_tok_s": 93.8,
+   "generated": 1000,
+   "decode_ms": 22431.8,
+   "decode_tok_s": 44.6,
+   "drafts": 644,
+   "accepted": 503,
+   "finish": "length"
+  },
+  {
+   "test": "pair: prose",
+   "wall_s": 48.46,
+   "prompt_tokens": 79,
+   "reused": 79,
+   "read": 0,
+   "prompt_ms": 0.1,
+   "prompt_tok_s": null,
+   "generated": 1000,
+   "decode_ms": 47471.2,
+   "decode_tok_s": 21.0,
+   "drafts": 0,
+   "accepted": 0,
+   "finish": "length"
+  },
+  {
+   "test": "pair: code",
+   "wall_s": 51.21,
+   "prompt_tokens": 133,
+   "reused": 1207,
+   "read": 0,
+   "prompt_ms": 108.3,
+   "prompt_tok_s": null,
+   "generated": 1200,
+   "decode_ms": 2531.5,
+   "decode_tok_s": 49.4,
+   "drafts": 93,
+   "accepted": 89,
+   "finish": "length"
+  },
+  {
+   "test": "pair: both",
+   "wall_s": 51.22,
+   "generated": 2200,
+   "decode_tok_s": 43.0
+  }
+ ]
+}

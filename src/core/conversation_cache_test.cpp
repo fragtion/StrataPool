@@ -59,6 +59,42 @@ int main() {
         check(segments <= 4,"thousands of small turns do not create thousands of restore transfers");
     }
     {
+        // a parked conversation's K/V buffer (16 MiB, as captured) grows by one turn: the reserve for later turns is
+        // an eighth of the buffer at most, not another 16 MiB segment
+        ConversationBuffer bytes;
+        bytes.resize(ConversationBuffer::segment_bytes, 3);
+        const size_t captured = bytes.bytes();
+        check(captured - bytes.size() < 1024, "a fresh capture reserves nothing");
+        const size_t turn = 1 << 20;
+        const size_t peak = bytes.allocation_peak(bytes.size() + turn);
+        bytes.resize(bytes.size() + turn, 4);
+        check(bytes.bytes() <= peak, "a turn's growth stays within the predicted allocation peak");
+        check(bytes.bytes() - captured <= turn + ConversationBuffer::segment_bytes / 8 + 1024,
+              "the reserve for later turns is at most an eighth of the buffer");
+        const size_t reserved = bytes.bytes();
+        bytes.resize(bytes.size() + turn / 2, 5);
+        check(bytes.bytes() == reserved, "the next small turn fills the reserve instead of allocating");
+        size_t segments = 0;
+        bytes.visit(0, bytes.size(), [&](const uint8_t*, size_t, size_t) { ++segments; return true; });
+        check(segments == 2, "the reserve extends the turn's segment");
+    }
+    {
+        // many turns of 1 MiB onto a 16 MiB buffer: the reserve grows with the buffer, so the segments do not
+        // multiply one per turn, and the reserve never exceeds an eighth of the buffer
+        ConversationBuffer bytes;
+        bytes.resize(ConversationBuffer::segment_bytes, 1);
+        for (int k = 0; k < 256; ++k) {
+            const size_t before = bytes.size();
+            const size_t peak = bytes.allocation_peak(before + (1 << 20));
+            bytes.resize(before + (1 << 20), 2);
+            check(bytes.bytes() <= peak, "each turn stays within the predicted allocation peak");
+            check(bytes.bytes() - bytes.size() <= before / 8 + 4096, "the reserve stays within an eighth");
+        }
+        size_t segments = 0;
+        bytes.visit(0, bytes.size(), [&](const uint8_t*, size_t, size_t) { ++segments; return true; });
+        check(segments <= 64, "256 turns of 1 MiB take far fewer than 256 segments");
+    }
+    {
         ConversationKv layer;
         layer.k.resize(400);
         std::vector<ConversationKv> layers;
@@ -203,6 +239,69 @@ int main() {
         huge.live.gdn.resize(2 << 20);
         check(!cache.put(std::move(huge)) && cache.size() == 5 && cache.superseded() == 1,
               "an oversized put drops nothing");
+    }
+    {
+        // borrowing: a NEW conversation that starts with a checkpoint inside a parked one (a sibling subagent with
+        // the same system prompt and tools) restores from it and leaves it parked; the same conversation going on
+        // (its live state, or its deepest checkpoint after the client re-rendered the last reply) is still taken
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        SavedConversation a = image({});
+        a.live.ids = {1, 2, 3, 4, 10, 11, 12, 13};
+        a.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10, 11})};
+        ConversationCache cache(1 << 20, 2);
+        check(cache.put(std::move(a)), "park subagent A");
+        const auto sib = cache.best(std::vector<int64_t>{1, 2, 3, 4, 20, 21}, {}, true);
+        check(sib.tokens == 4 && !sib.live && sib.serial != 0 && cache.borrows(sib), "a sibling on A's root borrows");
+        const auto again = cache.best(std::vector<int64_t>{1, 2, 3, 4, 10, 11, 30}, {}, true);
+        check(again.tokens == 6 && !again.live && !cache.borrows(again),
+              "A re-rendered at its deepest checkpoint is taken");
+        const auto cont = cache.best(std::vector<int64_t>{1, 2, 3, 4, 10, 11, 12, 13, 14}, {}, true);
+        check(cont.live && !cache.borrows(cont), "A going on is taken");
+        check(!cache.borrows(cache.best(std::vector<int64_t>{5, 6, 7}, {}, true)), "no match, nothing to borrow");
+        // while the outgoing conversations are parked, the pinned donor is neither evicted nor dropped
+        cache.pin(sib.serial);
+        check(cache.put(image({7, 7, 7})) && cache.put(image({8, 8, 8})), "two outgoing conversations park");
+        check(cache.find(sib.serial) != nullptr && cache.size() == 2 && cache.evictions() == 1 && !cache.pin_blocked(),
+              "the slot limit evicts the other entry, not the pinned donor");
+        check(cache.best(std::vector<int64_t>{7, 7, 7, 1}, {}, true).tokens == 0, "the unpinned one went");
+        SavedConversation rewritten = image({1, 2, 3, 4, 10, 11, 40});   // holds A's deepest checkpoint: supersedes A
+        rewritten.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10, 11})};
+        check(cache.put(std::move(rewritten)) && cache.find(sib.serial) != nullptr && cache.superseded() == 0,
+              "a pinned donor is not dropped as superseded");
+        cache.unpin();
+        // identity survives index shifts: take an older entry, the donor's serial still finds it
+        const auto donor_index = cache.index_of(sib.serial);
+        check(donor_index != SIZE_MAX, "donor indexed by its serial");
+        check(cache.best(std::vector<int64_t>{1, 2, 3, 4, 10, 11, 12, 13, 14}, {}, true).serial == sib.serial,
+              "matches report the entry's serial");
+    }
+    {
+        // the outgoing conversation fits only in the pinned donor's room: make_room refuses before evicting anything
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        SavedConversation a = image({1, 2, 3, 4, 10, 11});
+        a.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10})};
+        const size_t a_bytes = a.bytes();
+        const size_t out_bytes = image({9, 9, 9}).bytes();
+        ConversationCache tight(a_bytes + out_bytes - 1, 4);
+        check(tight.put(std::move(a)), "park the donor");
+        const auto m = tight.best(std::vector<int64_t>{1, 2, 3, 4, 50}, {}, true);
+        check(tight.borrows(m), "a sibling would borrow");
+        tight.pin(m.serial);
+        check(!tight.put(image({9, 9, 9})) && tight.pin_blocked(), "no room beside the pinned donor: refused");
+        check(tight.size() == 1 && tight.evictions() == 0, "nothing evicted by the refusal");
+        tight.unpin();
+        auto taken = tight.take(tight.index_of(m.serial));   // what the caller does then: take it, as before
+        check(taken.live.ids.size() == 6 && taken.checkpoints.size() == 2 && tight.size() == 0,
+              "the taken donor is whole");
+        ConversationCache one_slot(1 << 20, 1);
+        SavedConversation b = image({1, 2, 3, 4, 10, 11});
+        b.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10})};
+        check(one_slot.put(std::move(b)), "park in a single slot");
+        const auto mb = one_slot.best(std::vector<int64_t>{1, 2, 3, 4, 50}, {}, true);
+        one_slot.pin(mb.serial);
+        check(!one_slot.put(image({9, 9, 9})) && one_slot.pin_blocked() && one_slot.size() == 1,
+              "one slot: the pinned donor blocks, nothing evicted");
+        one_slot.unpin();
     }
     {
         ConversationCache disabled(0,4), no_slots(1024,0);
