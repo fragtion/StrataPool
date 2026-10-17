@@ -34,6 +34,7 @@
 #include <cstddef>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -88,9 +89,19 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/me
                            const std::string& cgroup_root = "/sys/fs/cgroup");
 
 /// Bound a resident budget by RAM and commit capacity after headroom; leave 256 MiB more when clamping.
-/// Pass UINT64_MAX for commit when the platform does not report it.
+/// Pass UINT64_MAX for the initial RAM-only attempt or when the platform does not report commit capacity.
 uint64_t clamp_resident_budget(uint64_t requested, uint64_t physical, uint64_t commit, uint64_t headroom);
 
+struct ResidentRetry {
+    HostMemory memory;
+    uint64_t limit = 0;
+};
+
+/// The first attempt uses RAM alone. Only a host allocation failure (failed_bytes > 0) permits one smaller retry.
+/// An empty memory probe disables retries. Callbacks allow failure and page-file growth tests without large allocations.
+using ResidentAttempt = std::function<bool(const ResidentRetry*, uint64_t& failed_bytes, std::string& err)>;
+bool try_resident_allocation(const ResidentAttempt& attempt, const std::function<bool(HostMemory&)>& read_memory,
+                             uint64_t headroom, std::string& err);
 /// #1250: one cudaHostAlloc of the whole page-locked complement has no way back when the kernel does not give the
 /// pages as fast as the driver takes them (the process is OOM-killed, even with MemAvailable high: clean file cache
 /// that cannot be reclaimed at that moment).  `free_now` is MemFree (pages that are really free), `bytes` the
@@ -673,7 +684,8 @@ public:
     /// CS-T, `budget_bytes` > 0 (`--resident-budget-gib`): only as many of those experts as fit `budget_bytes`, taken
     /// in `rank` order (the expert profile: the hottest after the GPU cache's), are copied; the rest stay on the
     /// mapped files (the SSD tier).  No lend region then (a lent slot's expert is read from the files).
-    /// Available memory is limited by both RAM and commit capacity on Windows.
+    /// The first attempt uses available RAM. After host allocation failure, Windows retries once with a smaller
+    /// budget limited by a fresh RAM/commit snapshot. A strict whole complement must still fit; only lending shrinks.
     /// #467: `budget_bytes` = `kResidentWhatFits` sizes that path from available memory minus headroom and the #403
     /// margin - the soft --resident-experts mode's second try when the whole complement does not fit;
     /// false when not even one expert fits.  On Windows the mapped experts leave the working set before any reading.
@@ -878,6 +890,11 @@ public:
     IoCounters io_counters() const;
 
 private:
+    bool pin_cache_complement_attempt(
+        const ExpertCache& cache, std::string& err, bool pin,
+        const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
+        uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank,
+        const detail::ResidentRetry* retry, uint64_t& failed_bytes);
     const uint8_t* resident_blob(size_t index) const;
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
@@ -1062,6 +1079,12 @@ public:
     /// Plan v0.3 P6: a native pack without experts.bin takes its experts from the model's GGUF: `native` is the
     /// --native shard, and native_experts.txt names the other shards beside it (per layer, or per role in v4).
     void set_gguf(const std::string& native) { gguf_ = native; }
+    /// POOL: load only the experts of layers [lb, le) - a pool node holds its own range in RAM, which is what
+    /// lets PCs whose RAM could not hold the whole model run it together.  `blob` of any other layer is null (nothing
+    /// asks: the node's pool, cache and prompt path only touch its own layers).  Set before `open`.
+    void set_layer_range(int64_t lb, int64_t le) { range_lb_ = lb; range_le_ = le; }
+    /// the bytes actually held in RAM (the range's, or the whole layout's)
+    uint64_t held_bytes() const { return held_bytes_; }
     void close();
 
     bool mapped() const { return base_ != nullptr; }
@@ -1139,6 +1162,9 @@ private:
     /// index of the registered range holding [off, off + len), or -1
     int64_t pin_range_of(uint64_t off, uint64_t len) const;
     std::string gguf_;
+    int64_t range_lb_ = 0, range_le_ = -1;   ///< POOL: the layers held (-1: to the last)
+    uint64_t range_off_ = 0;                 ///< the layout offset of layer range_lb_ (base_ is biased by it)
+    uint64_t held_bytes_ = 0;
 };
 
 /// Plan v0.3 P6: checks native_experts.txt's GGUF spans against the files, before anything is read: each layer's
@@ -1147,10 +1173,11 @@ private:
 bool check_experts_gguf(const std::string& native, const strata::kernels::cpu::ExpertLayout& lay, std::string& err);
 /// Fills `dst` (lay.total bytes, the experts.bin layout) from the GGUF files, one role at a time.
 /// `unbuffered`: each chunk read past the file cache (Windows); `ready`: layer l is written only once
-/// *ready > l + 1 (an arena that is still being registered).
-/// `pad` (optional): the destination is the page-aligned padded layout (pin by need), see PadMap.
+/// *ready > l + 1 (an arena that is still being registered).  POOL: only the layers [lb, le) (le < 0: to the end);
+/// `dst` is still addressed as the whole layout (a range-sized arena hands its base biased back by the range's start).
+/// `pad` (optional): the destination is the page-aligned padded layout (pin by need), see PadMap; whole layout only.
 LoadStats load_experts_gguf(const std::string& native, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
                             int threads, bool unbuffered = false, const std::atomic<int>* ready = nullptr,
-                            const PadMap* pad = nullptr);
+                            int64_t lb = 0, int64_t le = -1, const PadMap* pad = nullptr);
 
 }  // namespace strata::core

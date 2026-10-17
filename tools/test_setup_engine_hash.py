@@ -71,6 +71,7 @@ class WhereTheHashComesFrom(unittest.TestCase):
         for base in (LOCAL_BASE, "https://mirror.invalid/dl/", "/mnt/mirror", "\\\\share\\engine"):
             self.assertIsNone(setup.release_of(base), base)
 
+    @unittest.skipIf(not setup.PREBUILT_URL, "StrataPool ships no ready-made engine (it compiles its own)")
     def test_a_local_folder_is_local_and_a_remote_mirror_is_not(self):
         # The distinction the policy turns on: nothing is between a local file and setup; a remote mirror
         # has a network in the middle and still no release to check against.
@@ -306,6 +307,7 @@ class WhatARefusalDoesToTheCaller(unittest.TestCase):
         with contextlib_redirect(out),                 mock.patch.object(setup, "download", self.fake_download),                 mock.patch.object(setup, "engine_digest", return_value=digest):
             return setup.get_prebuilt(setup.PREBUILT_URL, {"arch": 89}, "gpu", updating=updating), out
 
+    @unittest.skipIf(not setup.PREBUILT_URL, "StrataPool ships no ready-made engine (it compiles its own)")
     def test_updating_keeps_the_installed_engine_instead_of_stopping(self):
         # The call site's own words: "a failed download must not stop the model from starting".
         for digest in ((999, "f" * 64), (1, "0" * 64)):
@@ -322,6 +324,7 @@ class WhatARefusalDoesToTheCaller(unittest.TestCase):
         eng, _ = self.get_prebuilt(updating=True, digest=(999, "f" * 64))
         self.assertIsNone(eng, "a refusal must not escape get_prebuilt as SystemExit")
 
+    @unittest.skipIf(not setup.PREBUILT_URL, "StrataPool ships no ready-made engine (it compiles its own)")
     def test_a_first_install_stops_because_there_is_nothing_to_fall_back_to(self):
         with mock.patch.object(setup, "download", self.fake_download),                 mock.patch.object(setup, "engine_digest", return_value=(999, "f" * 64)):
             with self.assertRaises(SystemExit):

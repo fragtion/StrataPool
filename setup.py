@@ -172,12 +172,14 @@ LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMI
 # "https://github.com/<you>/Strata/releases/latest/download/" (or pass --prebuilt / set STRATA_PREBUILT_URL).
 # With the default, the release of this checkout's own version (PREBUILT_TAG_URL, CMakeLists.txt's version) is
 # tried first and the latest release is the fallback (#214): an older checkout keeps the engine it shipped with.
-PREBUILT_URL = "https://github.com/Niko1221/Strata/releases/latest/download/"
-# The repository the release assets and their SHA-256 come from; `engine_digest` reads the API here even
-# when --prebuilt points the download somewhere else, because the hash is only worth having if it comes
-# from somewhere the download does not.
-REPO = "Niko1221/Strata"
-PREBUILT_TAG_URL = "https://github.com/Niko1221/Strata/releases/download/v{version}/"
+# STRATAPOOL: Strata's ready-made engines have no layer split (the Pool tab's Split mode), so StrataPool compiles its
+# engine (once, 10-20 minutes; setup installs the compiler and the CUDA toolkit itself).  --prebuilt URL still works
+# for a StrataPool build published somewhere.
+PREBUILT_URL = ""
+# The repository the release assets and their SHA-256 come from (`engine_digest`); StrataPool publishes no engine, so
+# a --prebuilt download finds no digest there and is installed with a warning (STRATA_SKIP_SHA256=1 skips the check).
+REPO = "fragtion/StrataPool"
+PREBUILT_TAG_URL = ""
 PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
@@ -2151,7 +2153,7 @@ GFX1103_SWITCHES = {
 # same greedy answers with all 17 on and with all 17 off, decode +2% and prompts +3-6%.  The engine's arch defaults are not used
 # for gfx1150 (src/core/arch_defaults_test.cpp asserts gfx1150 stays empty), so this keeps the default path byte-identical.
 GFX1150_SWITCHES = dict(GFX1103_SWITCHES)
-AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs has no product name
+AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series / PRO W7900 / W7800 (gfx1100)",   # when sysfs has no product name
              "gfx1101": "AMD Radeon RX 7800 XT / 7700 XT (gfx1101)",
              "gfx1102": "AMD Radeon RX 7600 / 7600 XT (gfx1102)",
              "gfx1200": "AMD Radeon RX 9060 series (gfx1200)",
@@ -3282,6 +3284,9 @@ def build_image_engine(backend: str, gpu: dict) -> tuple[Path, list[str]]:
     say(f"  Compiling the image generator (stable-diffusion.cpp {QI.SD_CPP_COMMIT[:7]}, {backend}; 5-20 minutes, "
         "once) ...")
     bdir = ROOT / f"build-image-{backend}"
+    if WIN:   # CMake's compiler probe uses the Debug flags (/Zi /RTC1), which some process monitors refuse (D8050)
+        defs += ["-DCMAKE_C_FLAGS_DEBUG=-MDd", "-DCMAKE_CXX_FLAGS_DEBUG=-MDd"] + \
+            (["-DCMAKE_CUDA_FLAGS_DEBUG=-Xcompiler=-MDd"] if backend == "cuda" else [])
     cmake_build(src, bdir, "sd-cli", defs, vcvars, f"build-image-{backend}.bat" if WIN else "")
     built = bdir / "bin" / QI.SD_EXE
     if not built.exists():
@@ -3599,6 +3604,9 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
         meta = json.loads(info.read_text(encoding="utf-8"))
         ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit())
         if meta.get("source") == "local":              # compiled here: build_engine checks its source and cards
+            return None
+        if b"--pool-listen" not in (eng / EXE).read_bytes():   # STRATAPOOL: a plain Strata engine (no layer split)
+            warn("the engine in engine/ is a plain Strata build without the pool's layer split: compiling StrataPool's")
             return None
         have = [int(a) for a in meta.get("archs", [])]
         miss = [int(x) for x in gpu.get("archs", [gpu["arch"]])

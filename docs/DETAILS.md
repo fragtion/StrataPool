@@ -283,11 +283,23 @@ the staging variant is worth trying only on a 32 GB-class box. **iGPU caveat:** 
 adaptive tier (`--adapt-every`, on by default) under memory pressure reset the GPU in about 7 of 9 runs (the engine
 prints a warning and runs as asked); with `--adapt-every 100000` there were no resets in ~40 runs. The cause is not found.
 
+**IQ1_S experts:** Unsloth's UD-IQ1_S keeps the routed gate/up experts in IQ1_S (GGML type 19, 1.5625 bpw, 50 bytes per
+256-value block), which earlier engines could not run on the GPU: the dequantizer, the MMVQ dot and the grouped expert
+kernels now cover it (`src/kernels/cuda/iq_kernels.cu`), and so does the AVX-2 multi-token kernel for AVX2 CPUs
+(`src/kernels/cpu/iq_avx2.cpp`, IQ1_S and IQ1_M both). `iq_parity` measures 0.00e+00 dequant relative error against
+gguf-py; `iq_multi_parity` and `native_grouped_parity` are bitwise equal to the per-column and v1 kernels. Its down
+experts are IQ4_NL and its PLE table `per_layer_token_embd.weight` (IQ4_NL) is read by the n-gram reader
+(`src/kernels/ngram.cpp`), already supported.
+
 **A RAM budget (engine 0.1.31, `--resident-budget-gib N`):** the resident variant for a model whose experts do not all
 fit: the N GiB of experts the GPU cache does not hold that the expert profile ranks hottest are copied into RAM at
 start (locked; page-locked when the driver allows the whole budget), and the rest are read from the files.
-It implies `--mmap-experts` and leaves 4 GiB of headroom. On Windows, available commit capacity also
-limits the budget; a larger N is clamped to the smaller limit less 4 GiB and a 256 MiB margin, with a message.
+It implies `--mmap-experts`. The first allocation is sized against available RAM, leaving 4 GiB of headroom
+(`STRATA_RESIDENT_HEADROOM_GIB` overrides it), so Windows can grow a system-managed page file to satisfy the request.
+If the pinned allocation and ordinary-memory fallback fail on Windows, the engine reads RAM and commit capacity
+again and retries once with a smaller positive budget. The retry applies headroom to the smaller limit; a clamped
+budget leaves another 256 MiB. A successful first allocation does not enforce a separate commit reserve. Page-file
+growth and allocation success are not guaranteed; other programs can consume memory after the snapshot.
 A clamped budget no longer fails the safety check that follows (#403). A budget that cannot be kept at all is a
 warning, with every expert read from the files. Setup sets N with `--resident-budget-gib N`. When the budget has room
 left after the ranked experts, the slots the prompt path borrows keep their experts in RAM too, as they do without a
@@ -304,6 +316,17 @@ RTX 5070, against ~3 tokens/s before these changes.
 
 **Opt-in switches measured on a hybrid Intel CPU under Windows (Core i7-13700K, 8 P + 8 E cores, RTX 5090, 64 GB RAM,
 Windows 11, Swift 1.5 IQ3_XXS at 128K):**
+- `STRATA_VRAM_FREE=device` (Windows, NVIDIA): `--expert-cache auto` reads the free VRAM of the whole card through NVML.
+  Under WDDM CUDA's own figure counts this process only: with 6 GiB held by another process it still read 30,994 MiB
+  free where NVML read 24,348. With the image encoder loaded (1,547 MiB) the cache was therefore sized too large and
+  shrunk by guesses: six starts of one config (engine 0.1.40.3 and 0.1.41, the default 700 MiB reserve) ended with
+  9,002 to 14,454 slots and 93 MiB to 10 GiB free. With the switch and `--vram-reserve-mib 1500` (0.1.41 built from
+  source): one pass, 13,007 to 13,188 slots and 973 to 1,392 MiB free over seven starts. On 0.1.42 with this switch
+  built in, three interleaved starts each: the default sized 13,543 slots after two shrink steps and ended with 336,
+  602 and 602 MiB free; the switch with a 1,500 MiB reserve 13,102 to 13,130 slots after one step and 1,107 to 1,288
+  MiB free. A run that filled the card to
+  0 MiB free decoded 80-115 tok/s where the same text ran at 205-230 with 900 MiB or more free. Not measured: AMD
+  cards, Linux (the switch is compiled for Windows CUDA builds only).
 - `--pool-affinity measure` (hybrid CPUs, native packs): the `all` and `p-cores` layouts are timed at start on the
   pack's own experts (about a second) and the faster one is taken. Engine 0.1.41 built from source, the same prompt:
   `all` (15 workers) spent 6.7 ms per verify window in the CPU pool and decoded 148 tok/s, `p-cores` (7 workers) 2.2 ms

@@ -1,0 +1,51 @@
+{
+ "label": "sp-share",
+ "run": "0f1bd985",
+ "url": "http://127.0.0.1:8080",
+ "at": "2026-10-06 22:33:31",
+ "sampling": {
+  "temperature": 0,
+  "presence_penalty": 1.0,
+  "penalty_last_n": 512,
+  "reasoning_effort": "none"
+ },
+ "total_s": 45.5,
+ "results": [
+  {
+   "test": "pair: prose",
+   "wall_s": 27.46,
+   "prompt_tokens": 78,
+   "reused": 0,
+   "read": 78,
+   "prompt_ms": 969.0,
+   "prompt_tok_s": 80.5,
+   "generated": 1000,
+   "decode_ms": 26477.3,
+   "decode_tok_s": 37.8,
+   "drafts": 666,
+   "accepted": 517,
+   "finish": "length"
+  },
+  {
+   "test": "pair: code",
+   "wall_s": 44.16,
+   "prompt_tokens": 132,
+   "reused": 0,
+   "read": 132,
+   "prompt_ms": 5044.0,
+   "prompt_tok_s": 26.2,
+   "generated": 1200,
+   "decode_ms": 39030.3,
+   "decode_tok_s": 30.7,
+   "drafts": 1115,
+   "accepted": 816,
+   "finish": "length"
+  },
+  {
+   "test": "pair: both",
+   "wall_s": 44.16,
+   "generated": 2200,
+   "decode_tok_s": 49.8
+  }
+ ]
+}
