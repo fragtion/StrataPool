@@ -103,7 +103,8 @@ def start_of(p):
         out = subprocess.run(["ps", "-o", "lstart=,stat=", "-p", str(p)], capture_output=True, text=True, timeout=5).stdout.strip()
     except Exception:
         return None
-    return None if not out or out.endswith("Z") else "s:" + out
+    parts = out.rsplit(None, 1)                     # "<start time> <state>": the state changes (R, S), the start does not
+    return None if len(parts) < 2 or parts[1].startswith("Z") else "s:" + parts[0]
 os.set_blocking(0, True)
 data = b""
 while True:
@@ -139,7 +140,8 @@ def _start_token(pid: int) -> str:
                              timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return ""
-    return "" if not out or out.endswith("Z") else "s:" + out
+    parts = out.rsplit(None, 1)   # "<start time> <state>": only the start names the process (R at start, S later)
+    return "" if len(parts) < 2 or parts[1].startswith("Z") else "s:" + parts[0]
 
 
 def _watch(child: subprocess.Popen) -> None:

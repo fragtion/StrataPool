@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   reopen:
-    if: startsWith(github.event.comment.body, '/reopen') && github.event.comment.user.type != 'Bot'
+    if: github.repository == 'Niko1221/Strata' && startsWith(github.event.comment.body, '/reopen') && github.event.comment.user.type != 'Bot'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -25,6 +25,7 @@ struct ConversationCheckpoint {
     std::vector<ConversationImageKey> imgs;
     std::vector<uint8_t> gdn, ple, tails, dead, block_pos;
     uint64_t used = 0; // upstream root-pinned/LRU checkpoint retention
+    uint64_t pool_id = 0; // POOL: the workers keep their layers' part of this checkpoint under this id
     // A shared-prefix pin (the request key pin=N): this checkpoint is the read-only prefix many suffix queries branch
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
@@ -166,6 +167,8 @@ struct SavedConversation {
     bool cvec = true;
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
+    // POOL: the workers keep their layers' part of this image under this id (0: none)
+    uint64_t pool_id = 0;
 
     /// Holds a pinned shared prefix (see ConversationCheckpoint::pinned): the parked-conversation budget keeps it.
     bool pinned() const {
@@ -325,8 +328,8 @@ public:
         }
         if (bytes() > budget_ - held - incoming) reuse_ = {};
         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
-            // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
-            // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
+            // the oldest entry that is neither the borrowed (pool-pinned) one nor holds a pinned shared prefix leaves;
+            // with only those left the new image does not fit (the caller skips parking it)
             if (!evict_oldest()) return false;
         }
         return true;
@@ -338,6 +341,7 @@ public:
     // own allocation, far above glibc's mmap threshold, so dropping an entry returns the whole footprint
     // to the kernel at once - the next admission check reads it back from /proc/meminfo.
     // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
+    // POOL: the borrowed entry (guard()) stays too.
     bool evict_oldest() {
         // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
         for (size_t i = 0; i < entries_.size(); ++i) {
@@ -356,6 +360,7 @@ public:
         const size_t n = entries_.size();
         entries_.clear();
         serials_.clear();
+        guarded_ = 0;
         bytes_ = 0;
         reuse_ = {};
         return n;
@@ -417,6 +422,15 @@ public:
             if (holds) longest = std::max(longest, deepest->ids.size());
         }
         return longest;
+    }
+
+    /// POOL: the ids the workers must keep for the parked entries - each image's own and its checkpoints'
+    void pool_ids(std::vector<uint64_t>& images, std::vector<uint64_t>& checkpoints) const {
+        for (const auto& e : entries_) {
+            if (e.pool_id != 0) images.push_back(e.pool_id);
+            for (const auto& c : e.checkpoints)
+                if (c.pool_id != 0) checkpoints.push_back(c.pool_id);
+        }
     }
 
     bool put(SavedConversation&& image, size_t held = 0) {
