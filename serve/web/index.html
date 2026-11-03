@@ -355,8 +355,9 @@
               one, instead of the second chat waiting for the first.</span>
             <span class="pool-note small" id="pool-chats-note" hidden><strong>Usually slower:</strong> on a desktop +
               laptop pool two chats together wrote 36-39 words/s against 44 one after the other, and a chat alone ran
-              10-15% slower: each PC keeps VRAM for the extra chat, so fewer experts are cached, and with a long context
-              each extra chat also locks gigabytes of RAM on every PC. A shorter context makes it cheaper. Keep it on
+              17% slower (42 against 51 tok/s): each PC keeps VRAM for the extra chat, so fewer experts are cached, and
+              with a long context each extra chat also locks gigabytes of RAM on every PC, so the laptop holds fewer
+              layers. A shorter context makes it cheaper. Keep it on
               only if several agents must answer at the same time.</span>
           </div>
           <div class="st-field" id="pool-chat-drafts-field">
@@ -377,8 +378,8 @@
             </div>
             <span class="muted small">One chat: this PC starts the next window on a guess while the workers run the
               current one, and undoes it when the guess was wrong. It pays when the workers and the network take most
-              of a window and the guesses are usually right; on a desktop + laptop pool it was about 6% slower (41-42
-              against 44 words/s). Off while several chats run.</span>
+              of a window and the guesses are usually right; on a desktop + laptop pool it was 4-6% slower (49 against
+              51 tok/s with sampled replies). Off while several chats run.</span>
           </div>
         </div>
       </div>

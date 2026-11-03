@@ -279,6 +279,26 @@ tools/pool_bench.py (greedy, 2026-10-06), against the defaults: code 55.4 agains
 52.2 (-3%), the answer to a 9.8K-token document 50.1 against 48.8 (+3%). Keep it on if your replies are mostly code;
 compare on your own PCs.
 
+## Which switches pay
+
+Measured on 2026-11-03 (engine 0.1.56, desktop RTX 3060 coordinator + laptop RTX 5060 Laptop worker, one chat, a
+1,000-word answer about TCP with thinking on, the shipped sampling: temperature 0.6, top_p 0.95, top_k 20, presence
+1.0 over 512 tokens; three seeds each, decode tok/s):
+
+| Pool tab | Split | Decode | Why |
+| --- | --- | --- | --- |
+| Several chats + Overlap (with `STRATA_PW_WITH_BATCH=1`) | 29 | 39.1 | as below, plus the overlap's cost |
+| Several chats | 29 | 42.4 | each slot's K/V copy of a 262K context takes pinned RAM on the laptop, so it can only hold layers 29-47; the desktop's 29 layers then share a smaller cache (78% hits) |
+| Overlap | 25 | 49.1 | two thirds of the guessed windows were thrown away (sampled text), and a window the loop does not guess takes 36 ms against 31.5 serially |
+| **neither** | 25 | **51.2** | desktop 17.5 ms + laptop 12 ms + network 2 ms a window, 94% hits on the desktop |
+| (the desktop alone) | - | 42.6 | |
+
+So for one chat at a time the plain split is the fastest: +20% over the desktop alone. A stricter guess gate for the
+overlap (`STRATA_PIPELINE_DEBUG=1 STRATA_PIPELINE_THETA=0.5` or `0.8`) was slower still (44-46). With greedy decoding
+nearly every draft is accepted and all of these run much faster (78 tok/s with both switches on), so compare with the
+sampling you use. Turn Several chats on only when two chats must really run at once (or lower the context, which
+shrinks each slot's K/V copy).
+
 ## Drafts in several chats
 
 **Drafts in several chats** (shown when Several chats at once is on; Strata's `--batch-mtp`) gives each chat's window
@@ -354,7 +374,7 @@ change. None of them has been measured on a pool yet, so compare a few replies o
 | `STRATA_STAGE_RESIDENT=0` | back to the old prompt staging: since #2968 (by sergiywith) a PC with more than 10% of its experts unpinned (a worker that may pin only half its RAM) keeps the full streamed ring and gets 8 copy threads (RTX 5090, Windows: 32K prompts +13%, 2K 1-2.5% slower) | pool-wide |
 | `STRATA_PREFILL_CPU_SHARE_BATCH=1` | with Several chats: a prompt read uses the CPU expert share while no slot decodes (#3382, by Vop3p; 2x RTX 3090: follow-ups 19-49% faster) | coordinator only (a worker does not know which slots decode) |
 | `STRATA_ROUTE_PRIOR=1.5` | residency-biased routing (faster on 12 GB cards; off by default since Strata 0.2.8, #4402, because it was tied to repetition loops in long agent sessions): on every PC | pool-wide |
-| `STRATA_PW_WITH_BATCH=1` | with Several chats: a chat that is alone keeps **Overlap the PCs** (the pipelined windows); the batch windows of several chats run without it (Vop3p's #3095, in Strata since 0.2.10; 2x RTX A6000: a lone request +14% on code, +3% on a long decode). The Pool tab sets it when Overlap and Several chats are both ticked; `"0"` here turns it off. Without it, Several chats turns Overlap off | coordinator |
+| `STRATA_PW_WITH_BATCH=1` | with Several chats: a chat that is alone keeps **Overlap the PCs** (the pipelined windows); the batch windows of several chats run without it (Vop3p's #3095, in Strata since 0.2.10; 2x RTX A6000: a lone request +14% on code, +3% on a long decode). On the desktop + laptop pool it was slower (a lone chat 39 against 42 tok/s, see "Which switches pay"), so the Pool tab does not set it. Without it, Several chats turns Overlap off | coordinator |
 | `STRATA_PIPE_ADAPT_EVERY=N` | with Several chats: the expert cache's swap round every N group windows (the pipeline empties for it; the workers already swap between the windows they serve) | coordinator |
 | `STRATA_PARK_VRAM_MIB=N`, `STRATA_CKPT_VRAM_SLOTS=N` | parked K/V and checkpoints kept in VRAM in front of the RAM copy: costs expert-cache room | each PC, in its own config |
 | `STRATA_DEFAULTS=026` | every default Strata 0.2.7 changed goes back to 0.2.6 | each PC (a worker reads it before the coordinator's settings arrive) |
