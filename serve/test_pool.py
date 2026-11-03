@@ -161,6 +161,17 @@ class Config(unittest.TestCase):
         env = pool_env(pc, {"PATH": "x", "STRATA_PARK_ASYNC": "0"})
         self.assertEqual((env["STRATA_PARK_ASYNC"], env["STRATA_PREFILL_COPY_EVENT_EVERY"], env["PATH"]), ("1", "4", "x"))
         self.assertEqual(PoolConfig(None, {})["env"], {})
+        self.assertNotIn("STRATA_PW_WITH_BATCH", env)
+
+    def test_overlap_with_several_chats(self):
+        """Overlap and Several chats both ticked: the engine keeps the overlap for a chat that is alone
+        (STRATA_PW_WITH_BATCH=1); the pool config's own "env" can still turn it off."""
+        both = {"role": "coordinator", "several_chats": True, "overlap_windows": True}
+        self.assertEqual(pool_env(PoolConfig(None, both), {})["STRATA_PW_WITH_BATCH"], "1")
+        off = pool_env(PoolConfig(None, {**both, "env": {"STRATA_PW_WITH_BATCH": "0"}}), {})
+        self.assertEqual(off["STRATA_PW_WITH_BATCH"], "0")
+        for one in ({"several_chats": True}, {"overlap_windows": True}):
+            self.assertNotIn("STRATA_PW_WITH_BATCH", pool_env(PoolConfig(None, {"role": "coordinator", **one}), {}))
         for bad in ({"PATH": "x"}, {"STRATA_X": "a;b"}, {"STRATA_X": True}, {"STRATA_X": "a\nb"}, ["STRATA_X"]):
             with self.assertRaises(ValueError):
                 PoolConfig(None, {"env": bad})

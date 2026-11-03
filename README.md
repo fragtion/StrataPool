@@ -143,6 +143,7 @@ measured on their own.
 | sergiywith - [#2968](https://github.com/Niko1221/Strata/pull/2968) (open PR) | experts staged from the resident arena keep the full ring |  |
 | Vop3p - [#3382](https://github.com/Niko1221/Strata/pull/3382) (in Strata since 0.2.10) | `STRATA_PREFILL_CPU_SHARE_BATCH` (opt-in) | coordinator only |
 | Stefano Sinden (bitaccesscomau) - [#4283](https://github.com/Niko1221/Strata/pull/4283) (in Strata since 0.2.10) | `STRATA_PREFILL_ROUTED_STREAM` (opt-in): unrouted streamed experts not copied | forwarded to the workers |
+| Vop3p - [#3095](https://github.com/Niko1221/Strata/pull/3095) (in Strata since 0.2.10) | `STRATA_PW_WITH_BATCH`: a request that is alone keeps the pipelined windows beside batch slots | **Overlap the PCs** with **Several chats** on: a chat that is alone keeps the overlap (set by the Pool tab when both are ticked) |
 
 Strata 0.1.40.2 took in [#851](https://github.com/Niko1221/Strata/pull/851), [#789](https://github.com/Niko1221/Strata/pull/789),
 [#813](https://github.com/Niko1221/Strata/pull/813), [#1063](https://github.com/Niko1221/Strata/pull/1063),

@@ -248,8 +248,8 @@ def coordinator_args(pc: PoolConfig) -> list[str]:
             out += ["--batch-mtp"]
     if pc["overlap_windows"]:
         # one chat: this PC starts the next window on a guess while the workers run the current one (Strata's
-        # --pipeline-windows 2; a wrong guess is undone here, the workers only ever see verified windows).  The engine
-        # turns it off with a note while several chats run.
+        # --pipeline-windows 2; a wrong guess is undone here, the workers only ever see verified windows).  With several
+        # chats too, a chat that is alone keeps it and the batch windows run without it (STRATA_PW_WITH_BATCH, pool_env).
         out += ["--pipeline-windows", "2"]
     return out
 
@@ -261,6 +261,10 @@ def worker_args(pc: PoolConfig) -> list[str]:
 def pool_env(pc: PoolConfig, env: dict) -> dict:
     """The secret travels in the environment, not on the command line (which other users of the PC can read)."""
     env = dict(env)
+    if pc["several_chats"] and pc["overlap_windows"]:
+        # both ticked: Strata's STRATA_PW_WITH_BATCH (0.2.10) keeps the overlap for a chat that is alone beside the batch
+        # slots; without it the engine turns the overlap off whenever several chats are set.  "0" in "env" turns it off.
+        env["STRATA_PW_WITH_BATCH"] = "1"
     env.update(pc["env"])                           # the pool's own switches (the engine forwards the pool-wide ones)
     env["STRATA_POOL_SECRET"] = pc["secret"]
     env["STRATA_POOL_NAME"] = pc["name"] or hostname()

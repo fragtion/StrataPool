@@ -5,6 +5,10 @@ answers and speed compare.
 
     .venv\\Scripts\\python tools\\pool_selftest.py strata-coder-iq1_m.json
     .venv\\Scripts\\python tools\\pool_selftest.py strata-coder-iq1_m.json --split 24 --ctx 8192 --cache 500
+    .venv\\Scripts\\python tools\\pool_selftest.py strata-coder-iq1_m.json --skip-single --several-chats --overlap
+
+--several-chats and --overlap start the coordinator as the Pool tab's switches do (batch slots, pipelined windows; with
+both, STRATA_PW_WITH_BATCH=1 as serve/pool.py sets it), and --several-chats also reads two prompts at once.
 
 Both engines of the pair run on this GPU, so each gets a small expert cache (--cache, slots per engine; the model alone
 gets twice that) and a short context.  Close Strata first: the GPU must be free.
@@ -87,6 +91,11 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=7799)
     ap.add_argument("--wire", default="f32", choices=["f32", "f16", "bf16"])
     ap.add_argument("--skip-single", action="store_true", help="only the pool run")
+    ap.add_argument("--several-chats", action="store_true", help="the coordinator with batch slots (--batch 2), and two prompts at once")
+    ap.add_argument("--overlap", action="store_true", help="the coordinator with pipelined windows (--pipeline-windows 2)")
+    ap.add_argument("--worker-reserve-mib", type=int, default=None,
+                    help="VRAM the worker keeps free (--vram-reserve-mib): a pool PC fills its free VRAM with experts, and "
+                         "the worker starts first, so on one GPU this leaves the coordinator room")
     a = ap.parse_args()
     from serve.server import StrataEngine, child_env
     import strata_tokenizer as ST
@@ -118,6 +127,8 @@ def main() -> int:
     secret = secrets.token_hex(8)
     penv = dict(env, STRATA_POOL_SECRET=secret, STRATA_POOL_NAME="selftest")
     wargs = base_args(cfg, a.ctx, a.cache, a.chunk) + ["--pool-listen", f"127.0.0.1:{a.port}"]
+    if a.worker_reserve_mib is not None:
+        wargs = with_arg(wargs, "--vram-reserve-mib", str(a.worker_reserve_mib))
     wlog = open(str(Path(log).with_suffix("")) + "-worker.log", "a", encoding="utf-8")
     worker = subprocess.Popen([cfg["exe"], "--serve", *wargs], cwd=cfg.get("cwd"), stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=wlog, text=True, env=penv)
@@ -138,8 +149,15 @@ def main() -> int:
         return 1
     cargs = base_args(cfg, a.ctx, a.cache, a.chunk) + ["--pool-peers", f"127.0.0.1:{a.port}", "--pool-split", a.split,
                                                        "--pool-wire", a.wire]
+    cenv = dict(penv)
+    if a.several_chats:
+        cargs += ["--batch", "2"]
+    if a.overlap:
+        cargs += ["--pipeline-windows", "2"]
+        if a.several_chats:
+            cenv["STRATA_PW_WITH_BATCH"] = "1"              # as serve/pool.py's pool_env sets it with both switches
     try:
-        eng = StrataEngine(cfg["exe"], cargs, cwd=cfg.get("cwd"), log=log, env=penv)
+        eng = StrataEngine(cfg["exe"], cargs, cwd=cfg.get("cwd"), log=log, env=cenv)
     except RuntimeError as e:
         say(f"[selftest] the coordinator did not start: {e} (see {log})")
         worker.kill()
@@ -147,6 +165,23 @@ def main() -> int:
     try:
         say(f"    pool: {eng.info.get('pool_workers')}, {eng.info.get('expert_slots')} experts on the GPU in total")
         pooled = run_prompts(eng, ids_list, a.max_new, say)
+        if a.several_chats:                                # two at once: the lone chat's path hands over to the slots
+            say("    two prompts at once ...")
+            both: list = [None, None]
+
+            def one(k: int):
+                both[k] = run_prompts(eng, [ids_list[k + 1]], a.max_new, say)[0]
+            th = [threading.Thread(target=one, args=(k,)) for k in (0, 1)]
+            for t in th:
+                t.start()
+            for t in th:
+                t.join()
+            for k in (0, 1):
+                got = both[k]["tokens"] if both[k] else []
+                say(f"    at once [{k + 2}]: {len(got)} tokens, "
+                    f"{'the same as alone' if got == pooled[k + 1]['tokens'] else 'not the same as alone'}")
+                if not got:
+                    pooled[k + 1]["tokens"] = []            # counted as a failure below
     finally:
         eng.close()
         worker.terminate()

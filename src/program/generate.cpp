@@ -6067,7 +6067,8 @@ int main(int argc, char** argv) {
         const char* off = !o.serve ? "it needs --serve"
                         : pool_worker ? "a pool worker runs the windows the coordinator sends (set it on the coordinator)"
                         : pool_coord ? (o.mtp.empty() || o.spec < 2 ? "it needs the MTP drafter (--mtp, --spec)"
-                                        : o.batch != 0 ? "not with batch slots (Several chats at once)" : nullptr)
+                                        : batch_blocks_pw ? "not with batch slots (Several chats at once; STRATA_PW_WITH_BATCH=1 "
+                                                            "keeps it for a request that is alone)" : nullptr)
                         : split_same ? "it needs each stage of the layer split on its own GPU"
                         : !multi_gpu ? "it needs a layer split on two GPUs"
                         : split_devs.empty() ? "it needs a layer split into two or more stages"
