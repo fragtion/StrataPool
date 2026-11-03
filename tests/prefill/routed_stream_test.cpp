@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <random>
@@ -289,6 +290,34 @@ int main() {
     expect(rs::depth_from("8") == 8, "depth 8");
     expect(rs::depth_from("0") == 1 && rs::depth_from("-4") == 1, "depth clamps to 1");
     expect(rs::depth_from("100000") == rs::kMaxDepth, "depth clamps to the maximum");
+
+    // Which chunks take the routed walk: the copy policies of STRATA_PREFILL_COPY_EVENT_EVERY > 1 and
+    // STRATA_PREFILL_COPY_WAIT_DEDUPE=1 keep the default issuer.  Otherwise a sparse consumer's wait_copied would spin
+    // on an a_rec the routed walk never publishes, and the requested release-wait deduplication would be bypassed.
+    expect(rs::eligible(true, true, false, 1, false), "streamed threaded single GPU: routed walk eligible");
+    expect(!rs::eligible(false, true, false, 1, false), "short prompt: default walk");
+    expect(!rs::eligible(true, false, false, 1, false), "inline issuer: default walk");
+    expect(!rs::eligible(true, true, true, 1, false), "peer prompt ring: default walk");
+    for (int every : {2, 16, 64}) {
+        expect(!rs::eligible(true, true, false, every, false), "sparse copied events: default walk");
+        expect(!rs::eligible(true, true, false, every, true), "sparse events and dedupe: default walk");
+    }
+    expect(!rs::eligible(true, true, false, 1, true), "release-wait dedupe: default walk");
+    // the reason the engine prints once when the switch is set and a streamed chunk keeps the default walk
+    expect(rs::held_off(true, false, 1, false) == nullptr, "eligible: no reason");
+    for (bool iss : {false, true})
+        for (bool peer : {false, true})
+            for (int every : {1, 2, 16})
+                for (bool dedupe : {false, true}) {
+                    const char* why = rs::held_off(iss, peer, every, dedupe);
+                    expect((why == nullptr) == rs::eligible(true, iss, peer, every, dedupe), "a reason exactly when held off");
+                }
+    auto names = [](const char* why, const char* what) { return why != nullptr && std::strstr(why, what) != nullptr; };
+    expect(names(rs::held_off(false, false, 1, false), "STRATA_PREFILL_ISSUER=0"), "inline issuer named");
+    expect(names(rs::held_off(true, true, 1, false), "--peer-device"), "peer ring named");
+    expect(names(rs::held_off(true, false, 4, false), "STRATA_PREFILL_COPY_EVENT_EVERY") &&
+               names(rs::held_off(true, false, 1, true), "STRATA_PREFILL_COPY_WAIT_DEDUPE"),
+           "copy policies named");
 
     // the gate
     {

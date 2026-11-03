@@ -139,10 +139,10 @@ measured on their own.
 | Amit Tsur (Tsury) - [#4132](https://github.com/Niko1221/Strata/pull/4132) (in Strata since 0.2.8) | a string argument that quotes a tool call stays exact |  |
 | xrip - [#3404](https://github.com/Niko1221/Strata/pull/3404) (open PR) | an older, shorter copy of the conversation is superseded | frees cache RAM for other conversations |
 | chaog992 - [#3517](https://github.com/Niko1221/Strata/pull/3517) (open PR) | the retention pin follows the system-prompt root |  |
-| merbanan - [#4039](https://github.com/Niko1221/Strata/pull/4039) (open PR) | `STRATA_PF_GROUP_SCRATCH`, `STRATA_PF_HC_REGION` (opt-in, bitwise) | forwarded to the workers; see docs/POOL.md |
+| merbanan - [#4039](https://github.com/Niko1221/Strata/pull/4039) (in Strata since 0.2.10) | `STRATA_PF_GROUP_SCRATCH`, `STRATA_PF_HC_REGION` (opt-in, bitwise) | forwarded to the workers; see docs/POOL.md |
 | sergiywith - [#2968](https://github.com/Niko1221/Strata/pull/2968) (open PR) | experts staged from the resident arena keep the full ring |  |
-| Vop3p - [#3382](https://github.com/Niko1221/Strata/pull/3382) (open PR) | `STRATA_PREFILL_CPU_SHARE_BATCH` (opt-in) | coordinator only |
-| Stefano Sinden (bitaccesscomau) - [#4283](https://github.com/Niko1221/Strata/pull/4283) (open PR) | `STRATA_PREFILL_ROUTED_STREAM` (opt-in): unrouted streamed experts not copied | forwarded to the workers; replaces `STRATA_PREFILL_COPY_EVENT_EVERY` when both are set |
+| Vop3p - [#3382](https://github.com/Niko1221/Strata/pull/3382) (in Strata since 0.2.10) | `STRATA_PREFILL_CPU_SHARE_BATCH` (opt-in) | coordinator only |
+| Stefano Sinden (bitaccesscomau) - [#4283](https://github.com/Niko1221/Strata/pull/4283) (in Strata since 0.2.10) | `STRATA_PREFILL_ROUTED_STREAM` (opt-in): unrouted streamed experts not copied | forwarded to the workers |
 
 Strata 0.1.40.2 took in [#851](https://github.com/Niko1221/Strata/pull/851), [#789](https://github.com/Niko1221/Strata/pull/789),
 [#813](https://github.com/Niko1221/Strata/pull/813), [#1063](https://github.com/Niko1221/Strata/pull/1063),

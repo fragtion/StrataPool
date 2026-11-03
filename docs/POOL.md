@@ -349,7 +349,7 @@ change. None of them has been measured on a pool yet, so compare a few replies o
 | `STRATA_PARK_ASYNC=1` | parking a conversation copies its K/V to RAM in the background (the copy into a GPU buffer is done before the park returns, so the next request cannot overwrite it) | pool-wide |
 | `STRATA_CKPT_ASYNC=1`, `STRATA_CKPT_GATHER=1` | a conversation checkpoint's running state is copied in the background; its small pieces in one copy | pool-wide |
 | `STRATA_PREFILL_COPY_EVENT_EVERY=N` (try 4-8), `STRATA_PREFILL_COPY_WAIT_DEDUPE=1` | while a prompt streams experts: one copy event every N experts instead of one each, and one wait per release (#4005). Aimed at Windows, where each event record or wait is a submission of its own (about 80 / 45 microseconds on Windows 11); the same bytes | pool-wide |
-| `STRATA_PREFILL_ROUTED_STREAM=1` | a prompt chunk does not copy the streamed experts no token of it routes to (#4283, by Stefano Sinden; RTX 3090: a 1,790-token follow-up read 18% faster, 2K / 4K / 32K reads 20% / 8% / 5%; the same bits). With it on, `STRATA_PREFILL_COPY_EVENT_EVERY` is not used | pool-wide |
+| `STRATA_PREFILL_ROUTED_STREAM=1` | a prompt chunk does not copy the streamed experts no token of it routes to (#4283, by Stefano Sinden; RTX 3090: a 1,790-token follow-up read 18% faster, 2K / 4K / 32K reads 20% / 8% / 5%; the same bits; in Strata since 0.2.10). It stays off where `STRATA_PREFILL_COPY_EVENT_EVERY` is above 1 or `STRATA_PREFILL_COPY_WAIT_DEDUPE=1` (the engine says so once) | pool-wide |
 | `STRATA_PF_GROUP_SCRATCH=1`, `STRATA_PF_HC_REGION=1` | smaller prompt scratch, so `--prefill auto` picks bigger chunks (#4039, by merbanan; RTX 2060S 8 GB: prompts +18% / +24% / +21% at 4K / 16K / 32K; the same bits). The pool's chunk is the smallest any PC can take, so the 8 GB worker's gain counts most | pool-wide |
 | `STRATA_STAGE_RESIDENT=0` | back to the old prompt staging: since #2968 (by sergiywith) a PC with more than 10% of its experts unpinned (a worker that may pin only half its RAM) keeps the full streamed ring and gets 8 copy threads (RTX 5090, Windows: 32K prompts +13%, 2K 1-2.5% slower) | pool-wide |
 | `STRATA_PREFILL_CPU_SHARE_BATCH=1` | with Several chats: a prompt read uses the CPU expert share while no slot decodes (#3382, by Vop3p; 2x RTX 3090: follow-ups 19-49% faster) | coordinator only (a worker does not know which slots decode) |
@@ -359,7 +359,14 @@ change. None of them has been measured on a pool yet, so compare a few replies o
 | `STRATA_DEFAULTS=026` | every default Strata 0.2.7 changed goes back to 0.2.6 | each PC (a worker reads it before the coordinator's settings arrive) |
 
 Layer-major prompt reading (`STRATA_PREFILL_LAYER_MAJOR`, Strata #3976) stays off on a pool PC: its walk has no
-hand-off to other PCs yet.
+hand-off to other PCs yet. For the same reason Strata 0.2.10's small-card prompt rule (unfused experts plus the
+layer-major walk below an 8K chunk) is not applied on a pool PC.
+
+What a pool PC does not take from Strata 0.2.10 yet: the DFlash2 drafter (a pool starts with the MTP drafter; the
+engine refuses `--draft dflash2` on a pool PC, because the hand-off carries the MTP's rows, not DFlash2's taps; Coder
+has no DFlash2 drafter anyway), prompt-lookup windows past 8 rows (`--lookup-max-t`, which a layer split does not take
+either), and the all-cards split engine (`strata-split`: every card computes a share of every layer and the cards
+exchange sums twice per layer, which needs the cards in one PC).
 
 ## How it is built
 
