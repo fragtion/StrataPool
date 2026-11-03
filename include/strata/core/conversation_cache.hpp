@@ -26,6 +26,7 @@ struct ConversationCheckpoint {
     std::vector<ConversationImageKey> imgs;
     std::vector<uint8_t> gdn, ple, tails, dead, block_pos;
     uint64_t used = 0; // upstream root-pinned/LRU checkpoint retention
+    uint64_t pool_id = 0; // POOL: the workers keep their layers' part of this checkpoint under this id
     // STRATA_CKPT_VRAM_SLOTS: the tag of the device copy of `gdn` (0: none).  Set by conversation_checkpoint_save, the
     // only writer of a checkpoint's GDN bytes besides a whole copy (which keeps them equal, so it keeps the tag).
     uint64_t dev_tag = 0;
@@ -182,6 +183,8 @@ struct SavedConversation {
     bool cvec = true;
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
+    // POOL: the workers keep their layers' part of this image under this id (0: none)
+    uint64_t pool_id = 0;
     // STRATA_PARK_ASYNC: set while a background copy fills this image's K/V; its deleter waits for that copy, and as
     // one of the last members it runs before any buffer is freed (whichever copy of the image goes last)
     std::shared_ptr<void> pending;
@@ -393,8 +396,8 @@ public:
         }
         if (bytes() > budget_ - held - incoming) reuse_ = {};
         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
-            // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
-            // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
+            // the oldest entry that is neither the borrowed (pool-pinned) one nor holds a pinned shared prefix leaves;
+            // with only those left the new image does not fit (the caller skips parking it)
             if (!evict_oldest()) return false;
         }
         return true;
@@ -406,6 +409,7 @@ public:
     // own allocation, far above glibc's mmap threshold, so dropping an entry returns the whole footprint
     // to the kernel at once - the next admission check reads it back from /proc/meminfo.
     // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
+    // POOL: the borrowed entry (guard()) stays too.
     bool evict_oldest() {
         // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
         for (size_t i = 0; i < entries_.size(); ++i) {
@@ -424,6 +428,7 @@ public:
         const size_t n = entries_.size();
         entries_.clear();
         serials_.clear();
+        guarded_ = 0;
         bytes_ = 0;
         reuse_ = {};
         return n;
@@ -436,24 +441,16 @@ public:
     // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
     // is the tail the client rewrote (the reply as it was generated, before the next request re-rendered it) and
     // checkpoints older than that one.  A subagent's successive turns parked one such copy each, and make_room's
-    // oldest-first eviction then pushed the parent conversation out after `slots` turns.  An entry without
-    // checkpoints, or whose deepest checkpoint the outgoing chain does not hold (another conversation that only
-    // shares the system prompt's root with it), is kept.  Returns how many were dropped.
+    // oldest-first eviction then pushed the parent conversation out after `slots` turns.  Also superseded: an older,
+    // shorter state of this conversation with at most a tenth of its tokens not in the outgoing ones (rewritten turns
+    // back, when the chain's spread checkpoints no longer hold one near its end).  An entry without checkpoints, or
+    // another conversation that only shares the system prompt's root with it, is kept.  Returns how many were dropped.
     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
                            const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
-        auto held = [&](const ConversationCheckpoint& c) {
-            if (c.ids == ids && c.imgs == images) return true;
-            for (const auto& k : checkpoints)
-                if (k.ids == c.ids && k.imgs == c.imgs) return true;
-            return false;
-        };
         size_t dropped = 0;
         for (size_t i = 0; i < entries_.size();) {
             const auto& e = entries_[i];
-            const ConversationCheckpoint* deepest = nullptr;
-            for (const auto& c : e.checkpoints)
-                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
-            if (e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest) &&
+            if (superseded_at(e, ids, images, checkpoints, cvec) > 0 &&
                 !(guarded_ != 0 && serials_[i] == guarded_)) {
                 bytes_ -= e.bytes();
                 erase(i);
@@ -500,18 +497,17 @@ public:
     size_t parked_prefix_tokens(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
                                 const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) const {
         size_t longest = 0;
-        for (const auto& e : entries_) {
-            if (e.cvec != cvec) continue;
-            const ConversationCheckpoint* deepest = nullptr;
-            for (const auto& c : e.checkpoints)
-                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
-            if (!deepest || deepest->ids.empty()) continue;
-            bool holds = deepest->ids == ids && deepest->imgs == images;
-            for (const auto& k : checkpoints)
-                if (!holds && k.ids == deepest->ids && k.imgs == deepest->imgs) holds = true;
-            if (holds) longest = std::max(longest, deepest->ids.size());
-        }
+        for (const auto& e : entries_) longest = std::max(longest, superseded_at(e, ids, images, checkpoints, cvec));
         return longest;
+    }
+
+    /// POOL: the ids the workers must keep for the parked entries - each image's own and its checkpoints'
+    void pool_ids(std::vector<uint64_t>& images, std::vector<uint64_t>& checkpoints) const {
+        for (const auto& e : entries_) {
+            if (e.pool_id != 0) images.push_back(e.pool_id);
+            for (const auto& c : e.checkpoints)
+                if (c.pool_id != 0) checkpoints.push_back(c.pool_id);
+        }
     }
 
     bool put(SavedConversation&& image, size_t held = 0) {
@@ -526,6 +522,22 @@ public:
     }
 
 private:
+    // How many of `e`'s tokens the outgoing conversation holds when it supersedes `e` (drop_superseded), else 0.
+    static size_t superseded_at(const SavedConversation& e, const std::vector<int32_t>& ids,
+                                const std::vector<ConversationImageKey>& images,
+                                const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
+        const ConversationCheckpoint* deepest = nullptr;
+        for (const auto& c : e.checkpoints)
+            if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+        if (e.cvec != cvec || !deepest || deepest->ids.empty()) return 0;
+        bool held = deepest->ids == ids && deepest->imgs == images;
+        for (const auto& k : checkpoints)
+            if (!held && k.ids == deepest->ids && k.imgs == deepest->imgs) held = true;
+        if (held) return deepest->ids.size();
+        const auto& own = e.live.ids;
+        const size_t shared = std::mismatch(own.begin(), own.end(), ids.begin(), ids.end()).first - own.begin();
+        return ids.size() > own.size() && own.size() - shared <= own.size() / 10 ? shared : 0;
+    }
     void erase(size_t index) {
         entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
         serials_.erase(serials_.begin() + (std::ptrdiff_t) index);

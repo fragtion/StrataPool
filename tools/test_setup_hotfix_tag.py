@@ -31,6 +31,7 @@ class HotfixTag(unittest.TestCase):
         self.assertLess((0, 1, 42, 1), setup.MIN_ENGINE)    # 0.1.42.1 is replaced
         self.assertLess((0, 1, 40), setup.MIN_ENGINE)       # an installed 0.1.40 engine is replaced
 
+    @unittest.skipIf(not setup.PREBUILT_URL, "StrataPool ships no ready-made engine (it compiles its own)")
     def test_the_engine_zips_are_found_for_a_hotfix_tag(self):
         # a hotfix that keeps CMakeLists.txt at the engine's version: the v0.1.40 release still holds the zips
         bases = setup.prebuilt_bases(setup.PREBUILT_URL)

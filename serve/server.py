@@ -32,6 +32,7 @@ import collections
 import base64
 import hashlib
 import hmac
+import http.client
 import codecs
 import ctypes
 import json
@@ -82,6 +83,7 @@ from serve import ready as ready_file  # noqa: E402
 from serve import owner_guard  # noqa: E402
 from serve import launch_identity  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
+from serve import route as pool_route  # noqa: E402
 from serve import lifeline  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json, extract_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
@@ -828,6 +830,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
 
     say("weights", "[strata] starting the engine: reading the model's weights ...")
     pos = offset
+    pool_wait = None                                    # StrataPool: the worker a coordinator's start waits for
     while not done.wait(0.5):
         try:
             with open(log_path, "rb") as f:
@@ -852,9 +855,20 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                     say("cache", f"[strata] filling the GPU's expert cache ({n}) ...")
                 elif "session is up" in line:
                     say("up", "[strata] almost ready ...")
+                elif line.startswith("strata pool: waiting for worker "):
+                    pool_wait = line[len("strata pool: waiting for worker "):].strip().rstrip(".").strip()
+                    say("poolwait", f"[pool] waiting for the worker {pool_wait}: start StrataPool on that PC with "
+                                    "its pool role set to Worker, or set this PC's role to Off in the Pool tab "
+                                    "(the Pool link above) to run the model alone")
+                elif line.startswith("strata pool:") and "connected" in line:
+                    pool_wait = None
         if time.time() - last > heartbeat:
             last = time.time()
-            print(f"[strata] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
+            if pool_wait:
+                print(f"[pool] still waiting for the worker {pool_wait} ({time.time() - t0:.0f} s; the pool gives "
+                      "up after 15 minutes)", flush=True)
+            else:
+                print(f"[strata] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
 
 
 class ConvCacheLog:
@@ -1315,6 +1329,13 @@ class StrataEngine:
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
 
+    @classmethod
+    def deferred(cls, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
+                 env: dict | None = None) -> "StrataEngine":
+        """An engine that is not started yet (the pool: a worker's chat engine, or a coordinator's while the server
+        comes up): `restart()` (Service.ensure_loaded) starts it with these arguments."""
+        return cls(exe, args, cwd=cwd, log=log, env=env, lazy=True)
+
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         slot_q = self.slot_q
@@ -1453,6 +1474,8 @@ class StrataEngine:
         exits before READY - a dead engine's VRAM can take a while to come back, notably on ROCm - is retried
         (PR #637)."""
         info = dict(self.info)
+        if "--pool-peers" in self.spawn[1]:      # a pool coordinator waited for its workers itself (--pool-wait-s):
+            tries = 1                            # another try would only wait again
         self.starting = True                     # prepare() answers 503 "starting" meanwhile (#344)
         try:
             self.close()
@@ -2488,6 +2511,9 @@ class StrataEngine:
             raise EngineDied("the engine is unavailable; this request was not sent")
         bias_api.validate_request(sampling or {}, self, None)
         refuse_for_split(self, sampling or {})
+        # the tokens the engine generated after the consumer stopped reading (read while draining to DONE below): the
+        # engine stops between verify windows, so its state can hold a few tokens past the consumer's cut
+        self.overrun = []
         if getattr(self, "batch", 0) and not self.multi:
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
             return
@@ -2646,6 +2672,8 @@ class StrataEngine:
                     if line.startswith("DONE"):
                         self._parse_done(line)
                         break
+                    if line.startswith("T ") and line[2:].strip().isdigit():
+                        self.overrun.append(int(line[2:]))
                     if not self.can_stop:
                         heard = time.monotonic()
             if rid is not None:                           # this request's lines are over (a late one goes nowhere)
@@ -3489,6 +3517,14 @@ def mtp_retry_args(cfg: dict, exe: str | None, extra: list[str] | None = None) -
     return alt if alt != first + list(extra or []) else None
 
 
+def pool_cfg(cfg: dict) -> dict:
+    """POOL: the run config a pool role starts from. The pool hands the MTP drafter's taps between PCs (verify.cpp's hand-off rows), and
+    DFlash2's taps are not carried, so Auto drafting (DFlash2 where the engine has it) runs the MTP on a pool PC; "off" stays off."""
+    if drafting.normalize(cfg.get("drafting")) in ("auto", "dflash2"):
+        return {**cfg, "drafting": "mtp"}
+    return cfg
+
+
 def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
@@ -4266,6 +4302,7 @@ class ByteTokenizer:
     @property
     def control_tokens(self):
         return [s for s in self.SPECIALS if s not in self.ALWAYS]
+    max_special_len = max(len(s) for s in SPECIALS)
 
     def encode(self, text, parse_special=False, plain=()):
         return self.encode_marked(text, parse_special, plain)[0]
@@ -4995,6 +5032,9 @@ class Service:
         the free-VRAM check.  The caller holds self.fifo."""
         if self.loaded() and not self._vision_down():
             return
+        if getattr(self, "pool_role", "off") == "worker":
+            raise GpuBusy("this PC lends its GPU to a pool coordinator (Pool tab): chat with the coordinator, "
+                          "or switch this PC's pool role off")
         hook_failed = None
         if self.before_load:
             cmd = self.before_load
@@ -6259,12 +6299,24 @@ class Service:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
                         force = None
                         extra = self.tok.encode(text, parse_special=True)
-                        if max_new - n - len(extra) < 1:
+                        # The engine stops between its verify windows, so it may already hold a few thinking tokens
+                        # past the budget that this pass did not read.  The next prompt carries them too, so it extends
+                        # the engine's state instead of diverging from it (which re-read the whole thinking from the
+                        # prompt's checkpoint).  Not when they could end the thinking or hold part of a tag or character,
+                        # nor when they would take the room an answer still has.
+                        over = list(getattr(self.engine, "overrun", None) or []) if wrap else []
+                        if over and (any(t in self.stop_ids for t in over) or
+                                     any(c in self.tok.decode(over) for c in "<�") or
+                                     max_new - n - len(over) - len(extra) < 1):
+                            over = []
+                        if max_new - n - len(over) - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
                         if wrap:
-                            print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
+                            print(f"[strata] thinking budget reached ({thought} tokens"
+                                  f"{f', {len(over)} more in flight' if over else ''}): wrapping up the thinking",
                                   flush=True)
-                        for t in extra:
+                        seg = seg + over
+                        for t in over + extra:
                             n += 1
                             raw_ids.append(t)
                             thinking_n += parser.state in ("reasoning", "rcall")
@@ -6643,6 +6695,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
 # chunk sends exactly one PP, that one: a client would see a bar that appears already full.  Such a line is dropped, and
 # the answer's first token ends the progress for the client anyway.
 PP_DONE_TAIL = 64
+PREFILL_BEAT_S = 5.0   # a real (empty) chunk this often while a prompt is read, for clients that ignore SSE comments
 
 
 
@@ -6823,12 +6876,22 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
+    beat = time.monotonic()
     for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, force=force, declared_only=True):
         if kind == "ping":
             # a PP line: the prompt is being read and there is nothing to say yet.  It used to be only the SSE comment;
             # now it carries the progress when the client asked, and stays the comment when there is nothing to report.
             pp = prompt_progress(svc) if want_progress else None
-            yield None if pp is None else {**chunk({}), "prompt_progress": pp}
+            if pp is not None:
+                yield {**chunk({}), "prompt_progress": pp}
+            elif time.monotonic() - beat >= PREFILL_BEAT_S:
+                # A client that resets its idle timer on data events - not on SSE comments - sees silence for as long
+                # as a long prompt takes to read (a 45K-token read is 34 s here, a 190K one minutes); an empty delta
+                # is a real event it can count, and every OpenAI client ignores it.
+                beat = time.monotonic()
+                yield chunk({})
+            else:
+                yield None                         # the SSE comment between two beats, as before
         elif kind == "mcp":
             c = chunk({})
             c["strata_mcp"] = x
@@ -6990,12 +7053,26 @@ def _with_reasoning(lps: dict, entries: list) -> dict:
     return out
 
 
+def _empty_delta(chunk) -> bool:
+    """An OpenAI chunk that says nothing: no content, no role, no tool call, no finish, no MCP or progress field."""
+    choices = chunk.get("choices")
+    return (isinstance(choices, list) and len(choices) == 1 and choices[0].get("delta") == {}
+            and choices[0].get("finish_reason") is None and "strata_mcp" not in chunk and "prompt_progress" not in chunk)
+
+
 def structured_chunks(chunks, validator):
     """Buffer structured streams so a client never receives unvalidated content."""
     buffered = []
     heartbeat = time.monotonic()
     try:
         for chunk in chunks:
+            if chunk is not None and _empty_delta(chunk):
+                # openai_chunks' beat while a long prompt is read (PREFILL_BEAT_S): it carries nothing to validate, and
+                # a client that counts events (not SSE comments) needs it now - buffered, it reached the client only
+                # after the answer, so the read was silent to that client
+                heartbeat = time.monotonic()
+                yield chunk
+                continue
             progress = chunk is not None and "prompt_progress" in chunk
             if chunk is not None and not progress:
                 buffered.append(chunk)      # a progress chunk carries no content: there is nothing in it to validate
@@ -7233,10 +7310,14 @@ def make_handler(svc: Service):
                     raise BadBody(400, "malformed chunked request body")
 
         def _body(self) -> bytes:
-            self.body_read = True
+            """The request body, read once (routing reads it before the handler to check the pool's signature)."""
+            if getattr(self, "_raw", None) is not None:
+                return self._raw
+            self.body_read = True                        # nothing left for the drain to wait for (#594)
             limit = body_limit()
             if self._chunked():
-                return self._read_chunked(limit)
+                self._raw = self._read_chunked(limit)
+                return self._raw
             try:
                 length = int(self.headers.get("Content-Length", 0))
             except ValueError:
@@ -7247,7 +7328,8 @@ def make_handler(svc: Service):
                 self.close_connection = True               # the body is not read: the connection ends with the answer
                 raise BadBody(413, f"the request body is larger than {limit >> 20} MiB "
                                    "(STRATA_MAX_BODY_MIB raises the limit)")
-            return self.rfile.read(length)
+            self._raw = self.rfile.read(length)
+            return self._raw
 
         def _drain_body(self):
             """An answer sent before the body was read (a 401, a 403, /load, a method with no handler) must not close
@@ -7742,7 +7824,8 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
-                                 "loaded": svc.loaded(), "service": "strata"})
+                                 "loaded": svc.loaded(), "service": "strata",
+                                 "pool_role": getattr(svc, "pool_role", "off"), "app": "strata-pool"})
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
                 f = svc.images.file(path[len("/v1/images/files/"):]) if svc.images is not None else None
@@ -7756,6 +7839,18 @@ def make_handler(svc: Service):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif path == "/pool/node":                     # the pool: this PC's public facts (other PCs read them)
+                pm = getattr(svc, "pool", None)
+                self._json(200, pm.node() if pm else {"role": "off", "app": "strata-pool"})
+            elif path == "/pool":
+                if self._authorized():
+                    pm = getattr(svc, "pool", None)
+                    if pm is None:
+                        self._json(404, {"error": {"message": "this server has no pool (mock engine)"}})
+                    else:
+                        # the secret only to this PC itself: a LAN neighbour reading it could join the pool
+                        local = self.client_address[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+                        self._json(200, pm.state(reveal_secret=local))
             elif path == "/status":
                 if not self._authorized():                  # #212: it shows the end of the last answer
                     return
@@ -7816,6 +7911,88 @@ def make_handler(svc: Service):
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
+        def _pool_signed(self, path) -> bool:
+            """A request another PC of the pool sent (routing): signed with the pool secret over this path and body."""
+            pm = getattr(svc, "pool", None)
+            rt = pm.routing() if pm else None
+            return rt is not None and rt.verifier.ok(self.headers.get(pool_route.AUTH_HEADER), path, self._body())
+
+        def _forward(self, target: dict, path: str, req: dict) -> bool:
+            """Pool routing: run this request on another PC and relay its answer as it comes (a stream stays a
+            stream).  False when that PC turned it down before answering (busy, starting, gone): this PC runs it."""
+            pm = svc.pool
+            rt = pm.routing()
+            addr = target["addr"]
+            facts = target.get("facts") or {}
+            body = dict(req)
+            if facts.get("model"):
+                body["model"] = facts["model"]          # the same model; the peer may not know this PC's aliases
+            data = json.dumps(body, ensure_ascii=False).encode()
+            fwd_path = self.path.split("?")[0].rstrip("/")
+            query = self.path[len(self.path.split("?")[0]):]
+            headers = {k: self.headers[k] for k in pool_route.FORWARD_HEADERS if self.headers.get(k)}
+            headers.update({"Content-Type": "application/json", "Content-Length": str(len(data)),
+                            pool_route.ROUTED_HEADER: pm.pc["name"] or "peer",
+                            pool_route.AUTH_HEADER: pool_route.sign(pm.pc["secret"], fwd_path, data)})
+            host, _, port = addr.rpartition(":")
+            rt.begin_forward(addr)
+            started = False
+            hung_up = threading.Event()
+            conn = None
+            try:
+                conn = http.client.HTTPConnection(host.strip("[]"), int(port), timeout=10)
+                conn.request("POST", fwd_path + query, data, headers)
+                conn.sock.settimeout(3600)                 # a long answer that is not streamed comes all at once
+                # #430 here too: a client that hangs up closes the connection to the other PC, which cancels there
+                self._watch_client(hung_up)
+                upstream = conn.sock
+
+                def cut():
+                    hung_up.wait()
+                    if self.watch_done is not None and not self.watch_done.is_set():
+                        try:
+                            upstream.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                threading.Thread(target=cut, daemon=True, name="strata-pool-cut").start()
+                resp = conn.getresponse()
+                if resp.status in (409, 503):              # busy, a worker now, starting: run it here instead
+                    resp.read()
+                    conn.close()
+                    rt.end_forward(addr, fell_back=True)
+                    print(f"[pool] routing: {facts.get('name') or addr} answered {resp.status}; "
+                          "running it on this PC", flush=True)
+                    return False
+                started = True
+                self.send_response(resp.status)
+                for k, v in resp.getheaders():
+                    if k.lower() in ("content-type", "content-length", "cache-control", "x-accel-buffering"):
+                        self.send_header(k, v)
+                self.send_header("X-Strata-Pool-Ran-On", facts.get("name") or addr)
+                self._cors()
+                self.end_headers()
+                while True:
+                    chunk = resp.read1(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                conn.close()
+                return True
+            except (OSError, http.client.HTTPException) as e:
+                if not started:
+                    rt.end_forward(addr, fell_back=True)
+                    print(f"[pool] routing: {facts.get('name') or addr} could not take it ({e}); "
+                          "running it on this PC", flush=True)
+                    return False
+                return True                                 # it broke mid-answer (or the client left): nothing to redo
+            finally:
+                if self.watch_done is not None:
+                    self.watch_done.set()                   # the request is over: the watcher stops
+                hung_up.set()                               # ... and so does the cutter (watch_done is set first)
+                if started:
+                    rt.end_forward(addr)
+
         def do_POST(self):
             try:
                 self._post()
@@ -7823,9 +8000,22 @@ def make_handler(svc: Service):
                 self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
 
         def _post(self):
-            if not self._authorized():
-                return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
+            routed = bool(self.headers.get(pool_route.ROUTED_HEADER))
+            if path == "/pool/route/probe" or routed:
+                # Pool routing: another PC of the pool (its secret, not this server's API key)
+                if not self._pool_signed(path):
+                    self._json(503 if routed else 403, {"error": {"type": "server_error", "message":
+                               "this PC does not take routed requests (not in routing mode, or another pool secret)"}})
+                    return
+                if path == "/pool/route/probe":
+                    try:
+                        self._json(200, svc.pool.routing().answer_probe(json.loads(self._body() or b"{}")))
+                    except ValueError:
+                        self._json(400, {"error": {"message": "bad probe"}})
+                    return
+            elif not self._authorized():
+                return
             path = V1_V1_ALIASES.get(path, path)         # an Anthropic client given ".../v1" as its base posts /v1/v1/messages
             if path.startswith("/v1/") and self._foreign_page():
                 return
@@ -7852,6 +8042,26 @@ def make_handler(svc: Service):
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 self._json(409 if r == "busy" else 200, {"status": r})
+                return
+            if path in ("/pool/config", "/pool/restart"):   # the Pool tab (its own page only)
+                body = self._body()
+                if not self._own_page("the pool can be changed"):
+                    return
+                pm = getattr(svc, "pool", None)
+                if pm is None:
+                    self._json(404, {"error": {"message": "this server has no pool (mock engine)"}})
+                    return
+                try:
+                    if path == "/pool/restart":
+                        pm.restart_engine()
+                        self._json(200, {"status": "restarting"})
+                    else:
+                        req = json.loads(body or b"{}")
+                        if not isinstance(req, dict):
+                            raise ValueError("send the pool config as an object")
+                        self._json(200, pm.apply(req))
+                except ValueError as e:
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                 return
             if path == "/load":                              # load now, e.g. ahead of a request
                 try:
@@ -7924,6 +8134,14 @@ def make_handler(svc: Service):
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
+                rt = svc.pool.routing() if getattr(svc, "pool", None) else None
+                if rt is not None and path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                    if not routed and getattr(svc, "pool_role", "off") == "router":
+                        target = rt.choose(path, req)
+                        if target is not None and self._forward(target, path, req):
+                            return
+                    rt.note_local(path, req, routed)
+                    self._local_routed = rt
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/responses":
@@ -7999,6 +8217,10 @@ def make_handler(svc: Service):
                 svc.drop_embeddings()                        # the images' file of a request that never got to run()
                 if self.watch_done is not None:
                     self.watch_done.set()
+                lr = getattr(self, "_local_routed", None)
+                if lr is not None:
+                    self._local_routed = None
+                    lr.done_local()
                 if self.cancel_event is not None:
                     with svc.status_lock:
                         svc.active_cancels.discard(self.cancel_event)
@@ -8537,11 +8759,20 @@ def make_handler(svc: Service):
                 return self._json(200, anthropic_collect(events))
             self._sse()
             try:
+                last = time.monotonic()
                 for item in events:
                     if item is None:
-                        self.wfile.write(b": keep-alive\n\n")
+                        if time.monotonic() - last >= PREFILL_BEAT_S:
+                            # Anthropic's own ping event, not just the comment: a client's idle timer counts the
+                            # events it parses, and a long prompt read is otherwise minutes of silence (#1619's hole,
+                            # in this dialect)
+                            last = time.monotonic()
+                            self.wfile.write(b'event: ping\ndata: {"type": "ping"}\n\n')
+                        else:
+                            self.wfile.write(b": keep-alive\n\n")
                     else:
                         name, e = item
+                        last = time.monotonic()
                         self.wfile.write(f"event: {name}\n".encode() + b"data: " +
                                          json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
@@ -9570,6 +9801,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     ap.add_argument("--slot-save-path", default=None, metavar="DIR",
                     help="enable POST /slots/0?action=save|restore {\"filename\": NAME} (llama-server's API): the "
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
+    ap.add_argument("--pool-config", help="pool: this PC's pool settings (default: <config>.pool.json, written "
+                                          "by the web app's Pool tab)")
+    ap.add_argument("--role", choices=["off", "router", "coordinator", "worker"],
+                    help="pool: this PC's role for this start only (default: the Pool tab's)")
     ap.add_argument("--replicas", type=int, default=None, metavar="N",
                     help="data-parallel replicas (opt-in): cut the \"gpu\" list into N equal groups and run one engine on "
                          "each, requests spread over them (also \"replicas\" in the config: a number, or "
@@ -9717,11 +9952,28 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             blocked = []
         if blocked:
             ap.error("--offline cannot be strict for this profile: " + "; ".join(blocked))
+    from serve.pool import (PoolConfig, PoolManager, config_problems, coordinator_args, pool_env,  # noqa: E402
+                            strip_pool_args)
+    pc = None
     lazy = False
     if a.engine == "strata":
         if not cfg:
             ap.error("--engine strata needs --config")
         cfg = apply_vision_defaults(with_component_engine(cfg))
+        pc = PoolConfig.load(a.pool_config or str(Path(a.config).with_suffix("")) + ".pool.json")
+        if a.role:
+            pc.data["role"] = a.role                    # this start only (not saved)
+        problems = config_problems(cfg, pc)
+        if problems:
+            print(f"[pool] this PC stays out of the pool for now ({pc.role} in the Pool tab): " +
+                  "; ".join(problems), flush=True)
+            pc.data["role"] = "off"
+        if pc.role == "coordinator" and not pc.enabled_peers():
+            print("[pool] the Pool tab names no worker: running on this PC alone", flush=True)
+            pc.data["role"] = "off"
+        if pc.role == "router" and not [p for p in pc["route_peers"] if p["enabled"]]:
+            print("[pool] routing mode names no other PC: running on this PC alone", flush=True)
+            pc.data["role"] = "off"
         vision = None
         # The engine's own environment. It carries the offline policy too: an engine that fetched a
         # missing shard or a plugin would break the promise the flag makes.
@@ -9753,8 +10005,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                       "encoder's GPU, or the first picture may not get it", flush=True)
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                             env=vision_env(cfg, env), lazy=lazy)
-        print("model unloaded; the first request loads it ..." if lazy else
-              "loading the model (the first start takes a minute or two) ...", flush=True)
+        if pc.role != "worker":                         # a worker's engine waits for a coordinator (below)
+            print("model unloaded; the first request loads it ..." if lazy else
+                  "loading the model (the first start takes a minute or two) ...", flush=True)
         warn_budget_over_ram(engine_args(cfg, announce=False) if "args" in cfg else [])      # #1080
         note = card_note(cfg, env)
         if note:
@@ -9789,30 +10042,48 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             effort_end = effort_end_args(cfg, exe, tok)  # #458
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
-        from serve import replicas as rp
-        try:
-            groups = rp.gpu_groups(cfg)
-        except rp.ReplicaConfigError as e:
-            raise SystemExit(f"[strata] config {e}")
-        from serve import split as split_mod
-        try:
-            split = split_mod.split_spec(cfg)
-            if split:
-                split_mod.check_cfg(cfg, split)
-        except split_mod.SplitConfigError as e:
-            raise SystemExit(f"[strata] config {e}")
-        if groups:
-            engine = start_replicas(cfg, groups, exe, effort_end or [], lazy, offline=a.offline)
-        elif split:
-            engine = start_split(cfg, split, exe, effort_end or [], lazy, offline=a.offline)
+        # the pool's engines (and the Pool tab's role switches, serve/pool.py PoolManager) start from these arguments; the pool
+        # carries the MTP drafter's taps between PCs, not DFlash2's, so a pool role runs the MTP (pool_cfg)
+        base_args = strip_pool_args(engine_args(pool_cfg(cfg), exe, announce=pc.role in ("worker", "coordinator"))) + (effort_end or [])
+        groups = []                                     # replicas' card groups: none on a pool PC (one engine each)
+        split = None                                    # split serving (two cards, one model): none on a pool PC
+        if pc.role == "worker":
+            # the chat engine stays off: the worker engine (serve/pool.py) runs the layers a coordinator assigns
+            print(f"[pool] this PC is a pool worker: it lends its GPU to a coordinator (port {pc['worker_port']})",
+                  flush=True)
+            engine = StrataEngine.deferred(exe, base_args, cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
+        elif pc.role == "coordinator":
+            # loads on a thread once the web app is up: a worker that is offline shows in the Pool tab
+            print(f"[pool] this PC coordinates a pool with {len(pc.enabled_peers())} worker(s): "
+                  f"{', '.join(p['addr'] for p in pc.enabled_peers())}", flush=True)
+            engine = StrataEngine.deferred(exe, base_args + coordinator_args(pc), cwd=cfg.get("cwd"),
+                                           log=cfg.get("log"), env=pool_env(pc, env))
         else:
-            engine = start_engine_or_fallback(cfg, exe, effort_end, env, lazy, tok, offline=a.offline, batch_telemetry=a.batch_telemetry)
+            from serve import replicas as rp
+            try:
+                groups = rp.gpu_groups(cfg)
+            except rp.ReplicaConfigError as e:
+                raise SystemExit(f"[strata] config {e}")
+            from serve import split as split_mod
+            try:
+                split = split_mod.split_spec(cfg)
+                if split:
+                    split_mod.check_cfg(cfg, split)
+            except split_mod.SplitConfigError as e:
+                raise SystemExit(f"[strata] config {e}")
+            if groups:
+                engine = start_replicas(cfg, groups, exe, effort_end or [], lazy, offline=a.offline)
+            elif split:
+                engine = start_split(cfg, split, exe, effort_end or [], lazy, offline=a.offline)
+            else:
+                engine = start_engine_or_fallback(cfg, exe, effort_end, env, lazy, tok, offline=a.offline,
+                                                  batch_telemetry=a.batch_telemetry)
+            warn_tight_ram(engine.info.get("arena_mib"))
+            note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
+                                     linux_desktop()) if not groups and not split else None
+            if note:                                    # #560 #516: before --open starts a browser on that card
+                print(note, flush=True)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
-        warn_tight_ram(engine.info.get("arena_mib"))
-        note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
-                                 linux_desktop()) if not groups and not split else None
-        if note:                                        # #560 #516: before --open starts a browser on that card
-            print(note, flush=True)
     else:
         effort_end = None
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
@@ -10013,15 +10284,24 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
               f"chat: {', '.join(hub.servers)}", flush=True)
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
+    if pc is not None:                                  # the pool
+        svc.pool = PoolManager(svc, cfg, pc, base_args, env, a.port)
+        svc.pool.addresses = lan_addresses
     httpd = serve(svc, host=a.host, port=a.port)
     bound_port = httpd.server_address[1]               # --port 0: report the port the OS actually assigned
     svc.start_idle_unload()
+    if pc is not None:
+        svc.pool.start()
+        if pc.role == "coordinator":
+            svc.pool.load_in_background()
     svc.start_vision_idle()
     here = "[::1]" if a.host == "::" else "127.0.0.1" if a.host in ("0.0.0.0", "") else f"[{a.host}]" if ":" in a.host else a.host
     print(f"ready: http://{here}:{bound_port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
           f"{', API key required' if svc.api_key else ''})", flush=True)
     print(f"       open http://{here}:{bound_port}/ in a browser to chat; close this window to stop the model", flush=True)
+    if pc is not None:
+        print(f"       Pool: http://{here}:{bound_port}/#pool - this PC's role: {pc.role}", flush=True)
     if a.host not in ("127.0.0.1", "localhost", "::1"):
         # issue #26: reachable from other devices - say at which address, and what can still block it
         ips = [f"[{a.host}]"] if ":" in a.host and a.host != "::" else [] if a.host == "::" else lan_addresses()
@@ -10043,7 +10323,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         # on its own thread: webbrowser.open waits for the browser launcher, which on Linux can run for as long as
         # the browser does, and the main thread must be free to take Ctrl+C and SIGTERM (#1872)
         threading.Thread(target=webbrowser.open, daemon=True, name="strata-open-browser",
-                         args=(f"http://{here}:{bound_port}/",)).start()
+                         args=(f"http://{here}:{bound_port}/" +
+                               ("#pool" if pc is not None and pc.role != "off" else ""),)).start()
     if ready_path is not None or event_sink is not None:
         ready_host = f"[{here}]" if ":" in here and not here.startswith("[") else here
         record = {"schema_version": 1, "instance_id": svc.instance_id, "pid": os.getpid(),
@@ -10085,7 +10366,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                 print(f"[strata] drain deadline expired; cancelling {cancelled} owned request(s) ...", flush=True)
                 svc.wait_for_drain(5)
                 drained = False
-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
+        closers = [httpd.shutdown, getattr(svc.pool, "close", None) if getattr(svc, "pool", None) else None,
+                   getattr(engine, "close", None), vision.shutdown if vision else None,
                    hub.close if hub is not None else None]
         try:
             for close in filter(None, closers):
