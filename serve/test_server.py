@@ -2079,7 +2079,11 @@ class IncrementalPrompts(unittest.TestCase):
             self.assertEqual(self.engine.last_ids, full.encode_prompt(msgs, None, {}))
             if turn:
                 self.assertGreater(self.svc.prompts.last_reused, len(prompt) // 3)
-            msgs.append({"role": "assistant", "content": b["choices"][0]["message"]["content"]})
+            # the turn goes back with its thinking, as the model wrote it: a turn sent back without it gets it restored
+            # (#5643, _restore_reasoning; serve/test_restore_reasoning.py), and the reference encode here would lack it
+            reply = b["choices"][0]["message"]
+            msgs.append({"role": "assistant", "content": reply["content"],
+                         **({"reasoning_content": reply["reasoning_content"]} if reply.get("reasoning_content") else {})})
 
     def conversation(self, n):
         """Messages of the n-th conversation: distinct from every other one from the number on."""

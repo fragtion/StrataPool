@@ -122,7 +122,9 @@ target_compile_definitions(strata_metal_kernels PRIVATE
   STRATA_METAL_DATA_DEFAULT="${STRATA_ROOT}/data")
 target_link_libraries(strata_metal_kernels PUBLIC strata_metal_host mtl_rt)
 
-add_executable(strata ${S}/program/generate.cpp)
+# StrataPool: generate.cpp carries the pool (coordinator and worker), so the pool's network sources link here too
+add_executable(strata ${S}/program/generate.cpp ${S}/pool/link.cpp ${S}/pool/net.cpp ${S}/pool/protocol.cpp ${S}/pool/split.cpp
+               ${S}/pool/worker.cpp)
 target_link_libraries(strata PRIVATE strata_metal_kernels strata_metal_host strata_metal_kernels)
 # the decode window on its own (probe/window_probe.cpp): the engine's process state without the engine, for looking at a Metal fault
 add_executable(window_probe probe/window_probe.cpp)

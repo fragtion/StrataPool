@@ -10917,7 +10917,7 @@ int main(int argc, char** argv) {
                     if (const strata::core::VmmChunk h = r.unmap(c)) kvg.spare.push_back(h);
         }
         if (gave > 0 &&
-            (cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess || cudaStreamSynchronize(cudaStreamLegacy) != cudaSuccess)) {
+            res_put(d_res) != cudaSuccess) {   // (res_put: stream 0, as HIP has no cudaStreamLegacy)
             std::fprintf(stderr, "strata: the residency table upload failed: %s\n", cudaGetErrorString(cudaGetLastError()));
             return false;
         }
