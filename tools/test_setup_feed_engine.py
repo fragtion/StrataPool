@@ -66,7 +66,14 @@ class FeedEngine(unittest.TestCase):
     def test_a_release_without_the_zip_falls_back_to_the_feed(self):
         gpu = {"arch": 89, "archs": [89], "vram_gb": 8.0, "index": 0}
         (self.eng / "BUILD.json").write_text(json.dumps({"version": "0.1.45", "source": "prebuilt", "archs": [89]}), encoding="utf-8")
-        with mock.patch.object(setup, "engine_dir", lambda toolkit=13: self.eng),                 mock.patch.object(setup, "_urlopen", side_effect=OSError("HTTP Error 404")),                 mock.patch.object(setup, "engine_from_feed", return_value=self.eng) as feed:
+        # STRATAPOOL: its setup keeps only an engine with the layer split and has no release URL of its own (it compiles):
+        # the fallback is tested the way a published StrataPool build would use it
+        (self.eng / setup.EXE).write_bytes(b"old --pool-listen")
+        with mock.patch.object(setup, "PREBUILT_URL", "https://github.com/Niko1221/Strata/releases/latest/download/"), \
+                mock.patch.object(setup, "PREBUILT_TAG_URL", "https://github.com/Niko1221/Strata/releases/download/v{version}/"), \
+                mock.patch.object(setup, "engine_dir", lambda toolkit=13: self.eng), \
+                mock.patch.object(setup, "_urlopen", side_effect=OSError("HTTP Error 404")), \
+                mock.patch.object(setup, "engine_from_feed", return_value=self.eng) as feed:
             got = setup.get_prebuilt(setup.PREBUILT_URL, gpu, "none", updating=True)
             self.assertEqual(got, self.eng)
             feed.assert_called_once()

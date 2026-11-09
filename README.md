@@ -53,6 +53,8 @@ not speed per chat.
 - **Defaults first.** Split layers with Several chats off is the fastest setup on a two-PC pool; turn on Overlap
   the PCs if your replies are mostly code.
 
+<a id="how-does-it-work"></a>
+
 ## What StrataPool adds
 
 - **The Pool tab:** this PC's role (alone, Share requests, split coordinator or worker), the workers found on the

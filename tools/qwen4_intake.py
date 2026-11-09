@@ -370,13 +370,14 @@ def check_layout(tensors: dict[str, list[int]], g: Geometry, complete: bool) -> 
 TYPE_NAME = G.GGML_TYPES
 SMALL_OK = {0, 1, 30}            # F32, F16, BF16: norms, router, biases, the SSM vectors (q36_engine.cu f32(): F32 / BF16 / F16 / Q8_0)
 MMVQ = {2, 6, 7, 8, 11, 12, 13, 14, 20, 23, 42, 16, 17, 18, 21, 22, 29}        # native_mmvq_supported(): CUDA, SYCL and Metal host copy
+MMVQ_CUDA = MMVQ | {19}          # StrataPool: #1374's IQ1_S (type 19) on CUDA/HIP only
 BACKEND_LISTS = {
     # src/kernels/cuda/iq_kernels.cu: STRATA_GU_FMTS / STRATA_D_FMTS (STRATA_Q6K_EXPERTS=ON, the default) and is_iq().  The HIP
     # build compiles this same file: AMD gfx11 / gfx12 / gfx1151 differ in kernel modes and speed, not in this list.
-    "cuda": {"gu": {16, 17, 18, 21, 22, 23, 29, 42, 12, 13, 14, 6, 2, 3, 8, 40, 144, 145, 147, 148, 149},
+    "cuda": {"gu": {16, 17, 18, 19, 21, 22, 23, 29, 42, 12, 13, 14, 6, 2, 3, 8, 40, 144, 145, 147, 148, 149},
              "down": {20, 23, 42, 7, 6, 2, 3, 8, 13, 14, 40, 144, 146, 147, 148, 149},
-             "is_iq": {16, 17, 18, 20, 21, 22, 23, 29, 42, 11, 12, 13, 14, 7, 6, 2, 3, 8, 40, 144, 145, 146, 147, 148, 149},
-             "mmvq": MMVQ, "embed_extra": {30, 14}},
+             "is_iq": {16, 17, 18, 19, 20, 21, 22, 23, 29, 42, 11, 12, 13, 14, 7, 6, 2, 3, 8, 40, 144, 145, 146, 147, 148, 149},
+             "mmvq": MMVQ_CUDA, "embed_extra": {30, 14}},
     # sycl/src/kernels/cuda/iq_kernels.dp.cpp (the SYCL port; it has no NVFP4 or the Gyro-L pair-trellis types)
     "sycl": {"gu": {16, 17, 18, 21, 22, 23, 29, 42, 12, 13, 14, 6, 2, 3, 8, 144, 145},
              "down": {20, 23, 42, 7, 6, 2, 3, 8, 13, 14, 144, 146},

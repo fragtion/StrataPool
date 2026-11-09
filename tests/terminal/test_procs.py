@@ -151,7 +151,9 @@ class SubreaperOrphans(unittest.TestCase):
             pass
 
         def proc(pid, name, ppid=1):
-            return mock.Mock(pid=pid, **{"name.return_value": name, "exe.return_value": "/x/engine", "info": {
+            # (ppid() / create_time() too: StrataPool's #3789 asks a --serve process for them instead of listing them for all)
+            return mock.Mock(pid=pid, **{"name.return_value": name, "exe.return_value": "/x/engine",
+                                         "ppid.return_value": ppid, "create_time.return_value": 100.0, "info": {
                 "pid": pid, "ppid": ppid, "cmdline": ["engine", "--serve"], "create_time": 100.0}})
 
         me = mock.Mock(**{"parents.return_value": [proc(p, n) for p, n in ancestors]})

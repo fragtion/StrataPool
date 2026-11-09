@@ -25,7 +25,10 @@ class PackagedSetupWithoutCMake(unittest.TestCase):
             self.assertEqual(S.source_version(), "0")
 
     def test_prebuilt_bases_names_the_latest_release_when_there_is_no_source_tree(self):
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(S, "ROOT", Path(tmp)):
+        # STRATAPOOL: its PREBUILT_URL is empty (it compiles its own engine): tested with Strata's release URLs
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(S, "ROOT", Path(tmp)), \
+                mock.patch.object(S, "PREBUILT_URL", "https://github.com/Niko1221/Strata/releases/latest/download/"), \
+                mock.patch.object(S, "PREBUILT_TAG_URL", "https://github.com/Niko1221/Strata/releases/download/v{version}/"):
             self.assertEqual(S.prebuilt_bases(S.PREBUILT_URL), [S.PREBUILT_URL])
             (Path(tmp) / "CMakeLists.txt").write_text("project(strata VERSION 0.1.52)\n", encoding="utf-8")
             bases = S.prebuilt_bases(S.PREBUILT_URL)

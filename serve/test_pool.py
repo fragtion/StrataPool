@@ -31,6 +31,14 @@ ROOT = Path(__file__).resolve().parents[1]
 FAKE = textwrap.dedent('''\
     #!{python}
     import os, sys, time
+    if os.name == "nt":   # started by a .cmd: end with it (killing cmd.exe leaves its child running, holding the logs)
+        import ctypes, threading
+        def _watch(ppid=os.getppid()):
+            h = ctypes.windll.kernel32.OpenProcess(0x100000, False, ppid)   # SYNCHRONIZE
+            if h:
+                ctypes.windll.kernel32.WaitForSingleObject(h, 0xFFFFFFFF)
+            os._exit(0)
+        threading.Thread(target=_watch, daemon=True).start()
     args = sys.argv[1:]
     log = sys.stderr
     if "--pool-listen" in args:
@@ -72,6 +80,15 @@ FAKE = textwrap.dedent('''\
 
 
 def fake_engine(tmp: Path) -> str:
+    if os.name == "nt":   # no shebangs on Windows: a .cmd runs the same fake engine (as test_fatal_recovery does)
+        py = tmp / "strata-fake.py"
+        py.write_text(FAKE.format(python=sys.executable))
+        cmd = tmp / "strata-fake.cmd"
+        # the rem line: engine_has_pool() looks for the split's flag in the engine file. The base interpreter: a venv's
+        # python.exe is a launcher that runs it as a child, which would hide cmd.exe's end from the watchdog above.
+        real = getattr(sys, "_base_executable", None) or sys.executable
+        cmd.write_text(f'@rem fake engine with --pool-listen\r\n@"{real}" "{py}" %*\r\n')
+        return str(cmd)
     p = tmp / "strata-fake"
     p.write_text(FAKE.format(python=sys.executable))
     p.chmod(p.stat().st_mode | stat.S_IEXEC)
