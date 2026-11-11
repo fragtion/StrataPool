@@ -5,6 +5,7 @@
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/ple_residency.hpp"
+#include "strata/core/resident_ram_copy.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/peer_experts.hpp"
@@ -3630,7 +3631,8 @@ bool FileExpertSource::pin_cache_complement_attempt(
         // they fit, the rest left on the mapped files. Commit limits only the retry, so a page file can grow (#730).
         uint64_t physical = budget_physical;
         if (retry == nullptr && !available_memory_bytes(physical)) {
-            err = "FileExpertSource: cannot determine available memory for --resident-budget-gib";
+            err = budget_automatic_ ? "FileExpertSource: cannot determine available memory for the automatic RAM copy"
+                                    : "FileExpertSource: cannot determine available memory for --resident-budget-gib";
             return false;
         }
         budget_physical = physical;
@@ -3642,16 +3644,10 @@ bool FileExpertSource::pin_cache_complement_attempt(
             // #403: 256 MiB under the room, so the engine's own allocations after this reading still leave the
             // headroom (a budget clamped to exactly the room failed the safety check below on a reading a few MB
             // lower).  An unclamped budget is unchanged.
-            if (what_fits)
-                std::fprintf(stderr, "FileExpertSource: room for the complement: %.2f GiB (%.2f GiB available %s "
-                                     "minus %.0f GiB headroom and a 0.25 GiB margin)\n",
-                             (double) clamped / 1073741824.0, (double) available / 1073741824.0, limit,
-                             (double) headroom_bytes / 1073741824.0);
-            else
-                std::fprintf(stderr, "FileExpertSource: --resident-budget-gib %.2f exceeds available %s "
-                                     "(%.2f GiB minus %.0f GiB headroom and a 0.25 GiB margin): %.2f GiB\n",
-                             (double) budget_bytes / 1073741824.0, limit, (double) available / 1073741824.0,
-                             (double) headroom_bytes / 1073741824.0, (double) clamped / 1073741824.0);
+            // the automatic RAM copy names no flag: none was given (its line used to say --resident-budget-gib)
+            const ResidentBudgetFrom from = what_fits ? ResidentBudgetFrom::WhatFits
+                                          : budget_automatic_ ? ResidentBudgetFrom::Automatic : ResidentBudgetFrom::Flag;
+            std::fputs(resident_clamp_line(from, budget_bytes, limit, available, headroom_bytes, clamped).c_str(), stderr);
             budget_bytes = clamped;
         }
         std::vector<uint64_t> ranked(offsets.size(), kNoComplement);
@@ -4266,7 +4262,8 @@ bool FileExpertSource::pin_cache_complement_attempt(
                              "cost 26%%). %s and restart; the line above should read N of N.\n", missing, lendable,
                      100.0 * (double) missing / (double) std::max<long long>(1, lendable),
                      lend ? "Free RAM or lower STRATA_RESIDENT_HEADROOM_GIB (now the RAM left free at start)"
-                          : "Raise --resident-budget-gib (the lend region comes after the ranked experts)");
+                          : budget_automatic_ ? "Free more RAM for the automatic RAM copy (the lend region comes after the ranked experts)"
+                                              : "Raise --resident-budget-gib (the lend region comes after the ranked experts)");
     }
     if (!stage_lend_regions_.empty()) {
         int64_t offered = 0;
