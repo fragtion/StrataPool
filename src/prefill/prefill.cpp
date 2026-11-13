@@ -335,6 +335,18 @@ std::atomic<bool> g_cpu_pool_busy{false};
 // STRATA_PREFILL_CPU_SHARE_BATCH: a slot is decoding beside this read (Prefill::set_share_blocked): the pool is its windows'
 std::atomic<bool> g_share_blocked{false};
 double g_pinned_share = 1.0;
+// The experts the GPU cannot DMA directly lie in RESIDENT RAM (the arena: locked, large pages where
+// possible), so the stager's copies are plain memcpy at RAM speed - not file reads, not a page-cache copy.  Then an
+// unpinned share is not a reason for the small ring (the 96 slots were measured where the host copies were the limit,
+// IQ3_S on a 64 GB PC): the staging pipeline keeps the pinned ring and gets more copy threads and pinned buffers
+// (Prefill::set_resident_stage; STRATA_STAGE_RESIDENT=0 keeps the old sizing).
+bool g_resident_stage = false;
+inline bool resident_stage() {
+    static const int env = [] { const char* v = std::getenv("STRATA_STAGE_RESIDENT"); return v == nullptr ? -1 : (v[0] != '0'); }();
+    return env < 0 ? g_resident_stage : env == 1;
+}
+// The streamed ring's full size: (nearly) every streamed expert pinned, or the unpinned ones staged from resident RAM.
+inline bool full_ring() { return g_pinned_share >= 0.9 || resident_stage(); }
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
 // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
 // and 96 when a large share goes through host copies (IQ3_S on 64 GB, a third unpinned: 96 slots 1216, 256 1070 -
@@ -399,7 +411,7 @@ inline int ring_cap() { return fused_ring() && !strata::kernels::cpu::expert_lay
 inline constexpr uint64_t Q2_0_BLOB = 1382400ull;   // the blob of the pack the ring was tuned on
 inline uint64_t ring_bytes() {
     const uint64_t slots = fused_ring() ? 1024ull : 384ull;   // #136: a fused ring holds two layers' experts
-    return (g_pinned_share >= 0.9 ? slots : slots / 4) * Q2_0_BLOB;
+    return (full_ring() ? slots : slots / 4) * Q2_0_BLOB;
 }
 // ...and what that buys on THIS pack, never past ring_cap(): the slot count `init` lays out, and what the auto
 // chunk scan treats as a full ring.  A pack whose blobs are larger than Q2_0's gets fewer slots for the same
@@ -456,7 +468,7 @@ inline int ring_slots(size_t T) {
     // is not what is competing for VRAM.
     // 0.1.39's ring (1024 fused / 384 pinned, 96 when a large share goes through host copies), and the #583 byte
     // budget the auto scan chose for chunks past the size 0.1.39's rule would have picked (set_ring_budget)
-    const int pinned_ring = g_pinned_share >= 0.9 ? (fused_ring() ? 1024 : 384) : 96;
+    const int pinned_ring = full_ring() ? (fused_ring() ? 1024 : 384) : 96;
     const bool budget = ring_bytes_on() && g_ring_budget > 0 && (int64_t) T > g_ring_small_max;
     const int r = v ? std::atoi(v) : g_ring_override > 0 ? g_ring_override : budget ? g_ring_budget : pinned_ring;
     if (v && r == STAGE) return STAGE; // Explicit opt-in to routed-only staging, including large chunks.
@@ -1843,13 +1855,16 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     cudaGetDevice(&m.device);
     if (stage_le_ < 0) stage_le_ = g.n_layers;
-    if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers || (stage_le_ < g.n_layers) != (next_ != nullptr)) {
+    const bool hands_on = next_ != nullptr || (bool) remote_next;   // POOL: or to the pool's workers
+    if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers ||
+        (stage_le_ < g.n_layers && !hands_on && !headless_) || (stage_le_ == g.n_layers && hands_on) ||
+        (next_ != nullptr && remote_next)) {
         err = "prefill: the stage's layer range is wrong";
         return false;
     }
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
     arm_cpu_share(cpu_pool_ != nullptr);
-    for (int b = 0; next_ != nullptr && b < 2; ++b)
+    for (int b = 0; hands_on && b < 2; ++b)
         if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
             err = "prefill: the layer split's hand-off buffers";
             return false;
@@ -1906,8 +1921,15 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                 std::fprintf(stderr, "prefill: the GGUF experts are %.0f%% in the page cache; the stager takes the RAM profile\n", warm * 100.0);
             }
         }
-        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 : std::max(2, std::min(4, hw / 4));
+        // A large unpinned share staged from resident RAM: 8 copy threads (a quarter of the CPU's, at
+        // least 4) and 64 pinned buffers (~180 MiB of NVFP4 blobs, charged to the GPU's shared budget like any pin).
+        // One memcpy thread already moves ~30 GB/s on a dual-channel DDR5 PC and the pipeline tops at ~25 GB/s there
+        // (RAM-bound: read, write, the DMA's read); the buffers let the copies run a layer's worth ahead of the DMAs.
+        const bool stage_big = !files && g_pinned_share < 0.9 && resident_stage();
+        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 :
+                            stage_big ? std::max(4, std::min(8, hw / 4)) : std::max(2, std::min(4, hw / 4));
         if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
+        if (stage_big && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 64;
         // pp-opt: with files, each thread claims runs of neighbouring blobs and reads them as one request (copy_blobs);
         // STRATA_STAGER_BATCH=1 is the A/B arm (one blob per request, as before)
         {
@@ -1917,6 +1939,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         }
         if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
         m.stager->batch = std::min(m.stager->batch, m.stager->kRing);
+        if (stage_big)
+            std::fprintf(stderr, "prefill: %.0f%% of the expert bytes are not pinned: the stager copies them from resident RAM with "
+                                 "%d threads into %d pinned buffers (%.0f MiB) and the streamed ring keeps its pinned size "
+                                 "(STRATA_STAGE_RESIDENT=0: 4 threads, 16 buffers, a quarter ring)\n",
+                         100.0 * (1.0 - g_pinned_share), threads, m.stager->kRing,
+                         (double) m.stager->kRing * (double) MAXBLOB() / 1048576.0);
     }
     pf_mark("init: stager ring (pinned host buffers)", tr_last, (uint64_t) m.stager->kRing * (uint64_t) MAXBLOB());
     if (!m.warmer && src != nullptr && src->warms()) {
@@ -2770,6 +2798,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
 }
 
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
+void Prefill::set_resident_stage(bool on) { g_resident_stage = on; }
 void Prefill::set_ring_override(int slots) { g_ring_override = slots > 0 ? slots : 0; }
 void Prefill::set_ring_budget(int slots, int64_t small_max) {
     g_ring_budget = slots > 0 ? slots : 0;
@@ -2958,7 +2987,7 @@ uint64_t Prefill::bytes_needed_no_ring(const core::ModelGeometry& g, const core:
 }
 
 int64_t Prefill::ring_default_slots() {
-    const int r = g_pinned_share >= 0.9 ? (fused_ring() ? 1024 : 384) : 96;
+    const int r = full_ring() ? (fused_ring() ? 1024 : 384) : 96;
     return (int64_t) std::min(r, ring_cap());
 }
 
@@ -2973,7 +3002,7 @@ int64_t Prefill::ring_cap_for(int64_t old_chunk) {
 
 // the unpinned arm keeps its measured 96 (the PR's rule; the byte budget would have been ~49 slots on IQ3_S)
 int64_t Prefill::ring_max_slots() {
-    return g_pinned_share >= 0.9 ? (int64_t) ring_budget_slots() : (int64_t) std::min(96, ring_cap());
+    return full_ring() ? (int64_t) ring_budget_slots() : (int64_t) std::min(96, ring_cap());
 }
 
 int64_t Prefill::ring_slots_for(int64_t chunk) { return ring_slots((size_t) chunk); }
@@ -6268,7 +6297,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
-        if (next_ != nullptr) {
+        if (next_ != nullptr || remote_next) {
             // The current hand-off slot was used two chunks ago.
             float* h = m.hand[hand_buf_];
             const int hp = m.hand_pieces;
@@ -6298,6 +6327,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
             if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
             next_err_.clear();
+            if (remote_next) {   // POOL: the next layers are on other PCs
+                next_run_ = std::async(std::launch::async, [this, h, tokens, c0, T, p0] {
+                    strata::aux_cpus::pin_current_thread();
+                    return remote_next(h, tokens + c0, T, p0, next_err_);
+                });
+                hand_buf_ ^= 1;
+                continue;   // the last stage reports the chunk (on_chunk)
+            }
             next_->hand_in_ = h;
             next_->hand_ev_ = hp > 0 ? static_cast<const void*>(m.hand_ev[hand_buf_]) : nullptr;
             next_->hand_pieces_ = hp;
@@ -6633,6 +6670,9 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
     // no layer-major form
     const bool split = stage_lb_ != 0 || stage_le_ != g.n_layers || next_ != nullptr;
     if (hand_in_ != nullptr) { why = "a layer split's chunk hand-off is in use"; return 0; }
+    // POOL: the coordinator hands each chunk's rows to the workers as it reads it (remote_next), a worker returns them
+    // per chunk (headless): the walk has no such hand-off yet
+    if (remote_next || headless_) { why = "a pool split (its workers take the rows chunk by chunk)"; return 0; }
     if (m.pp || helper_ != nullptr || core::peer_portable()) { why = "a peer GPU"; return 0; }
     // the PLE block (layer 1) reads the token history: on a split it runs in a first stage that holds layers 0 and 1
     // (a later stage never reaches it)

@@ -10,6 +10,14 @@
 # building for a pre-Ampere arch would produce a binary that runs and is wrong about its own performance, which is
 # the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
+# The compiler probe that project() runs compiles a test program with the DEBUG flags; the MSVC default
+# (/Zi + /RTC1) asks cl.exe to bring up c1xx.dll with debug records, which some process monitors refuse
+# outright (D8050: "failed to get command line into debug records").  The probe needs no debug info, and
+# these builds are Release anyway; set BEFORE project() so the probe sees them.
+if(WIN32)
+  set(CMAKE_C_FLAGS_DEBUG "-MDd" CACHE STRING "")
+  set(CMAKE_CXX_FLAGS_DEBUG "-MDd" CACHE STRING "")
+endif()
 project(strata VERSION 0.1.59.1 LANGUAGES CXX)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/strata_geometry.cmake)   # -DSTRATA_GEOMETRY=<name>: the model shape the kernels are compiled for (default flash_next, no flag added)
 # The build is cut by backend (cleanup 5.4): each file below only DEFINES macros (strata_<part>()), which run here, in this scope, at the place their
@@ -33,9 +41,13 @@ endif()
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 # issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
 # be read back to the exact source line
+option(STRATA_RELEASE_PDB "keep a PDB beside the Release exe (needs /Zi + /DEBUG)" ON)
 if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
-  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zi>)
-  add_link_options(/DEBUG /OPT:REF /OPT:ICF)
+  if(STRATA_RELEASE_PDB)   # OFF where cl.exe cannot create its PDB folders: only the debug symbols are skipped
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zi>)
+    add_link_options(/DEBUG)
+  endif()
+  add_link_options(/OPT:REF /OPT:ICF)
 endif()
 
 # The prebuilt release (setup.py downloads it, so users need no compiler): ggml's CPU backend for any AVX2 CPU
@@ -238,6 +250,9 @@ add_library(strata_warnings INTERFACE)
 target_compile_options(strata_warnings INTERFACE
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/W4>
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/utf-8>
+  # StrataPool: generate.cpp (the pool's coordinator and worker on top of Strata's) can pass MSVC's 65,279 sections
+  # per object file (C1128); /bigobj lifts that limit and changes nothing else
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/bigobj>
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wall>
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wextra>
   $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/W4>

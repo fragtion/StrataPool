@@ -28020,6 +28020,72 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PIPELINE_LOOKUP_ANY",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 18539,
+     "backend": "cuda-hip",
+     "fn": "pl_on_env"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "4b2539fa23",
+   "first_date": "2026-10-06",
+   "since": null,
+   "last_commit": "4b2539fa23",
+   "last_date": "2026-10-06",
+   "status": "default",
+   "owner": "pool",
+   "note": "StrataPool (Architectds pipelined decode): a long lookup match also continues after a chain window; on by default, =0 off",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_PIPELINE_LOOKUP_NEXT",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 18538,
+     "backend": "cuda-hip",
+     "fn": "pl_on_env"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "4b2539fa23",
+   "first_date": "2026-10-06",
+   "since": null,
+   "last_commit": "4b2539fa23",
+   "last_date": "2026-10-06",
+   "status": "default",
+   "owner": "pool",
+   "note": "StrataPool (Architectds pipelined decode): a copied stretch takes the next window from the same lookup; on by default, =0 off",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_PIPELINE_LOOKUP_PON",
    "backends": [
     "cuda-hip",
@@ -28289,6 +28355,39 @@
    "status": "research",
    "owner": "program",
    "note": "[auto] diagnostic / trace / measurement switch by name or by code, not documented for users",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_PIPELINE_YIELD",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 18537,
+     "backend": "cuda-hip",
+     "fn": "pl_on_env"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "4b2539fa23",
+   "first_date": "2026-10-06",
+   "since": null,
+   "last_commit": "4b2539fa23",
+   "last_date": "2026-10-06",
+   "status": "default",
+   "owner": "pool",
+   "note": "StrataPool (Architectds pipelined decode): the verified window is served first; on by default, =0 off",
    "retire_after": "",
    "retired_in": ""
   },
@@ -28796,6 +28895,42 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_POOL_CALIB",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 5667,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/POOL.md:226",
+    "docs/POOL.md:227"
+   ],
+   "first_commit": "fa512d6599",
+   "first_date": "2026-10-06",
+   "since": null,
+   "last_commit": "fa512d6599",
+   "last_date": "2026-10-06",
+   "status": "research",
+   "owner": "pool",
+   "note": "StrataPool: the file of the learned split timings (default pool-split-measured.txt beside the engine); =0 turns it off",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_POOL_CORES",
    "backends": [
     "cuda-hip",
@@ -28835,6 +28970,117 @@
    "status": "opt-in",
    "owner": "program",
    "note": "[reviewed] Experimental, off by default --pool-cores option, documented. [notes-022-cores.md:33]",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_POOL_HOP_MS",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 5623,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "float",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "7b352b1566",
+   "first_date": "2026-10-06",
+   "since": null,
+   "last_commit": "7b352b1566",
+   "last_date": "2026-10-06",
+   "status": "research",
+   "owner": "pool",
+   "note": "StrataPool: the network hop time (ms) the split search assumes, instead of its built-in estimate",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_POOL_PIN_GIB",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 5416,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "float",
+   "default_state": null,
+   "code_default": "0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/POOL.md:181"
+   ],
+   "first_commit": "7e3a156e61",
+   "first_date": "2026-10-06",
+   "since": null,
+   "last_commit": "7e3a156e61",
+   "last_date": "2026-10-06",
+   "status": "research",
+   "owner": "pool",
+   "note": "StrataPool: the RAM (GiB) a pool PC may pin for experts and K/V in the split search; =0 no limit",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_POOL_SECRET",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 3955,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [
+    "serve/pool.py"
+   ],
+   "launch_sets": [
+    {
+     "file": "serve/pool.py",
+     "line": 267,
+     "value": "pc[\"secret\"]"
+    }
+   ],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/POOL.md:347"
+   ],
+   "first_commit": "7b352b1566",
+   "first_date": "2026-10-06",
+   "since": null,
+   "last_commit": "7b352b1566",
+   "last_date": "2026-10-06",
+   "status": "default",
+   "owner": "pool",
+   "note": "StrataPool: the pool secret when --pool-secret is not given (both PCs share it)",
    "retire_after": "",
    "retired_in": ""
   },
@@ -38091,6 +38337,41 @@
    "status": "opt-in",
    "owner": "core",
    "note": "[reviewed] \"STRATA_STAGE_PIN=1, opt-in since 0.1.41\". [notes-145-pp-cache.md:31]",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_STAGE_RESIDENT",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/prefill.cpp",
+     "line": 344,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/POOL.md:374"
+   ],
+   "first_commit": "0968ff1d30",
+   "first_date": "2026-10-27",
+   "since": null,
+   "last_commit": "aa9a6689ce",
+   "last_date": "2026-10-27",
+   "status": "rollback",
+   "owner": "pool",
+   "note": "StrataPool: =0 keeps the old prompt staging ring sizing for resident experts (#4283-era stager)",
    "retire_after": "",
    "retired_in": ""
   },

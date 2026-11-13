@@ -222,7 +222,8 @@ NativeDense::~NativeDense() {
 bool NativeDense::load(const std::vector<std::string> &shards,
                        WeightTable &table, std::string &err,
                        bool include_ple_key, int64_t layer_lo,
-                       int64_t layer_hi) try {
+                       int64_t layer_hi,
+                       const std::set<std::string>* skip) try {   // StrataPool: `skip` as in src/core/native_dense.cpp
     auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
         if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
         const long l = std::strtol(name.c_str() + 4, nullptr, 10);
@@ -312,6 +313,7 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                 auto& ref = found->second;
                 if (ref.native_data) { err = "native dense: override already attached"; return false; }
                 if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
+                if (skip != nullptr && skip->count(tensor.name)) continue;   // POOL: another PC's layer
                 // #326: the pack keeps an unquantized (--compat-bf16) key, which the PLE reads from the arena
                 if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;
                 if (!ref.quantized() || tensor.shape.size() != 2 ||

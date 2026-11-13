@@ -246,6 +246,9 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
     // PROCESS must enable it in its own token (AdjustTokenPrivileges) before VirtualAlloc, or the call fails.
     // An account without the assignment, or a failure to enable, leaves the process as it was: VirtualAlloc
     // then refuses and the 4 KB fallback below runs - that is the EXPECTED outcome on a desktop.
+    // StrataPool: whether the token holds the privilege at all (AdjustTokenPrivileges "succeeds" with
+    // ERROR_NOT_ALL_ASSIGNED when it does not), so a refusal below can say which of the usual causes it is.
+    bool lock_held = false;
     {
         HANDLE tok = nullptr;
         if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
@@ -253,8 +256,8 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
             tp.PrivilegeCount = 1;
             if (LookupPrivilegeValueW(nullptr, L"SeLockMemoryPrivilege", &tp.Privileges[0].Luid)) {
                 tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-                if (!AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr) && GetLastError() != ERROR_NOT_ALL_ASSIGNED)
-                    (void) 0;   // nothing actionable: the large-page attempt below reports the outcome
+                lock_held = AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr) &&
+                            GetLastError() != ERROR_NOT_ALL_ASSIGNED;
             }
             CloseHandle(tok);
         }
@@ -277,9 +280,16 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         }
         // 1450 (ERROR_NO_SYSTEM_RESOURCES) is the large-page pool saying no, 87 is a size that is not a
         // multiple of the minimum, 1314 is the privilege: without the byte count the three read as one bug.
+        const DWORD le = GetLastError();
         note = "large pages refused for " + std::to_string((unsigned long long) lbytes) + " B (GetLargePageMinimum=" +
                std::to_string((unsigned long long) large) + ", VirtualAlloc error " +
-               std::to_string((unsigned long long) GetLastError()) + "); using 4 KB pages";
+               std::to_string((unsigned long long) le) + "); using 4 KB pages";
+        if (!lock_held)
+            note += " - this process does not hold 'Lock pages in memory': an account given it holds it after signing "
+                    "out and in, and an administrator account under UAC only in a program run as administrator";
+        else if (le == ERROR_NO_SYSTEM_RESOURCES)
+            note += " - the privilege is held, but Windows has no free 2 MB pages this large (RAM fragmented since "
+                    "boot: right after a restart they are there)";
     } else if (std::getenv("STRATA_NO_LARGEPAGES") != nullptr) {
         note = "large pages skipped (STRATA_NO_LARGEPAGES); using 4 KB pages";
     } else {
@@ -578,6 +588,7 @@ int arena_pin_cap_gib() {
     if (e == nullptr || *e == '\0') return -1;
     if (std::string(e) == "none") return -1;   // 153-igpu: handled by arena_no_register(); no cap otherwise
     if (std::string(e) == "auto") return -2;   // #243: the Windows shared-memory budget sets the sliced pin's cap
+    if (std::string(e) == "none") return -3;   // nothing pinned (`0` stays the whole arena, as documented)
     const int v = std::atoi(e);
     return v < 0 ? -1 : v;
 }
@@ -773,6 +784,10 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
         if (cap == 0 && env_gib > 0) {
             cap = (uint64_t) env_gib << 30;
             cap_why = "by STRATA_ARENA_PIN_GIB";
+        }
+        if (env_gib == -3 && cap <= 1) {   // STRATA_ARENA_PIN_GIB=none: no slice fits one byte
+            cap = 1;
+            cap_why = "by STRATA_ARENA_PIN_GIB=none (nothing pinned)";
         }
         const bool capped = cap > 0 && cap < bytes && bounds.size() >= 2;
         const cudaError_t e = capped ? cudaSuccess :

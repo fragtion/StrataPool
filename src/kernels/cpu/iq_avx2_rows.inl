@@ -298,10 +298,60 @@ inline void row_dot_iq1m(const uint8_t* row, int nblocks, const block_q8_K* cons
     for (int t = 0; t < NT; ++t) res[t] = ggml_hsum8(acc1[t]) + 0.125f * ggml_hsum8(acc2[t]);
 }
 
+// ---- IQ1_S (19): 256 values as 8 sub-blocks of 32.  Each sub-block is four 8-value grid entries
+// (iq1s_grid) plus one `qh` word: a 4-bit scale selector (bits 12-14) and a sign bit (15) for the -1 +/- 1/8
+// delta every value carries.  The grid half is the same maddubs/madd pair as the other formats (the grid
+// bytes are 0/-1/+1, so ggml's mul_add sign trick applies); the delta half is a scalar per sub-block,
+// ls * delta * (sum of the sub-block's activations), which q8_K precomputes in `bsums` as groups of 16.
+// StrataPool (#1374, Yxmura; upstream has IQ1_M only). Ported from ggml's ggml_vec_dot_iq1_s_q8_K (arch/x86/quants.c); only the float-addition order differs.
+template <int NT> STRATA_ROWS_FN
+inline void row_dot_iq1s(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
+    __m256 accf[NT];
+    float accd[NT];
+    for (int t = 0; t < NT; ++t) { accf[t] = _mm256_setzero_ps(); accd[t] = 0.f; }
+    const int pf = prefetch_distance();
+    for (int i = 0; i < nblocks; ++i) {
+        const uint8_t* blk = row + (size_t) i * 50;
+        rows_ahead(blk, pf);
+        __m256i acci[NT];
+        float sd[NT];
+        for (int t = 0; t < NT; ++t) { acci[t] = _mm256_setzero_si256(); sd[t] = 0.f; }
+        for (int ib = 0; ib < 8; ++ib) {
+            const uint16_t qh = u16(blk + 34 + 2 * ib);
+            const uint8_t* qs = blk + 2 + 4 * ib;
+            const __m256i g = _mm256_set_epi64x(
+                (long long) iq1s_grid[qs[3] | ((qh >> 1) & 0x700)],
+                (long long) iq1s_grid[qs[2] | ((qh << 2) & 0x700)],
+                (long long) iq1s_grid[qs[1] | ((qh << 5) & 0x700)],
+                (long long) iq1s_grid[qs[0] | ((qh << 8) & 0x700)]);
+            const int lsv = 2 * ((qh >> 12) & 7) + 1;
+            const __m256i sc = _mm256_set1_epi16((short) lsv);
+            const float sgn = (qh & 0x8000) ? -1.f : 1.f;
+            for (int t = 0; t < NT; ++t) {
+                const __m256i yv = _mm256_loadu_si256((const __m256i*) (y[t][i].qs + 32 * ib));
+                // iq1s_grid holds signed values in {-1,0,1}: ggml's mul_add_epi8 trick (|g| as the maddubs
+                // operand, q8's sign taken from g) - a direct maddubs would read -1 as 255.
+                const __m256i ga = _mm256_sign_epi8(g, g);
+                const __m256i ys = _mm256_sign_epi8(yv, g);
+                acci[t] = madd_add(acci[t], _mm256_maddubs_epi16(ga, ys), sc);
+                sd[t] += sgn * (float) lsv * (float) (y[t][i].bsums[2 * ib] + y[t][i].bsums[2 * ib + 1]);
+            }
+        }
+        const float dx = h2f(u16(blk));
+        for (int t = 0; t < NT; ++t) {
+            const float dd = dx * y[t][i].d;
+            accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dd), _mm256_cvtepi32_ps(acci[t]), accf[t]);
+            accd[t] += dd * sd[t];
+        }
+    }
+    for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]) + IQ1S_DELTA * accd[t];
+}
+
 template <int TY, int NT, bool EX = false> STRATA_ROWS_FN
 inline void row_dot_any(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res,
                         const int16_t* const* aux = nullptr) {
     if constexpr (TY == 29) row_dot_iq1m<NT>(row, nblocks, y, aux, res);
+    else if constexpr (TY == 19) row_dot_iq1s<NT>(row, nblocks, y, res);
     else if constexpr (TY == 17) row_dot_iq2xs<NT, EX>(row, nblocks, y, res);
     else                    row_dot<TY, NT, EX>(row, nblocks, y, res);
 }
@@ -585,6 +635,7 @@ void gu_type(int type, int nt, const uint8_t* blob, size_t gu_row, size_t up_off
         case 22: gu_rows_nt<G ? 122 : 22, EX>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 23: gu_rows_nt<23, EX>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 29: gu_rows_nt<29, EX>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 19: gu_rows_nt<19, false>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;   // (no exact/wide form: #1374's rows)
         default: break;
     }
 }
@@ -600,6 +651,7 @@ void dot_type(int type, int nt, const uint8_t* w, size_t row_bytes, int n, const
         case 22: dot_rows_nt<G ? 122 : 22, EX>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 23: dot_rows_nt<23, EX>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 29: dot_rows_nt<29, EX>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 19: dot_rows_nt<19, false>(nt, w, row_bytes, n, act, out, r0, r1); break;
         default: break;
     }
 }

@@ -644,6 +644,11 @@ class Telemetry:
     def close(self):
         """Ends the sampler thread (a server that stops, a test's service): it used to run for the life of the process."""
         self._stop.set()
+        # wait for it to end (a sample in progress takes a moment): a closed server leaves no sampler behind, so the
+        # next server's thread count starts clean (test_responses' NoLeakedSampler raced the previous test's sampler)
+        t = getattr(self, "_thread", None)
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=5.0)
 
     def _loop(self):
         """One sample a second, for as long as the server lives.
