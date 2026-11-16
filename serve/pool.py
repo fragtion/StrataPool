@@ -53,7 +53,7 @@ class PoolConfig:
     (lends its GPU to a coordinator).  Every PC of a pool shares `secret`."""
 
     DEFAULTS = {"role": "off", "name": "", "secret": "", "worker_port": ENGINE_PORT, "peers": [], "split": "auto",
-                "wire": "f32", "draft_wire": "f16", "prefill_wire": "f16", "discovery": True, "several_chats": False,
+                "wire": "f32", "draft_wire": "f16", "prefill_wire": "f32", "discovery": True, "several_chats": False,
                 "overlap_windows": False, "chat_drafts": False,
                 "route_peers": [], "primary": False, "move_tokens": 8000, "env": {}}
 

@@ -327,7 +327,7 @@
       $("pool-split").hidden = !manual;
       if (document.activeElement !== $("pool-split")) $("pool-split").value = manual ? draft.split : "";
       setSeg("pool-wire", draft.wire);
-      setSeg("pool-prefill-wire", draft.prefill_wire || "f16");
+      setSeg("pool-prefill-wire", draft.prefill_wire || "f32");
       setSeg("pool-chats", draft.several_chats ? "on" : "off");
       $("pool-chats-note").hidden = !draft.several_chats;   // the cost is said where it is paid
       setSeg("pool-chat-drafts", draft.chat_drafts ? "on" : "off");

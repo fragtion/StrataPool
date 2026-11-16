@@ -6229,7 +6229,7 @@ int main(int argc, char** argv) {
         common.set("rope_attn_factor", rope_cfg.attn_factor);
         common.set("rope_beta_fast", rope_cfg.beta_fast);
         common.set("rope_beta_slow", rope_cfg.beta_slow);
-        pool_link.set_prefill_wire(pool_prefill_wire);   // a worker confirms it in READY (else the decode wire)
+        pool_link.set_prefill_wire(pool_prefill_wire);   // configure() falls back to the decode wire when a worker did not say prefill_wire in its HELLO
         if (!pool_link.configure(pool_at, g.n_layers, common, pool_wire, pool_draft_wire, err)) {
             std::fprintf(stderr, "strata pool: %s\n", err.c_str());
             return 1;

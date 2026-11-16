@@ -352,9 +352,10 @@
               <button type="button" role="radio" data-v="f16">f16</button>
               <button type="button" role="radio" data-v="bf16">bf16</button>
             </div>
-            <span class="muted small">A long prompt sends hundreds of MB of rows to the workers. f16 halves them, so
-              prompts read faster on a 1 Gbps network; answers can then differ very slightly from one PC's. Exact
-              keeps them identical.</span>
+            <span class="muted small">A long prompt sends hundreds of MB of rows to the workers. Exact keeps the
+              answers identical to one PC's. f16 halves the bytes for slow networks such as Wi-Fi (answers can then
+              differ very slightly); on wired 1 Gbps it gained only 1-2%, since the next chunk already crosses while
+              the workers read one.</span>
           </div>
           <div class="st-field">
             <span class="st-label">Several chats at once</span>
