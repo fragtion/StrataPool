@@ -10892,6 +10892,10 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                 print(f"[strata] drain deadline expired; cancelling {cancelled} owned request(s) ...", flush=True)
                 svc.wait_for_drain(5)
                 drained = False
+        else:
+            # #6055: without --shutdown-timeout there is no wait, but a request that arrives while the engine closes is
+            # still refused (503 server_draining, retry elsewhere) instead of being accepted and cut off with 0 tokens
+            svc.begin_drain()
         closers = [httpd.shutdown, getattr(svc.pool, "close", None) if getattr(svc, "pool", None) else None,
                    getattr(engine, "close", None), vision.shutdown if vision else None,
                    hub.close if hub is not None else None]
