@@ -28,6 +28,9 @@ public:
 
     bool valid() const { return fd_ >= 0; }
     void close();
+    /// Ends both directions without closing: a thread blocked in recv_all on this socket returns (false) and the
+    /// descriptor stays valid until close().  For stopping a reader on another thread before closing.
+    void shutdown_both();
     /// Sends all `n` bytes (false: the peer went away or the timeout passed; `err` says which).
     bool send_all(const void* p, size_t n, std::string& err);
     /// Receives exactly `n` bytes.

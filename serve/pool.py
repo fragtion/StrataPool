@@ -53,7 +53,7 @@ class PoolConfig:
     (lends its GPU to a coordinator).  Every PC of a pool shares `secret`."""
 
     DEFAULTS = {"role": "off", "name": "", "secret": "", "worker_port": ENGINE_PORT, "peers": [], "split": "auto",
-                "wire": "f32", "draft_wire": "f16", "discovery": True, "several_chats": False,
+                "wire": "f32", "draft_wire": "f16", "prefill_wire": "f16", "discovery": True, "several_chats": False,
                 "overlap_windows": False, "chat_drafts": False,
                 "route_peers": [], "primary": False, "move_tokens": 8000, "env": {}}
 
@@ -120,7 +120,7 @@ class PoolConfig:
         if split != "auto" and not re.fullmatch(r"\d+(,\d+)*", split):
             raise ValueError("split: auto, or the first layer of each worker's share, e.g. 24 or 16,32")
         out["split"] = split
-        for k in ("wire", "draft_wire"):
+        for k in ("wire", "draft_wire", "prefill_wire"):
             if out[k] not in WIRES:
                 raise ValueError(f"{k}: one of {', '.join(WIRES)}")
         out["discovery"] = bool(out["discovery"])
@@ -235,7 +235,7 @@ def coordinator_args(pc: PoolConfig) -> list[str]:
     if not peers:
         return []
     out = ["--pool-peers", ",".join(peers), "--pool-split", pc["split"], "--pool-wire", pc["wire"],
-           "--pool-draft-wire", pc["draft_wire"]]
+           "--pool-draft-wire", pc["draft_wire"], "--pool-prefill-wire", pc["prefill_wire"]]
     if pc["several_chats"]:
         # several conversations at once: the engine's batch slots, pipelined across the PCs (one PC runs one chat's
         # layers while the next runs another's).  One slot per PC keeps every PC busy; more would only share the
@@ -272,7 +272,7 @@ def pool_env(pc: PoolConfig, env: dict) -> dict:
 # the engine's layer-split flags (the role adds its own).  Not every --pool-* flag: --pool-workers and --pool-affinity
 # are Strata's own, for its CPU expert pool, and stay as the config has them.
 POOL_FLAGS = ("--pool-peers", "--pool-split", "--pool-listen", "--pool-secret", "--pool-wire", "--pool-draft-wire",
-              "--pool-timeout-s", "--pool-wait-s")
+              "--pool-prefill-wire", "--pool-timeout-s", "--pool-wait-s")
 
 
 def strip_pool_args(args: list[str]) -> list[str]:

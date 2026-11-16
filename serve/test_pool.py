@@ -142,7 +142,8 @@ class Config(unittest.TestCase):
         pc = PoolConfig(None, {"role": "coordinator", "peers": ["a", {"addr": "b", "enabled": False}, "c"],
                                "split": "auto", "wire": "f16"})
         self.assertEqual(coordinator_args(pc), ["--pool-peers", "a:7701,c:7701", "--pool-split", "auto",
-                                                "--pool-wire", "f16", "--pool-draft-wire", "f16"])
+                                                "--pool-wire", "f16", "--pool-draft-wire", "f16",
+                                                "--pool-prefill-wire", "f16"])
         self.assertEqual(worker_args(pc), ["--pool-listen", "0.0.0.0:7701"])
         # several chats at once: one batch slot per PC (the worker's count comes from its coordinator)
         self.assertNotIn("--batch", coordinator_args(pc))           # off by default

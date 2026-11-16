@@ -45,6 +45,7 @@ struct FakeWorker {
     std::mutex mu;
     bool reload_first = false;     // answer the first CONFIG with "reload" (it had another range)
     bool wrong_model = false;
+    bool knows_prefill_wire = true;   // false: an engine from before CONFIG prefill_wire (prompt rows on the decode wire)
     int port = 0;
     std::atomic<bool> stop{false};
 
@@ -62,6 +63,7 @@ struct FakeWorker {
                     KV h = fp().to_kv();
                     if (wrong_model) h.set("n_expert", (int64_t) 512);
                     h.set("proto", (int64_t) kProtocol);
+                    if (knows_prefill_wire) h.set("prefill_wire", (int64_t) 1);
                     h.set("name", std::string("fake"));
                     h.set("vram_free", (int64_t) 8 << 30);
                     return h;
@@ -79,7 +81,9 @@ struct FakeWorker {
                     continue;   // "restarts" and takes the connection again
                 }
                 const Wire wire = cfg.str("wire") == "f16" ? Wire::F16 : Wire::F32;
-                const Wire dwire = cfg.i64("last") ? (cfg.str("draft_wire") == "bf16" ? Wire::BF16 : cfg.str("draft_wire") == "f16" ? Wire::F16 : Wire::F32) : wire;
+                Wire pwire = wire;   // the prompt rows' wire
+                if (knows_prefill_wire) parse_wire(cfg.str("prefill_wire", cfg.str("wire", "f32")), pwire);
+                const Wire dwire = cfg.i64("last") ? (cfg.str("draft_wire") == "bf16" ? Wire::BF16 : cfg.str("draft_wire") == "f16" ? Wire::F16 : Wire::F32) : pwire;
                 KV ready;
                 ready.set("slots", (int64_t) 1000);
                 ready.set("chunk", (int64_t) 64);
@@ -97,10 +101,10 @@ struct FakeWorker {
                         uint64_t ck;
                         u.get(p0); u.get(T); u.get(seg); u.get(ck);
                         u.skip((size_t) T * 8);
-                        const size_t n = u.left() / wire_bytes(wire);
+                        const size_t n = u.left() / wire_bytes(pwire);
                         std::vector<float> rows(n);
-                        decode_rows(wire, u.here(), n, rows.data());
-                        for (float& x : rows) x += add;
+                        decode_rows(pwire, u.here(), n, rows.data());
+                        for (float& x : rows) x += add + (float) p0;   // + p0: which chunk this is, for the order checks
                         std::vector<uint8_t> out(n * wire_bytes(dwire));
                         encode_rows(dwire, rows.data(), n, out.data());
                         if (ck) { std::lock_guard<std::mutex> g(mu); ckpts.insert(ck); }
@@ -404,10 +408,84 @@ static void test_reload_and_busy() {
     link.bye();
 }
 
+// Prompt chunks pipelined (prefill_send / prefill_recv): the decode wire stays as configured, the prompt rows go as
+// `pwire`; chunks are sent ahead of their replies by one thread and received in order by another.  `old_second`: the
+// second worker predates CONFIG prefill_wire, so the link falls back to the decode wire for prompt rows.
+static void test_prefill_pipelined(Wire wire, Wire pwire, bool old_second) {
+    FakeWorker a("pw", 1.0f), b("pw", 10.0f);
+    b.knows_prefill_wire = !old_second;
+    a.run(1);
+    b.run(1);
+    PoolLink link;
+    std::string err;
+    CHECK(link.connect({"127.0.0.1:" + std::to_string(a.port), "127.0.0.1:" + std::to_string(b.port)}, "pw", fp(), 10.0,
+                       10.0, err));
+    KV common;
+    common.set("max_context", (int64_t) 4096);
+    link.set_prefill_wire(pwire);
+    CHECK(link.configure({20, 34}, 48, common, wire, Wire::F32, err));
+    CHECK(link.wait_ready(10.0, err));
+    CHECK(link.prefill_wire() == (old_second ? wire : pwire));
+    link.set_rows_geometry(8, 64);
+    // chunks of different lengths, so a reply taken for the wrong chunk shows (its size and its + p0)
+    const int64_t Ts[6] = {3, 5, 2, 7, 1, 4};
+    std::vector<std::vector<float>> rows(6);
+    std::vector<int64_t> p0s(6);
+    int64_t p = 0;
+    for (int c = 0; c < 6; ++c) {
+        p0s[(size_t) c] = p;
+        rows[(size_t) c].resize((size_t) Ts[c] * 8);
+        for (size_t i = 0; i < rows[(size_t) c].size(); ++i) rows[(size_t) c][i] = (float) i * 0.25f;
+        p += Ts[c];
+    }
+    std::vector<int64_t> toks(64, 5);
+    std::atomic<bool> send_ok{true};
+    std::atomic<int> sent{0}, received{0};
+    std::thread sender([&] {
+        for (int c = 0; c < 6; ++c) {
+            // ahead of the receiver by up to three chunks (the link holds four in flight)
+            while (c - received.load() >= 3) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            std::string e;
+            if (!link.prefill_send(rows[(size_t) c].data(), toks.data(), Ts[c], p0s[(size_t) c], 32, (uint64_t) (100 + c), e)) {
+                std::fprintf(stderr, "send %d: %s\n", c, e.c_str());
+                send_ok = false;
+                return;
+            }
+            ++sent;
+        }
+    });
+    for (int c = 0; c < 6; ++c) {
+        while (send_ok && sent.load() <= c) std::this_thread::sleep_for(std::chrono::milliseconds(1));   // its send first
+        const float* out = nullptr;
+        uint64_t ck = 0;
+        std::string e;
+        const bool ok = link.prefill_recv(Ts[c], &out, &ck, e);
+        CHECK(ok);
+        if (!ok) { std::fprintf(stderr, "recv %d: %s\n", c, e.c_str()); break; }
+        CHECK(ck == (uint64_t) (100 + c));
+        for (size_t i = 0; out && i < rows[(size_t) c].size(); ++i)
+            CHECK(std::fabs(out[i] - (rows[(size_t) c][i] + 11.0f + 2.0f * (float) p0s[(size_t) c])) < 2e-2f);
+        ++received;
+    }
+    sender.join();
+    CHECK(send_ok);
+    CHECK(a.prefills == 6 && b.prefills == 6);
+    // a chunk received with none in flight, and one received under the wrong length, are refused
+    const float* out = nullptr;
+    uint64_t ck = 0;
+    CHECK(!link.prefill_recv(3, &out, &ck, err) && err.find("no prompt chunk") != std::string::npos);
+    CHECK(link.prefill_send(rows[0].data(), toks.data(), 3, 0, 3, 0, err));
+    CHECK(!link.prefill_recv(4, &out, &ck, err) && err.find("out of order") != std::string::npos);
+    link.bye();
+}
+
 int main() {
     net_init();
     test_two_workers(Wire::F32);
     test_two_workers(Wire::F16);
+    test_prefill_pipelined(Wire::F32, Wire::F16, false);
+    test_prefill_pipelined(Wire::F32, Wire::F32, false);
+    test_prefill_pipelined(Wire::F32, Wire::F16, true);
     test_refusals();
     test_reload_and_busy();
     if (failures) { std::fprintf(stderr, "%d check(s) failed\n", failures); return 1; }

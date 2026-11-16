@@ -87,8 +87,11 @@ every token.
 - **The same model and size installed on every PC** (for example the Coder IQ1_M on both). Each PC reads its own
   layers from its own copy. The coordinator refuses a worker whose model differs, and says how.
 - A wired network is best. At 1 Gbit/s a decode window adds about 3-5 ms (two crossings of ~300 KB plus latency).
-  A 6,144-token prompt chunk is ~250 MB each way in exact mode, about 2 s at 1 Gbit/s, and it overlaps with the
-  coordinator's own work. Wi-Fi works, but slower.
+  A 6,144-token prompt chunk is ~250 MB out in exact mode (about 2 s at 1 Gbit/s) and ~125 MB back. By default the
+  prompt rows go out as f16 (Prompt precision in the Pool tab: half the bytes, answers can differ very slightly from
+  one PC's; Exact keeps them identical), and the next chunk goes out while the workers still read one, so the
+  network, the coordinator and the workers all work at once (`STRATA_POOL_PF_PIPE=0` sends one chunk at a time).
+  Wi-Fi works, but slower.
 - StrataPool's engine on each PC. `START-HERE.bat` compiles it the first time (10-20 minutes, once; it installs the
   compiler and the CUDA toolkit itself): Strata's ready-made engines do not include the layer split. An engine
   without it says so in the Pool tab. Share requests (routing) works with any engine: only the server takes part.
@@ -299,6 +302,22 @@ nearly every draft is accepted and all of these run much faster (78 tok/s with b
 sampling you use. Turn Several chats on only when two chats must really run at once (or lower the context, which
 shrinks each slot's K/V copy).
 
+Long prompts, measured on 2026-11-16 (engine 0.1.61, the same two PCs over 1 Gbit/s, split 28, a 25,723-token prompt
+read from scratch, two runs each; prompt tok/s):
+
+| Prompt chunks | Prompt | Why |
+| --- | --- | --- |
+| one at a time, exact rows (`STRATA_POOL_PF_PIPE=0`, Prompt precision Exact) | 928 / 923 | each chunk waits for its rows to cross the link both ways and for the laptop's layers |
+| overlapped, exact rows (Prompt precision Exact) | 1,236 / 1,250 | the next chunk crosses while the laptop reads one: +34% |
+| **overlapped, f16 rows** (the default) | **1,243 / 1,280** | half the bytes out; the link is no longer the slow part, so little more |
+| (the desktop alone, earlier the same day) | 1,276 | |
+
+So a long prompt now reads as fast as on the desktop alone (it was 30% slower), and the decode keeps the split's gain.
+Decode was unchanged by the prompt switches (about 41 tok/s in both runs; that day the desktop shared its card with
+another engine). Greedy replies differ from run to run even on one setting (drafts and the GPU's rounding), so
+the overlap's exactness is checked in `strata-pool-link-test` instead: with exact rows the same bytes go out and
+come back, in order.
+
 ## Drafts in several chats
 
 **Drafts in several chats** (shown when Several chats at once is on; Strata's `--batch-mtp`) gives each chat's window
@@ -347,6 +366,7 @@ out of the pool. The automatic split would give it as few layers as it can.
 --pool-secret S              the shared secret (also STRATA_POOL_SECRET; the app passes it in the environment)
 --pool-wire f32|f16|bf16     the rows on the network (f32: exact, the default)
 --pool-draft-wire F          the last worker's prompt rows (default f16; they feed only the draft layer)
+--pool-prefill-wire F        the prompt rows to the workers (default: as --pool-wire; the Pool tab passes f16)
 --pool-timeout-s S           a worker's reply (default 300)
 --pool-wait-s S              connecting to and loading the workers at start (default 900)
 ```

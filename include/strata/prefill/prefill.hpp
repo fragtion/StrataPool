@@ -302,6 +302,13 @@ public:
     /// `on_chunk` does on a last stage.  Set before `init`, instead of a `next` stage.
     std::function<bool(const float* rows_host, const int64_t* tokens, int64_t T, int64_t pos0, std::string& err)>
         remote_next;
+    /// POOL coordinator, pipelined (both set: they replace remote_next): `remote_send` puts a chunk's rows on the
+    /// network and returns once they are out; `remote_recv` waits for that chunk's final rows and does what
+    /// remote_next does with them.  Chunk c + 1 then goes out while the workers still read chunk c.  Each runs on a
+    /// thread of its own, sends in chunk order and receives in chunk order (a chunk's receive starts after its send).
+    std::function<bool(const float* rows_host, const int64_t* tokens, int64_t T, int64_t pos0, std::string& err)>
+        remote_send;
+    std::function<bool(const int64_t* tokens, int64_t T, int64_t pos0, std::string& err)> remote_recv;
     /// POOL worker: this stage's input rows for the next `run` (host, pinned, T x hc*n_embd).
     void set_hand_in(const float* rows_host) { hand_in_ = rows_host; }
     /// POOL worker: a stage that may end before the last layer but has no next stage - its rows go to
@@ -404,6 +411,9 @@ private:
     std::string next_err_;
     std::future<bool> next_run_;
     int hand_buf_ = 0;
+    // POOL, pipelined hand-off: the last chunk's send (its receive waits for it, and so does the next chunk's send)
+    std::string send_err_;
+    std::shared_future<bool> send_run_;
 
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)

@@ -29014,6 +29014,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_POOL_PF_PIPE",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 4276,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "2026-11-16",
+   "since": null,
+   "last_commit": "",
+   "last_date": "2026-11-16",
+   "status": "rollback",
+   "owner": "pool",
+   "note": "StrataPool: =0 sends a prompt chunk to the workers only after the last one came back (the default sends the next while the workers read one)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_POOL_PIN_GIB",
    "backends": [
     "cuda-hip"

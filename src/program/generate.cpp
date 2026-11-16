@@ -1086,6 +1086,8 @@ struct Options {
     /// coordinator: the rows' wire format f32 (exact) | f16 | bf16 (half the bytes); the last worker's prompt rows
     /// feed only the draft layer, so they travel as --pool-draft-wire (f16 by default: no effect on the output)
     std::string pool_wire = "f32", pool_draft_wire = "f16";
+    /// coordinator: the prompt rows' wire to the workers (a prompt chunk is hundreds of MB; "": as --pool-wire)
+    std::string pool_prefill_wire;
     double pool_timeout_s = 300.0;   ///< a worker's reply
     double pool_wait_s = 900.0;      ///< connecting to / loading the workers at start
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
@@ -1216,6 +1218,7 @@ void usage() {
                  "  --pool-secret S      the pool's shared secret (also STRATA_POOL_SECRET)\n"
                  "  --pool-wire f32|f16|bf16  the residual rows on the network (f32: exact; default)\n"
                  "  --pool-draft-wire F  the last worker's prompt rows (they feed only the draft layer; default f16)\n"
+                 "  --pool-prefill-wire F  the prompt rows to the workers (default: as --pool-wire)\n"
                  "  --pool-timeout-s S   a worker's reply (default 300); --pool-wait-s S: workers at start (900)\n"
                  "\n"
                  "  --no-ple             explicit diagnostic ablation of the PLE layer\n"
@@ -3944,6 +3947,7 @@ int main(int argc, char** argv) {
         else if (a == "--pool-secret") o.pool_secret = next("--pool-secret");
         else if (a == "--pool-wire") o.pool_wire = next("--pool-wire");
         else if (a == "--pool-draft-wire") o.pool_draft_wire = next("--pool-draft-wire");
+        else if (a == "--pool-prefill-wire") o.pool_prefill_wire = next("--pool-prefill-wire");
         else if (a == "--pool-timeout-s") o.pool_timeout_s = std::atof(next("--pool-timeout-s"));
         else if (a == "--pool-wait-s") o.pool_wait_s = std::atof(next("--pool-wait-s"));
         else if (a == "--vision") o.vision = true;
@@ -4266,6 +4270,12 @@ int main(int argc, char** argv) {
     bool pool_wide_rows = false;   // --batch-mtp in a pool: batch windows carry each slot's draft row (CONFIG batch_mtp)
     int pool_tail_skip = -1;       // a worker: the coordinator's explicit STRATA_ROUTE_TAIL_SKIP (CONFIG tail_skip; -1: none)
     strata::pool::Wire pool_wire = strata::pool::Wire::F32, pool_draft_wire = strata::pool::Wire::F16;
+    strata::pool::Wire pool_prefill_wire = strata::pool::Wire::F32;   // the prompt rows (a worker: CONFIG prefill_wire)
+    // coordinator: the next prompt chunk goes out while the workers still read one (STRATA_POOL_PF_PIPE=0: one at a time)
+    const bool pool_pf_pipe = [] {
+        const char* v = std::getenv("STRATA_POOL_PF_PIPE");
+        return v == nullptr || v[0] == '\0' || std::strcmp(v, "0") != 0;
+    }();
     if (o.pool_secret.empty())
         if (const char* v = std::getenv("STRATA_POOL_SECRET")) o.pool_secret = v;
     if (pool_any && o.expert_cache > 0) {
@@ -4288,8 +4298,9 @@ int main(int argc, char** argv) {
             why = "the low-RAM modes are not supported in a pool: each PC already holds only its own layers' experts";
         else if (!o.shared_expert_arena.empty()) why = "--shared-expert-arena is not supported in a pool";
         else if (!strata::pool::parse_wire(o.pool_wire, pool_wire) ||
-                 !strata::pool::parse_wire(o.pool_draft_wire, pool_draft_wire))
-            why = "--pool-wire / --pool-draft-wire take f32, f16 or bf16";
+                 !strata::pool::parse_wire(o.pool_draft_wire, pool_draft_wire) ||
+                 !strata::pool::parse_wire(o.pool_prefill_wire.empty() ? o.pool_wire : o.pool_prefill_wire, pool_prefill_wire))
+            why = "--pool-wire / --pool-draft-wire / --pool-prefill-wire take f32, f16 or bf16";
         if (why != nullptr) {
             std::fprintf(stderr, "strata pool: %s\n", why);
             return 2;
@@ -5858,6 +5869,7 @@ int main(int argc, char** argv) {
     auto pool_hello = [&]() -> strata::pool::KV {
         strata::pool::KV h = pool_fp.to_kv();
         h.set("proto", (int64_t) strata::pool::kProtocol);
+        h.set("prefill_wire", (int64_t) 1);   // takes prompt rows on CONFIG prefill_wire (said before CONFIG is sent)
         h.set("name", pool_node_name());
         cudaDeviceProp prop{};
         if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) h.set("gpu", std::string(prop.name));
@@ -5992,6 +6004,7 @@ int main(int argc, char** argv) {
         }
         strata::pool::parse_wire(pool_cfg.str("wire", "f32"), pool_wire);
         strata::pool::parse_wire(pool_cfg.str("draft_wire", "f16"), pool_draft_wire);
+        strata::pool::parse_wire(pool_cfg.str("prefill_wire", pool_cfg.str("wire", "f32")), pool_prefill_wire);
         pool_loaded = pool_essentials(pool_cfg);
         std::fprintf(stderr, "strata pool: worker: layers %lld-%lld of %lld, context %lld, KV %s, windows of %d\n",
                      (long long) node_lb, (long long) (node_le - 1), (long long) g.n_layers, (long long) o.max_context,
@@ -6216,6 +6229,7 @@ int main(int argc, char** argv) {
         common.set("rope_attn_factor", rope_cfg.attn_factor);
         common.set("rope_beta_fast", rope_cfg.beta_fast);
         common.set("rope_beta_slow", rope_cfg.beta_slow);
+        pool_link.set_prefill_wire(pool_prefill_wire);   // a worker confirms it in READY (else the decode wire)
         if (!pool_link.configure(pool_at, g.n_layers, common, pool_wire, pool_draft_wire, err)) {
             std::fprintf(stderr, "strata pool: %s\n", err.c_str());
             return 1;
@@ -12160,6 +12174,10 @@ int main(int argc, char** argv) {
                 return 1;
             }
             pool_chunk_cap = pool_link.max_chunk();
+            std::fprintf(stderr, "strata pool: prompt chunks: rows out as %s, back as %s, %s\n",
+                         strata::pool::wire_name(pool_link.prefill_wire()), strata::pool::wire_name(pool_draft_wire),
+                         pool_pf_pipe ? "the next chunk goes out while the workers read one (STRATA_POOL_PF_PIPE=0: one at a time)"
+                                      : "one at a time (STRATA_POOL_PF_PIPE=0)");
             if (o.conversation_cache_mib > 0 && !pool_link.all_ready("conv_park")) {
                 std::fprintf(stderr, "strata pool: a worker runs an engine without parked conversations (rebuild it); "
                                      "the pool keeps the per-chat checkpoints only\n");
@@ -12860,6 +12878,10 @@ int main(int argc, char** argv) {
         // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
         // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
         std::function<bool(const float*, const int64_t*, int64_t, int64_t, std::string&)> pool_prefill_fn;
+        // POOL coordinator, pipelined (STRATA_POOL_PF_PIPE, on by default): the same in two halves, so the next chunk
+        // goes out while the workers still read this one (pool_prefill_fn = send, then receive)
+        std::function<bool(const float*, const int64_t*, int64_t, int64_t, std::string&)> pool_prefill_send;
+        std::function<bool(const int64_t*, int64_t, int64_t, std::string&)> pool_prefill_recv;
         int64_t pool_segment = 0;   // POOL: the length of the batched part being read (a worker lends its slots for it)
         // The path the room belongs to (set below): the one on the drafter's card, which is where the ring's slots
         // point into the drafter's expert block.  The room's LAYOUT is a start-up property - it costs nothing to
@@ -12899,6 +12921,14 @@ int main(int argc, char** argv) {
                 sp.remote_next = [&](const float* rows, const int64_t* toks, int64_t T, int64_t p0, std::string& e) {
                     return pool_prefill_fn(rows, toks, T, p0, e);
                 };
+                if (pool_pf_pipe) {
+                    sp.remote_send = [&](const float* rows, const int64_t* toks, int64_t T, int64_t p0, std::string& e) {
+                        return pool_prefill_send(rows, toks, T, p0, e);
+                    };
+                    sp.remote_recv = [&](const int64_t* toks, int64_t T, int64_t p0, std::string& e) {
+                        return pool_prefill_recv(toks, T, p0, e);
+                    };
+                }
             } else if (pool_worker) {
                 sp.set_stage(node_lb, node_le, nullptr);
                 sp.set_headless(true);
@@ -14686,15 +14716,23 @@ int main(int argc, char** argv) {
                 v[0] = std::move(part);
                 return true;
             };
-            pool_prefill_fn = [&](const float* rows, const int64_t* toks, int64_t T, int64_t p0, std::string& e) -> bool {
+            // the send half: the workers keep their state after this chunk when this PC does (same rule)
+            pool_prefill_send = [&](const float* rows, const int64_t* toks, int64_t T, int64_t p0, std::string& e) -> bool {
                 const int64_t done = p0 + T;
-                uint64_t ck = 0;   // the workers keep their state after this chunk when this PC does (same rule)
+                uint64_t ck = 0;
                 if (o.prompt_cache > 0 && o.prompt_cache_every > 0 && done >= pool_part_next) {
                     pool_part_next = done + o.prompt_cache_every;
                     ck = pool_link.new_ckpt_id();
                 }
+                return pool_link.prefill_send(rows, toks, T, p0, pool_segment, ck, e);
+            };
+            // the receive half: the final rows come back for the draft layer; the chunk is reported and checkpointed
+            pool_prefill_recv = [&](const int64_t* toks, int64_t T, int64_t p0, std::string& e) -> bool {
+                (void) toks;
+                const int64_t done = p0 + T;
+                uint64_t ck = 0;
                 const float* fin = nullptr;
-                if (!pool_link.prefill(rows, toks, T, p0, pool_segment, ck, &fin, e)) return false;
+                if (!pool_link.prefill_recv(T, &fin, &ck, e)) return false;
                 const int64_t D = g.hc * g.n_embd;
                 std::vector<int32_t> nxt;
                 for (int64_t a = 0; a < T; a += kPoolPfRows) {
@@ -14730,6 +14768,10 @@ int main(int argc, char** argv) {
                     pp_next_check = done + o.prompt_cache_every;
                 }
                 return true;
+            };
+            // not pipelined (STRATA_POOL_PF_PIPE=0): both halves on the prompt path's hand-off thread, one chunk at a time
+            pool_prefill_fn = [&](const float* rows, const int64_t* toks, int64_t T, int64_t p0, std::string& e) -> bool {
+                return pool_prefill_send(rows, toks, T, p0, e) && pool_prefill_recv(toks, T, p0, e);
             };
         }
         drive.d.plan = ver.plan_sink();
@@ -15958,11 +16000,27 @@ int main(int argc, char** argv) {
                     std::string se;
                     return pool_ch.send(strata::pool::Msg::Ack, se);
                 };
-                std::vector<uint8_t> msg;
+                std::vector<uint8_t> msg, msg_ahead;
+                // the next frame, read while a prompt chunk runs: the coordinator sends chunk c + 1 while this PC
+                // still reads chunk c, so the network and this PC's layers work at the same time
+                struct Ahead {
+                    strata::pool::Msg t{};
+                    std::string e;
+                    bool ok = false;
+                };
+                std::future<Ahead> ahead;
                 for (;;) {
                     strata::pool::Msg t;
                     std::string e;
-                    if (!pool_ch.recv(t, msg, e, (uint64_t) 8 << 30)) { why = e; break; }
+                    if (ahead.valid()) {
+                        Ahead a = ahead.get();
+                        msg.swap(msg_ahead);
+                        if (!a.ok) { why = a.e; break; }
+                        t = a.t;
+                    } else if (!pool_ch.recv(t, msg, e, (uint64_t) 8 << 30)) {
+                        why = e;
+                        break;
+                    }
                     strata::pool::Unpacker u(msg.data(), msg.size());
                     if (t == strata::pool::Msg::Verify) {
                         int32_t T = 0;
@@ -16129,7 +16187,7 @@ int main(int argc, char** argv) {
                         int64_t p0 = 0, T = 0, segment = 0;
                         uint64_t ck = 0;
                         if (!u.get(p0) || !u.get(T) || !u.get(segment) || !u.get(ck) || T < 1 || T > w_chunk ||
-                            u.left() != (size_t) T * 8 + (size_t) T * (size_t) D * strata::pool::wire_bytes(pool_wire)) {
+                            u.left() != (size_t) T * 8 + (size_t) T * (size_t) D * strata::pool::wire_bytes(pool_prefill_wire)) {
                             fail("a malformed prompt chunk (its size is above this worker's chunk of " +
                                  std::to_string(w_chunk) + "?)");
                             fatal = true;
@@ -16137,7 +16195,14 @@ int main(int argc, char** argv) {
                         }
                         std::vector<int64_t> toks((size_t) T);
                         u.get_bytes(toks.data(), (size_t) T * 8);
-                        strata::pool::decode_rows(pool_wire, u.here(), (size_t) T * (size_t) D, w_rows_in);
+                        strata::pool::decode_rows(pool_prefill_wire, u.here(), (size_t) T * (size_t) D, w_rows_in);
+                        // the frame after this chunk (most often the next chunk) comes in while this one runs; only
+                        // this thread sends, only that one reads (the connection carries both ways at once)
+                        ahead = std::async(std::launch::async, [&pool_ch, &msg_ahead] {
+                            Ahead a;
+                            a.ok = pool_ch.recv(a.t, msg_ahead, a.e, (uint64_t) 8 << 30);
+                            return a;
+                        });
                         apply_pending(true);
                         if (!w_lend(std::max<int64_t>(segment, T), e)) { fail("lending the prompt path its slots: " + e); fatal = true; break; }
                         sp.set_hand_in(w_rows_in);
@@ -16158,7 +16223,7 @@ int main(int argc, char** argv) {
                             }
                             w_ckpts[ck] = std::move(c);
                         }
-                        const strata::pool::Wire rw = pool_cfg.i64("last", 0) ? pool_draft_wire : pool_wire;
+                        const strata::pool::Wire rw = pool_cfg.i64("last", 0) ? pool_draft_wire : pool_prefill_wire;
                         const size_t n = (size_t) T * (size_t) D;
                         if (rw == strata::pool::Wire::F32) {
                             if (!pool_ch.send(strata::pool::Msg::PrefillRows, w_rows_out, n * 4, nullptr, 0, e)) { why = e; break; }
@@ -16357,6 +16422,10 @@ int main(int argc, char** argv) {
                     }
                 }
                 busy.reset();
+                if (ahead.valid()) {   // a read still waiting for the next frame: end it before the connection goes
+                    pool_ch.socket().shutdown_both();
+                    ahead.wait();
+                }
                 pool_ch.close();
                 save_profile("the coordinator's session ended");   // #477 (nothing without --expert-profile-save)
                 if (fatal) {
@@ -16390,6 +16459,7 @@ int main(int argc, char** argv) {
                 pool_cfg = next;
                 strata::pool::parse_wire(pool_cfg.str("wire", "f32"), pool_wire);
                 strata::pool::parse_wire(pool_cfg.str("draft_wire", "f16"), pool_draft_wire);
+                strata::pool::parse_wire(pool_cfg.str("prefill_wire", pool_cfg.str("wire", "f32")), pool_prefill_wire);
                 strata::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
             }

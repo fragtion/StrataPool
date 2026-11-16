@@ -7271,6 +7271,36 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             // Wait only for the DIRECT successor's previous chunk. That successor
             // may already have forwarded its older chunk to later GPUs.
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
+            if (remote_send && remote_recv) {
+                // POOL, pipelined: this chunk goes out while the workers still read the one before.  The sends go one
+                // at a time and in order: the one before this chunk's read the other hand-off slot, and the one
+                // before that read this slot (done: the last chunk's launch waited for it).
+                if (send_run_.valid() && !send_run_.get()) { err = send_err_; return false; }
+                // a chunk the workers already answered with an error stops the prompt here, not at its end
+                if (next_run_.valid() && next_run_.wait_for(std::chrono::seconds(0)) == std::future_status::ready &&
+                    !next_run_.get()) {
+                    err = next_err_;
+                    return false;
+                }
+                send_err_.clear();
+                send_run_ = std::async(std::launch::async, [this, h, tokens, c0, T, p0] {
+                                strata::aux_cpus::pin_current_thread();
+                                return remote_send(h, tokens + c0, T, p0, send_err_);
+                            }).share();
+                // the receives run in chunk order: each waits for the one before it and for its own send
+                next_run_ = std::async(std::launch::async,
+                                       [this, prev = std::move(next_run_), sent = send_run_, tokens, c0, T, p0]() mutable {
+                                           strata::aux_cpus::pin_current_thread();
+                                           if (prev.valid() && !prev.get()) return false;   // next_err_ says why
+                                           if (!sent.get()) {
+                                               next_err_ = send_err_;
+                                               return false;
+                                           }
+                                           return remote_recv(tokens + c0, T, p0, next_err_);
+                                       });
+                hand_buf_ ^= 1;
+                continue;   // the receive reports the chunk (remote_recv)
+            }
             if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
             next_err_.clear();
             if (remote_next) {   // POOL: the next layers are on other PCs
@@ -8971,6 +9001,13 @@ bool Prefill::drain_pipeline(std::string& err) {
             err = next_err_;
             ok = false;
         }
+    }
+    if (send_run_.valid()) {   // POOL, pipelined: the last send (its receive above waited for it, unless one failed first)
+        if (!send_run_.get() && ok) {
+            err = send_err_;
+            ok = false;
+        }
+        send_run_ = {};
     }
 
     if (next_ != nullptr) {

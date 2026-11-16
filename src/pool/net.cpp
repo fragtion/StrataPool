@@ -154,6 +154,16 @@ Socket& Socket::operator=(Socket&& o) noexcept {
     return *this;
 }
 
+void Socket::shutdown_both() {
+    if (fd_ >= 0) {
+#if defined(_WIN32)
+        shutdown((SOCKET) fd_, SD_BOTH);
+#else
+        shutdown((int) fd_, SHUT_RDWR);
+#endif
+    }
+}
+
 void Socket::close() {
     if (fd_ >= 0) {
 #if defined(_WIN32)

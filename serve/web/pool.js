@@ -327,6 +327,7 @@
       $("pool-split").hidden = !manual;
       if (document.activeElement !== $("pool-split")) $("pool-split").value = manual ? draft.split : "";
       setSeg("pool-wire", draft.wire);
+      setSeg("pool-prefill-wire", draft.prefill_wire || "f16");
       setSeg("pool-chats", draft.several_chats ? "on" : "off");
       $("pool-chats-note").hidden = !draft.several_chats;   // the cost is said where it is paid
       setSeg("pool-chat-drafts", draft.chat_drafts ? "on" : "off");
@@ -360,6 +361,7 @@
     touch();
   };
   for (const b of $("pool-wire").querySelectorAll("button")) b.onclick = () => { if (draft) { draft.wire = b.dataset.v; touch(); } };
+  for (const b of $("pool-prefill-wire").querySelectorAll("button")) b.onclick = () => { if (draft) { draft.prefill_wire = b.dataset.v; touch(); } };
   for (const b of $("pool-chats").querySelectorAll("button")) b.onclick = () => { if (draft) { draft.several_chats = b.dataset.v === "on"; touch(); } };
   for (const b of $("pool-chat-drafts").querySelectorAll("button")) b.onclick = () => { if (draft) { draft.chat_drafts = b.dataset.v === "on"; touch(); } };
   for (const b of $("pool-overlap").querySelectorAll("button")) b.onclick = () => { if (draft) { draft.overlap_windows = b.dataset.v === "on"; touch(); } };

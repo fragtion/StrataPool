@@ -346,6 +346,17 @@
               bytes, for slow networks.</span>
           </div>
           <div class="st-field">
+            <span class="st-label">Prompt precision</span>
+            <div class="seg seg--3" id="pool-prefill-wire" role="radiogroup" aria-label="Prompt precision">
+              <button type="button" role="radio" data-v="f32">Exact</button>
+              <button type="button" role="radio" data-v="f16">f16</button>
+              <button type="button" role="radio" data-v="bf16">bf16</button>
+            </div>
+            <span class="muted small">A long prompt sends hundreds of MB of rows to the workers. f16 halves them, so
+              prompts read faster on a 1 Gbps network; answers can then differ very slightly from one PC's. Exact
+              keeps them identical.</span>
+          </div>
+          <div class="st-field">
             <span class="st-label">Several chats at once</span>
             <div class="seg seg--2" id="pool-chats" role="radiogroup" aria-label="Several chats at once">
               <button type="button" role="radio" data-v="off">Off</button>

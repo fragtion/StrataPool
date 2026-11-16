@@ -176,6 +176,7 @@ KV PoolLink::config_for(size_t i) const {
     c.set("last", (int64_t) (i + 1 == workers_.size()));
     c.set("wire", std::string(wire_name(wire_)));
     c.set("draft_wire", std::string(wire_name(draft_wire_)));
+    c.set("prefill_wire", std::string(wire_name(prefill_wire_)));
     return c;
 }
 
@@ -185,6 +186,16 @@ bool PoolLink::configure(const std::vector<int64_t>& at, int64_t n_layers, const
     common_ = common;
     wire_ = wire;
     draft_wire_ = draft_wire;
+    // every worker must read prompt rows on the same wire: one that did not say in its HELLO that it takes CONFIG
+    // prefill_wire (an engine from before it) reads them on the decode wire, so then they all do
+    if (prefill_wire_ != wire_)
+        for (const WorkerInfo& w : workers_)
+            if (w.hello.i64("prefill_wire", 0) != 1) {
+                std::fprintf(stderr, "strata pool: worker %s does not take prompt rows as %s (an older engine): they "
+                                     "travel as %s\n", w.addr.c_str(), wire_name(prefill_wire_), wire_name(wire_));
+                prefill_wire_ = wire_;
+                break;
+            }
     for (size_t i = 0; i < workers_.size(); ++i) {
         WorkerInfo& w = workers_[i];
         w.lb = at[i];
@@ -573,23 +584,85 @@ void PoolLink::set_rows_geometry(int64_t d, int64_t max_chunk) {
 
 bool PoolLink::prefill(const float* rows, const int64_t* tokens, int64_t T, int64_t p0, int64_t segment, uint64_t ckpt,
                        const float** out, std::string& err) {
-    std::lock_guard<std::mutex> lk(mu_);
+    uint64_t ck = 0;
+    return prefill_send(rows, tokens, T, p0, segment, ckpt, err) && prefill_recv(T, out, &ck, err);
+}
+
+bool PoolLink::prefill_send(const float* rows, const int64_t* tokens, int64_t T, int64_t p0, int64_t segment,
+                            uint64_t ckpt, std::string& err) {
+    std::lock_guard<std::mutex> lk(pf_send_mu_);
+    if (ch_.empty()) { err = "pool: no workers"; return false; }
     if (T < 1 || T > max_chunk_) { err = "pool: a prompt chunk of " + std::to_string(T) + " tokens is too long"; return false; }
-    const auto t0 = Clock::now();
+    PfInFlight f;
+    f.t0 = Clock::now();
+    f.T = T;
+    f.ckpt = ckpt;
     Packer pk;
     pk.put<int64_t>(p0);
     pk.put<int64_t>(T);
     pk.put<int64_t>(segment);
     pk.put<uint64_t>(ckpt);
     pk.put_bytes(tokens, (size_t) T * 8);
+    f.prefix = pk.b;
     const size_t n = (size_t) T * (size_t) d_;
-    const uint8_t* first = (const uint8_t*) rows;
-    if (wire_ != Wire::F32) {
-        enc_.resize(n * wire_bytes(wire_));
-        encode_rows(wire_, rows, n, enc_.data());
-        first = enc_.data();
+    const uint8_t* body = (const uint8_t*) rows;
+    if (prefill_wire_ != Wire::F32) {
+        pf_enc_.resize(n * wire_bytes(prefill_wire_));
+        encode_rows(prefill_wire_, rows, n, pf_enc_.data());
+        body = pf_enc_.data();
     }
-    if (!forward(Msg::Prefill, pk.b, T, d_, first, draft_wire_, fin_, err)) return false;
+    Channel& c = ch_[0];
+    {
+        std::lock_guard<std::mutex> q(pf_q_mu_);
+        // the receive side reads this connection while chunks are in flight: an ACK still owed here would be read
+        // by two threads (nothing lazily acknowledged is sent between a prompt's chunks, so this does not happen)
+        if (c.pending > 0 && !pf_q_.empty()) { err = "pool: an acknowledgement is owed while prompt chunks are in flight"; return false; }
+        if (pf_q_.size() >= 4) { err = "pool: too many prompt chunks in flight"; return false; }
+        pf_q_.push_back(std::move(f));   // queued first: the reply may be read as soon as the bytes are out
+    }
+    if (!c.drain(err) || !c.send(Msg::Prefill, pk.b.data(), pk.b.size(), body, n * wire_bytes(prefill_wire_), err)) {
+        err = "pool worker " + workers_[0].addr + ": " + err;
+        return false;
+    }
+    return true;
+}
+
+bool PoolLink::prefill_recv(int64_t T, const float** out, uint64_t* ckpt, std::string& err) {
+    std::lock_guard<std::mutex> lk(pf_recv_mu_);
+    PfInFlight f;
+    {
+        std::lock_guard<std::mutex> q(pf_q_mu_);
+        if (pf_q_.empty()) { err = "pool: no prompt chunk in flight"; return false; }
+        f = std::move(pf_q_.front());
+        pf_q_.pop_front();
+    }
+    if (f.T != T) { err = "pool: prompt chunks out of order"; return false; }
+    const size_t n = (size_t) T * (size_t) d_;
+    std::vector<uint8_t>* bufs[2] = {&buf_a_, &buf_b_};
+    for (size_t i = 0; i < ch_.size(); ++i) {
+        Channel& c = ch_[i];
+        if (i > 0) {   // the previous worker's rows (on the prompt wire) go on to this one
+            const std::vector<uint8_t>& prev = *bufs[(i - 1) & 1];
+            if (!c.drain(err) || !c.send(Msg::Prefill, f.prefix.data(), f.prefix.size(), prev.data(), prev.size(), err)) {
+                err = "pool worker " + workers_[i].addr + ": " + err;
+                return false;
+            }
+        }
+        const bool last = i + 1 == ch_.size();
+        std::vector<uint8_t>& in = last ? fin_ : *bufs[i & 1];
+        Msg t;
+        if (!c.recv(t, in, err, (uint64_t) 8 << 30)) { err = "pool worker " + workers_[i].addr + ": " + err; return false; }
+        if (t != Msg::PrefillRows) {
+            err = "pool worker " + workers_[i].addr + ": " + unexpected(t, Msg::PrefillRows, in);
+            return false;
+        }
+        const size_t expect = n * wire_bytes(last ? draft_wire_ : prefill_wire_);
+        if (in.size() != expect) {
+            err = "pool worker " + workers_[i].addr + " returned " + std::to_string(in.size()) + " bytes of rows, not " +
+                  std::to_string(expect);
+            return false;
+        }
+    }
     float* dst = pf_host_;
     if (dst == nullptr) {   // no device side (the tests): plain memory
         pf_vec_.resize(n);
@@ -597,7 +670,12 @@ bool PoolLink::prefill(const float* rows, const int64_t* tokens, int64_t T, int6
     }
     decode_rows(draft_wire_, fin_.data(), n, dst);
     *out = dst;
-    ms_prefill_net += ms_since(t0);
+    if (ckpt != nullptr) *ckpt = f.ckpt;
+    // the time the workers held a chunk: from its send (or the previous chunk's return, when they overlap) to its rows
+    const auto now = Clock::now();
+    const auto from = f.t0 > pf_last_back_ ? f.t0 : pf_last_back_;
+    ms_prefill_net += std::chrono::duration<double, std::milli>(now - from).count();
+    pf_last_back_ = now;
     return true;
 }
 

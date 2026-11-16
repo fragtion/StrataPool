@@ -16,6 +16,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -89,6 +90,18 @@ public:
     /// keep its state after this chunk under that id.
     bool prefill(const float* rows, const int64_t* tokens, int64_t T, int64_t p0, int64_t segment, uint64_t ckpt,
                  const float** out, std::string& err);
+    /// The same chunk in two halves, so the next chunk can go out while the workers still read this one (the
+    /// prompt path's pipelined hand-off): `prefill_send` puts the chunk on the first worker's connection,
+    /// `prefill_recv` takes the oldest chunk sent and not yet received back (through every later worker) and gives its
+    /// final rows (valid until the next prefill_recv) and the checkpoint id it was sent with.  One thread sends and
+    /// one receives, each in chunk order; they may run at the same time, and nothing else may use the link meanwhile.
+    bool prefill_send(const float* rows, const int64_t* tokens, int64_t T, int64_t p0, int64_t segment, uint64_t ckpt,
+                      std::string& err);
+    bool prefill_recv(int64_t T, const float** out, uint64_t* ckpt, std::string& err);
+    /// The prompt rows' wire to the first worker and between workers (CONFIG prefill_wire).  Set before configure,
+    /// which falls back to the decode wire when a worker's HELLO does not say it takes it (an older engine).
+    void set_prefill_wire(Wire w) { prefill_wire_ = w; }
+    Wire prefill_wire() const { return prefill_wire_; }
 
     // ---- batch slots (several conversations at once): each worker is one stage of the pipeline that
     // --batch-groups runs (generate.cpp's pump).  A group's window: this PC's verifier runs its layers (batch_launch),
@@ -186,7 +199,18 @@ private:
     std::vector<WorkerInfo> workers_;
     std::vector<Channel> ch_;
     std::mutex mu_;
-    Wire wire_ = Wire::F32, draft_wire_ = Wire::F16;
+    Wire wire_ = Wire::F32, draft_wire_ = Wire::F16, prefill_wire_ = Wire::F32;
+    // prompt chunks sent and not yet received back (prefill_send / prefill_recv), oldest first
+    struct PfInFlight {
+        std::vector<uint8_t> prefix;   ///< p0, T, segment, ckpt, tokens: what each later worker gets in front of the rows
+        int64_t T = 0;
+        uint64_t ckpt = 0;
+        std::chrono::steady_clock::time_point t0;
+    };
+    std::deque<PfInFlight> pf_q_;
+    std::mutex pf_q_mu_, pf_send_mu_, pf_recv_mu_;
+    std::vector<uint8_t> pf_enc_;   ///< the send side's encoded rows (the receive side has its own buffers)
+    std::chrono::steady_clock::time_point pf_last_back_{};   ///< when the last chunk's rows came back
     double timeout_s_ = 300.0, wait_s_ = 900.0;
     std::string secret_;
     ModelFingerprint fp_;
