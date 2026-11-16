@@ -80,8 +80,8 @@ not speed per chat.
   ([what Strata needs](https://github.com/Niko1221/Strata#what-you-need)). For Split layers, each needs an NVIDIA
   card (RTX 20 or newer, 8 GB or more) and **the same model and size** installed.
 - A wired network is best. Wi-Fi works, but slower.
-- DeepSeek-V4.1-Flash runs on its own engine, which has no layer split: in a pool it can use Share requests (each PC
-  runs the whole model), not Split layers.
+- DeepSeek-V4.1-Flash is gone since Strata 0.2.14 (StrataPool follows). It had its own engine with no layer split, so
+  it never took part in Split layers; an older StrataPool still runs it, and Share requests with it.
 
 ## Install
 
@@ -127,7 +127,7 @@ measured on their own.
 | Anon - [#652](https://github.com/Niko1221/Strata/pull/652) | only the tokens a verify window hands out are committed | |
 | ATIVX928 - [#1019](https://github.com/Niko1221/Strata/pull/1019) | the int8 K/V gather decodes 8 values per thread | |
 | Maxim Shipko - [#1064](https://github.com/Niko1221/Strata/pull/1064) | commit limits applied after an allocation failure | |
-| sergiywith - [#1231](https://github.com/Niko1221/Strata/pull/1231), [#1284](https://github.com/Niko1221/Strata/pull/1284) (#1284 in Strata since 0.1.52) | the elastic K/V without a lend; `--adapt-decay` checked | |
+| sergiywith - [#1231](https://github.com/Niko1221/Strata/pull/1231), [#1284](https://github.com/Niko1221/Strata/pull/1284) (#1284 in Strata since 0.1.52; #1231's mapping since 0.2.14, Strata's kv_grow_start) | the elastic K/V without a lend; `--adapt-decay` checked | |
 | Yxmura - [#1374](https://github.com/Niko1221/Strata/pull/1374) | IQ1_S on the GPU and on AVX2; IQ1_S and IQ1_M on AVX-512 | Unsloth's UD-IQ1_S models run, on every PC of a pool. Since Strata 0.1.49 the AVX2 IQ1_M rows are Strata's own (in 0.1.52 bit-identical to ggml and 7-30% faster per expert than #1374's in our kernel test), and StrataPool sends Qwen's IQ1_M experts to them |
 | anon761 - [#1247](https://github.com/Niko1221/Strata/pull/1247) | a layer split inside one PC: `--prefill-help` | for a pool PC with two cards |
 | Jeremiah Ritchey - [#1290](https://github.com/Niko1221/Strata/pull/1290) | batch-MTP drafters share their weights fully; a slot's draft row only where the context and its answer leave room | **Drafts in several chats** holds less VRAM |
@@ -136,7 +136,7 @@ measured on their own.
 | xrip - [#1823](https://github.com/Niko1221/Strata/pull/1823) | whole messages remembered by the tokenizer | |
 | Saber - [#1362](https://github.com/Niko1221/Strata/pull/1362) | a tool-call text fix | |
 | Scott Page - [#3789](https://github.com/Niko1221/Strata/pull/3789) (dropped 2026-11-11: Strata now reads the process names first, its own fix) | Windows: the orphan search before an engine start lists processes by command line only (6.2 s -> 0.1 s) |  |
-| macintog - [#3971](https://github.com/Niko1221/Strata/pull/3971) (open PR) | the thinking budget's continuation keeps the tokens generated past the cut |  |
+| macintog - [#3971](https://github.com/Niko1221/Strata/pull/3971) (dropped in 0.2.14: Strata's own thinking-budget hold, `GEN hold`, covers it) | the thinking budget's continuation keeps the tokens generated past the cut |  |
 | suifei - [#4340](https://github.com/Niko1221/Strata/pull/4340) (open PR) | a long prompt read keeps clients that count events alive | long pool prompt reads no longer time out in strict clients |
 | Amit Tsur (Tsury) - [#4132](https://github.com/Niko1221/Strata/pull/4132) (in Strata since 0.2.8) | a string argument that quotes a tool call stays exact |  |
 | xrip - [#3404](https://github.com/Niko1221/Strata/pull/3404) (open PR) | an older, shorter copy of the conversation is superseded | frees cache RAM for other conversations |
