@@ -177,7 +177,51 @@ KV PoolLink::config_for(size_t i) const {
     c.set("wire", std::string(wire_name(wire_)));
     c.set("draft_wire", std::string(wire_name(draft_wire_)));
     c.set("prefill_wire", std::string(wire_name(prefill_wire_)));
+    if (!cvec_s_.empty()) {
+        // the vector's rows of this worker's layers and of the layer before them (the rest are zero there): the
+        // first layer's read and a prompt chunk's hand-over apply that layer's write, and its vector, on this side,
+        // as in a layer split inside one PC.  cvec_id names the whole vector, so a worker that has another one
+        // loaded reloads (the steered layers shape its graphs).
+        const int64_t L = (int64_t) cvec_s_.size(), lb = std::clamp<int64_t>(w.lb - 1, 0, L), le = std::clamp<int64_t>(w.le, lb, L);
+        c.set("cvec", (int64_t) 1);
+        c.set("cvec_mode", (int64_t) cvec_mode_);
+        c.set("cvec_first", (int64_t) cvec_first_);
+        c.set("cvec_last", (int64_t) cvec_last_);
+        c.set("cvec_n_embd", cvec_n_);
+        c.set("cvec_lb", lb);
+        c.set("cvec_le", le);
+        c.set("cvec_id", to_hex((const uint8_t*) &cvec_digest_, sizeof cvec_digest_));
+        c.set("cvec_on", (int64_t) (cvec_on_ ? 1 : 0));
+        c.set("cvec_dir", to_base64(cvec_dir_.data() + (size_t) (lb * cvec_n_), (size_t) ((le - lb) * cvec_n_) * sizeof(float)));
+        c.set("cvec_s", to_base64(cvec_s_.data() + (size_t) lb, (size_t) (le - lb) * sizeof(float)));
+    }
     return c;
+}
+
+void PoolLink::set_cvec(std::vector<float> dir, std::vector<float> s, int mode, int first, int last, int64_t n_embd,
+                        uint64_t digest) {
+    std::lock_guard<std::mutex> lk(mu_);
+    cvec_dir_ = std::move(dir);
+    cvec_s_ = std::move(s);
+    cvec_mode_ = mode;
+    cvec_first_ = first;
+    cvec_last_ = last;
+    cvec_n_ = n_embd;
+    cvec_digest_ = digest;
+    cvec_on_ = true;
+}
+
+bool PoolLink::cvec_set(bool on, std::string& err) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (cvec_s_.empty() || on == cvec_on_) return true;
+    Packer pk;
+    pk.put<int32_t>(on ? 1 : 0);
+    for (size_t i = 0; i < ch_.size(); ++i) {
+        if (!ch_[i].send(Msg::Cvec, pk.b, err)) { err = "pool worker " + workers_[i].addr + ": " + err; return false; }
+        ++ch_[i].pending;
+    }
+    cvec_on_ = on;
+    return true;
 }
 
 bool PoolLink::configure(const std::vector<int64_t>& at, int64_t n_layers, const KV& common, Wire wire,
@@ -195,6 +239,15 @@ bool PoolLink::configure(const std::vector<int64_t>& at, int64_t n_layers, const
                                      "travel as %s\n", w.addr.c_str(), wire_name(prefill_wire_), wire_name(wire_));
                 prefill_wire_ = wire_;
                 break;
+            }
+    // a control vector runs on every PC's layers: a worker that cannot take it (an engine from before it) would run
+    // the stock model on its layers, so it is refused rather than giving a reply that is neither
+    if (!cvec_s_.empty())
+        for (const WorkerInfo& w : workers_)
+            if (w.hello.i64("cvec", 0) != 1) {
+                err = "pool worker " + w.addr + " cannot take the control vector (the speed projection): update that "
+                      "PC's engine, or turn the projection off";
+                return false;
             }
     for (size_t i = 0; i < workers_.size(); ++i) {
         WorkerInfo& w = workers_[i];

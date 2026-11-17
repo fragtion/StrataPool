@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <set>
@@ -48,6 +49,9 @@ struct FakeWorker {
     bool knows_prefill_wire = true;   // false: an engine from before CONFIG prefill_wire (prompt rows on the decode wire)
     int prefill_ms = 0;               // each prompt chunk takes this long (the coordinator's sends run ahead)
     int fail_prefill_at = -1;         // this prompt chunk (0-based, per session) is answered with an Err
+    bool knows_cvec = true;           // false: an engine from before the control vector in a pool (no HELLO cvec)
+    std::atomic<int> cvecs{0}, cvec_on{-1};   // CVEC switches received, and the last one
+    KV last_cfg;                      // the last CONFIG (under mu)
     int port = 0;
     std::atomic<bool> stop{false};
 
@@ -66,12 +70,14 @@ struct FakeWorker {
                     if (wrong_model) h.set("n_expert", (int64_t) 512);
                     h.set("proto", (int64_t) kProtocol);
                     if (knows_prefill_wire) h.set("prefill_wire", (int64_t) 1);
+                    if (knows_cvec) h.set("cvec", (int64_t) 1);
                     h.set("name", std::string("fake"));
                     h.set("vram_free", (int64_t) 8 << 30);
                     return h;
                 };
                 if (!accept_coordinator(l, secret, hello, ch, cfg, [](const std::string&) {}, &stop)) return;
                 ++sessions;
+                { std::lock_guard<std::mutex> g(mu); last_cfg = cfg; }
                 if (reload_first) {
                     reload_first = false;
                     KV no;
@@ -174,6 +180,11 @@ struct FakeWorker {
                         ch.send(Msg::Ack, e);
                     } else if (t == Msg::Commit) {
                         ++commits;
+                        ch.send(Msg::Ack, e);
+                    } else if (t == Msg::Cvec) {
+                        int32_t on = -1; u.get(on);
+                        cvec_on = on;
+                        ++cvecs;
                         ch.send(Msg::Ack, e);
                     } else if (t == Msg::Reset) {
                         ++resets;
@@ -626,8 +637,92 @@ static void test_prefill_worker_error() {
     link.bye();
 }
 
+// A control vector (the speed projection) in a split: each worker's CONFIG carries the rows of its layers and of the
+// layer before them, exactly; the per-request switch goes out only when it changes and is acknowledged in order; a
+// worker whose engine does not take a vector is refused at configure.
+static void test_cvec() {
+    std::string err;
+    const int64_t L = 48, N = 8;
+    std::vector<float> dir((size_t) (L * N), 0.0f), sc((size_t) L, 0.0f);
+    for (int64_t l = 4; l <= 44; ++l) {
+        sc[(size_t) l] = 1.0f + 0.25f * (float) l;
+        for (int64_t j = 0; j < N; ++j) dir[(size_t) (l * N + j)] = (float) l * 100.0f + (float) j * 0.125f - 3.0f;
+    }
+    {
+        FakeWorker a("s", 0), b("s", 0);
+        a.run(1);
+        b.run(1);
+        PoolLink link;
+        CHECK(link.connect({"127.0.0.1:" + std::to_string(a.port), "127.0.0.1:" + std::to_string(b.port)}, "s", fp(),
+                           5.0, 5.0, err));
+        link.set_cvec(dir, sc, 0, 4, 44, N, 0x1234abcd5678ef90ull);
+        CHECK(link.has_cvec());
+        KV c;
+        CHECK(link.configure({20, 36}, L, c, Wire::F32, Wire::F16, err) && link.wait_ready(5.0, err));
+        auto check_rows = [&](FakeWorker& w, int64_t lb, int64_t le) {
+            KV k;
+            { std::lock_guard<std::mutex> g(w.mu); k = w.last_cfg; }
+            CHECK(k.i64("cvec") == 1 && k.i64("cvec_mode", -1) == 0 && k.i64("cvec_first") == 4 && k.i64("cvec_last") == 44);
+            CHECK(k.i64("cvec_n_embd") == N && k.i64("cvec_on") == 1);
+            CHECK(k.i64("cvec_lb") == lb - 1 && k.i64("cvec_le") == le);   // (the layer before its range too)
+            CHECK(std::strtoull(k.str("cvec_id").c_str(), nullptr, 16) != 0);
+            std::vector<uint8_t> db, sb;
+            CHECK(from_base64(k.str("cvec_dir"), db) && from_base64(k.str("cvec_s"), sb));
+            CHECK(db.size() == (size_t) ((le - lb + 1) * N) * 4 && sb.size() == (size_t) (le - lb + 1) * 4);
+            if (db.size() == (size_t) ((le - lb + 1) * N) * 4)
+                CHECK(std::memcmp(db.data(), dir.data() + (size_t) ((lb - 1) * N), db.size()) == 0);
+            if (sb.size() == (size_t) (le - lb + 1) * 4)
+                CHECK(std::memcmp(sb.data(), sc.data() + (size_t) (lb - 1), sb.size()) == 0);
+        };
+        check_rows(a, 20, 36);
+        check_rows(b, 36, 48);
+        CHECK(link.cvec_set(true, err));    // already on: nothing goes out
+        CHECK(link.cvec_set(false, err));
+        CHECK(link.cvec_set(false, err));   // (unchanged)
+        CHECK(link.end_request(err));       // drains the lazy ACKs
+        CHECK(a.cvecs == 1 && b.cvecs == 1 && a.cvec_on == 0 && b.cvec_on == 0);
+        CHECK(link.cvec_set(true, err) && link.reset(err) && link.end_request(err));
+        CHECK(a.cvecs == 2 && b.cvecs == 2 && a.cvec_on == 1 && b.cvec_on == 1);
+        link.bye();
+    }
+    {   // without a vector nothing about it is sent
+        FakeWorker w("s", 0);
+        w.run(1);
+        PoolLink link;
+        CHECK(link.connect({"127.0.0.1:" + std::to_string(w.port)}, "s", fp(), 5.0, 5.0, err));
+        KV c;
+        CHECK(link.configure({24}, L, c, Wire::F32, Wire::F16, err) && link.wait_ready(5.0, err));
+        CHECK(link.cvec_set(false, err) && link.end_request(err));
+        KV k;
+        { std::lock_guard<std::mutex> g(w.mu); k = w.last_cfg; }
+        CHECK(!k.has("cvec") && !k.has("cvec_dir") && w.cvecs == 0);
+        link.bye();
+    }
+    {   // a worker whose engine predates it: refused, naming the fix
+        FakeWorker w("s", 0);
+        w.knows_cvec = false;
+        w.run(1);
+        PoolLink link;
+        CHECK(link.connect({"127.0.0.1:" + std::to_string(w.port)}, "s", fp(), 5.0, 5.0, err));
+        link.set_cvec(dir, sc, 0, 4, 44, N, 7);
+        KV c;
+        err.clear();
+        CHECK(!link.configure({24}, L, c, Wire::F32, Wire::F16, err));
+        CHECK(err.find("update that PC's engine") != std::string::npos);
+    }
+    // base64 round trips of every length mod 3, and a malformed string
+    for (size_t n = 0; n < 10; ++n) {
+        std::vector<uint8_t> in(n), back;
+        for (size_t i = 0; i < n; ++i) in[i] = (uint8_t) (i * 77 + 251);
+        CHECK(from_base64(to_base64(in.data(), n), back) && back == in);
+    }
+    std::vector<uint8_t> junk;
+    CHECK(!from_base64("ab=c", junk) && !from_base64("abc", junk) && !from_base64("a*cd", junk));
+}
+
 int main() {
     net_init();
+    test_cvec();
     test_two_workers(Wire::F32);
     test_two_workers(Wire::F16);
     test_prefill_pipelined(Wire::F32, Wire::F16, false);

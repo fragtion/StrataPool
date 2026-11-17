@@ -48,7 +48,8 @@ bool accept_coordinator(Listener& l, const std::string& secret, const std::funct
         const auto mine = hmac_sha256(secret, cn.data(), cn.size());
         KV ok;
         ok.set("mac", to_hex(mine.data(), mine.size()));
-        if (!ch.send(Msg::AuthOk, ok, e) || !ch.recv(t, p, e, 1 << 20)) {
+        // (CONFIG can carry a control vector's rows: up to n_layers x n_embd f32 in base64, a few MiB)
+        if (!ch.send(Msg::AuthOk, ok, e) || !ch.recv(t, p, e, (uint64_t) 64 << 20)) {
             log(peer + ": " + e);
             continue;
         }

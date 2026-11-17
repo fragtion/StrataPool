@@ -2683,12 +2683,21 @@ private:
     bool stop_ = false;
 };
 
+// A control vector's host tables, as `cvec_upload` takes them (built from the files, or a pool worker's rows of them
+// from its coordinator's CONFIG).  `summary` is what INFO reports; `digest` identifies the tables, mode and range
+// exactly (a session file is bound to it; a pool worker reloads for another one).
+struct CvecTables {
+    std::vector<float> dir, s;   // n_layers x n_embd, n_layers (empty: no vector)
+    int mode = 0, first = 1, last = 0;
+    int steered = 0;             // layers with a direction (0 on a worker whose layers have none: nothing to upload)
+    uint64_t digest = 0;
+    std::string summary = "0";
+};
+
 // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
 // summed; layer 0 has none) and `llama_adapter_cvec::apply` with the projection-mode patch (project: the unit
-// direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports;
-// `digest` identifies the uploaded tables, mode and range exactly (a session file is bound to it).
-bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g, std::string& summary,
-                          uint64_t& digest, std::string& err) {
+// direction and its norm as the scale), into the tables `cvec_upload` takes.
+bool build_control_vectors(const Options& o, const strata::core::ModelGeometry& g, CvecTables& out, std::string& err) {
     const int64_t L = g.n_layers, N = g.n_embd;
     std::vector<float> data((size_t) (L * N), 0.0f);
     std::vector<bool> have((size_t) L, false);
@@ -2750,7 +2759,6 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
         ++steered;
     }
     if (steered == 0) { err = "the control vector has no direction in layers " + std::to_string(first) + ".." + std::to_string(last); return false; }
-    if (!strata::kernels::cvec_upload(dir, s, o.cvec_mode, first, last, N, g.hc, err)) return false;
     {
         strata::core::SessionIdentityBuilder b(0x43564543ull);   // "CVEC"
         b.i64("mode", o.cvec_mode);
@@ -2759,11 +2767,17 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
         b.i64("single", single);
         b.bytes("dir", dir.data(), dir.size() * sizeof(float));
         b.bytes("scale", s.data(), s.size() * sizeof(float));
-        digest = b.digest();
-        if (digest == 0) digest = 1;   // 0 means "none loaded"
+        out.digest = b.digest();
+        if (out.digest == 0) out.digest = 1;   // 0 means "none loaded"
     }
-    summary = std::string(o.cvec_mode == 0 ? "project" : "add") + ":" + std::to_string(first) + "-" + std::to_string(last) +
-              (single >= 0 ? ":single" + std::to_string(single) : "");
+    out.summary = std::string(o.cvec_mode == 0 ? "project" : "add") + ":" + std::to_string(first) + "-" + std::to_string(last) +
+                  (single >= 0 ? ":single" + std::to_string(single) : "");
+    out.dir = std::move(dir);
+    out.s = std::move(s);
+    out.mode = o.cvec_mode;
+    out.first = first;
+    out.last = last;
+    out.steered = steered;
     // the line llama.cpp's patched build prints, so a log shows the same thing
     std::fprintf(stderr, "strata generate: control vector mode = %s, dir = %s, layers %d..%d (%d steered)\n",
                  o.cvec_mode == 0 ? "project" : "add", single >= 0 ? "single" : "per-layer", first, last, steered);
@@ -4292,7 +4306,6 @@ int main(int argc, char** argv) {
         else if (!o.layer_split.empty() || !o.split_device.empty())
             why = "a pool node uses one GPU (no --layer-split; the pool is the split)";
         else if (o.vision) why = "images are not supported in a pool yet: turn vision off for the pool's model";
-        else if (!o.cvec_files.empty()) why = "control vectors (the speed projection) are not supported in a pool yet";
         else if (o.expert_cache_remote[0] > 0) why = "--expert-cache-remote is not supported in a pool";
         else if (o.mmap_experts || o.resident_cpu_experts)
             why = "the low-RAM modes are not supported in a pool: each PC already holds only its own layers' experts";
@@ -4308,6 +4321,12 @@ int main(int argc, char** argv) {
         // parked conversations: the coordinator parks its layers and the draft layer, every worker its own layers
         // (CONV_PARK); a worker that cannot (an older engine) turns parking off once the workers are ready
         if (pool_worker) o.mtp.clear();   // the coordinator drafts; a worker runs layers only
+        if (pool_worker && !o.cvec_files.empty()) {
+            // a control vector (the speed projection) is the coordinator's: its CONFIG carries the rows of this PC's
+            // layers, so the whole pool steers with one vector
+            std::fprintf(stderr, "strata pool: --control-vector ignored on a worker: it takes the coordinator's\n");
+            o.cvec_files.clear();
+        }
         // --batch in a pool: the slot groups are pipelined across the PCs (one group per PC at a time), so while a
         // worker runs one conversation's layers this PC runs another's.  Groups of one slot overlap the most.  A
         // worker's slot count is the coordinator's (CONFIG), not its own config's.
@@ -5798,6 +5817,16 @@ int main(int argc, char** argv) {
             else pool_dense_other += (int64_t) bytes;
         }
     }
+    // a control vector's tables (--control-vector-scaled), uploaded below before session_init: built here, before a
+    // coordinator configures its workers, since each worker's CONFIG carries the rows of its own layers
+    CvecTables cvec_tab;
+    if (!o.cvec_files.empty()) {
+        std::string ce;
+        if (!build_control_vectors(o, g, cvec_tab, ce)) {
+            std::fprintf(stderr, "strata generate: control vector: %s\n", ce.c_str());
+            return 2;
+        }
+    }
     // ================================ POOL: who runs which layers ================================
     // Both sides meet here, before any weight is on the GPU: a pool node loads only ITS layers' dense weights (and
     // later only their experts, their session and their cache), so the split must be known first.  The free VRAM now
@@ -5814,7 +5843,7 @@ int main(int argc, char** argv) {
         std::string e;
         for (const char* k : {"lb", "le", "max_context", "kv", "spec", "batch", "batch_mtp", "prefill_chunk", "prefill_auto", "rope_type",
                               "rope_freq_base", "rope_factor", "rope_freq_scale_in", "rope_orig_ctx", "rope_ext_factor",
-                              "rope_attn_factor", "rope_beta_fast", "rope_beta_slow"})
+                              "rope_attn_factor", "rope_beta_fast", "rope_beta_slow", "cvec_id"})
             e += std::string(k) + "=" + c.str(k) + ";";
         return e;
     };
@@ -5870,6 +5899,7 @@ int main(int argc, char** argv) {
         strata::pool::KV h = pool_fp.to_kv();
         h.set("proto", (int64_t) strata::pool::kProtocol);
         h.set("prefill_wire", (int64_t) 1);   // takes prompt rows on CONFIG prefill_wire (said before CONFIG is sent)
+        h.set("cvec", (int64_t) 1);           // takes a control vector's rows in CONFIG (cvec_*) and the CVEC switch
         h.set("name", pool_node_name());
         cudaDeviceProp prop{};
         if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) h.set("gpu", std::string(prop.name));
@@ -6005,6 +6035,42 @@ int main(int argc, char** argv) {
         strata::pool::parse_wire(pool_cfg.str("wire", "f32"), pool_wire);
         strata::pool::parse_wire(pool_cfg.str("draft_wire", "f16"), pool_draft_wire);
         strata::pool::parse_wire(pool_cfg.str("prefill_wire", pool_cfg.str("wire", "f32")), pool_prefill_wire);
+        if (pool_cfg.i64("cvec", 0) == 1) {
+            // the coordinator's control vector: the rows of this PC's layers and of the one before them (its write and
+            // vector are applied here, as in a layer split inside one PC), zero elsewhere, as cvec_upload takes them
+            const int64_t L = g.n_layers, N = g.n_embd;
+            const int64_t lb = pool_cfg.i64("cvec_lb", -1), le = pool_cfg.i64("cvec_le", -1);
+            std::vector<uint8_t> db, sb;
+            const char* bad = nullptr;
+            if (pool_cfg.i64("cvec_n_embd", 0) != N) bad = "its width is not this model's";
+            else if (lb < 0 || le < lb || le > L) bad = "a bad layer range";
+            else if (!strata::pool::from_base64(pool_cfg.str("cvec_dir"), db) || !strata::pool::from_base64(pool_cfg.str("cvec_s"), sb) ||
+                     db.size() != (size_t) ((le - lb) * N) * sizeof(float) || sb.size() != (size_t) (le - lb) * sizeof(float))
+                bad = "malformed rows";
+            if (bad != nullptr) {
+                strata::pool::KV no;
+                no.set("message", std::string("the control vector in CONFIG: ") + bad);
+                pool_ch.send(strata::pool::Msg::Err, no, err);
+                std::fprintf(stderr, "strata pool: the coordinator's control vector: %s\n", bad);
+                return 1;
+            }
+            cvec_tab.dir.assign((size_t) (L * N), 0.0f);
+            cvec_tab.s.assign((size_t) L, 0.0f);
+            if (!db.empty()) std::memcpy(cvec_tab.dir.data() + (size_t) (lb * N), db.data(), db.size());
+            if (!sb.empty()) std::memcpy(cvec_tab.s.data() + (size_t) lb, sb.data(), sb.size());
+            cvec_tab.mode = (int) pool_cfg.i64("cvec_mode", 0);
+            cvec_tab.first = (int) pool_cfg.i64("cvec_first", 1);
+            cvec_tab.last = (int) pool_cfg.i64("cvec_last", 0);
+            cvec_tab.steered = 0;
+            for (int64_t l = std::max<int64_t>(node_lb - 1, cvec_tab.first); l < node_le && l <= cvec_tab.last; ++l)
+                cvec_tab.steered += cvec_tab.s[(size_t) l] != 0.0f;
+            cvec_tab.digest = std::strtoull(pool_cfg.str("cvec_id", "1").c_str(), nullptr, 16);
+            if (cvec_tab.digest == 0) cvec_tab.digest = 1;
+            cvec_tab.summary = std::string(cvec_tab.mode == 0 ? "project" : "add") + ":" + std::to_string(cvec_tab.first) +
+                               "-" + std::to_string(cvec_tab.last) + ":pool";
+            std::fprintf(stderr, "strata pool: the coordinator's control vector (%s): %d of this PC's layers steered\n",
+                         cvec_tab.mode == 0 ? "project" : "add", cvec_tab.steered);
+        }
         pool_loaded = pool_essentials(pool_cfg);
         std::fprintf(stderr, "strata pool: worker: layers %lld-%lld of %lld, context %lld, KV %s, windows of %d\n",
                      (long long) node_lb, (long long) (node_le - 1), (long long) g.n_layers, (long long) o.max_context,
@@ -6230,6 +6296,9 @@ int main(int argc, char** argv) {
         common.set("rope_beta_fast", rope_cfg.beta_fast);
         common.set("rope_beta_slow", rope_cfg.beta_slow);
         pool_link.set_prefill_wire(pool_prefill_wire);   // configure() falls back to the decode wire when a worker did not say prefill_wire in its HELLO
+        if (!cvec_tab.s.empty())   // each worker's CONFIG carries the rows of its layers (the speed projection)
+            pool_link.set_cvec(cvec_tab.dir, cvec_tab.s, cvec_tab.mode, cvec_tab.first, cvec_tab.last, g.n_embd,
+                               cvec_tab.digest);
         if (!pool_link.configure(pool_at, g.n_layers, common, pool_wire, pool_draft_wire, err)) {
             std::fprintf(stderr, "strata pool: %s\n", err.c_str());
             return 1;
@@ -6434,12 +6503,16 @@ int main(int argc, char** argv) {
     // before session_init: every graph captured from here on has the vector's kernels where it applies
     std::string cvec_summary = "0";
     uint64_t cvec_digest = 0;   // a session file is bound to the loaded vector (0: none)
-    if (!o.cvec_files.empty()) {
+    if (cvec_tab.steered > 0) {   // (a pool worker whose layers the vector does not reach has nothing to upload)
         std::string ce;
-        if (!load_control_vectors(o, g, cvec_summary, cvec_digest, ce)) {
+        if (!strata::kernels::cvec_upload(cvec_tab.dir, cvec_tab.s, cvec_tab.mode, cvec_tab.first, cvec_tab.last,
+                                          g.n_embd, g.hc, ce)) {
             std::fprintf(stderr, "strata generate: control vector: %s\n", ce.c_str());
             return 2;
         }
+        if (pool_worker && pool_cfg.i64("cvec_on", 1) == 0) strata::kernels::cvec_set_enabled(false);
+        cvec_summary = cvec_tab.summary;
+        cvec_digest = cvec_tab.digest;
     }
     if (o.max_context < (int64_t) o.tokens.size() + o.max_new) {
         std::fprintf(stderr, "strata generate: --max-context %lld cannot hold %zu prompt + %lld new tokens\n",
@@ -16235,6 +16308,12 @@ int main(int argc, char** argv) {
                         }
                         w_prefill += T;
                         w_ms_prefill += std::chrono::duration<double, std::milli>(Clock::now() - tp).count();
+                    } else if (t == strata::pool::Msg::Cvec) {
+                        // the coordinator's per-request switch of the control vector (what follows runs with it so)
+                        int32_t on = 1;
+                        if (!u.get(on)) { fail("a malformed control vector switch"); fatal = true; break; }
+                        if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(on != 0);
+                        if (!ack()) { why = "the coordinator went away"; break; }
                     } else if (t == strata::pool::Msg::Reset) {
                         strata::core::session_zero(ss, g, nullptr, main_cs);
                         if (cudaStreamSynchronize(main_stream) != cudaSuccess) { fail("resetting the session failed"); fatal = true; break; }
@@ -16458,6 +16537,7 @@ int main(int argc, char** argv) {
                     return 3;
                 }
                 pool_cfg = next;
+                if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(pool_cfg.i64("cvec_on", 1) != 0);
                 strata::pool::parse_wire(pool_cfg.str("wire", "f32"), pool_wire);
                 strata::pool::parse_wire(pool_cfg.str("draft_wire", "f16"), pool_draft_wire);
                 strata::pool::parse_wire(pool_cfg.str("prefill_wire", pool_cfg.str("wire", "f32")), pool_prefill_wire);
@@ -19620,6 +19700,10 @@ int main(int argc, char** argv) {
                 cvec_cached = want_cvec;
             }
             if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(want_cvec);
+            if (pool_coord && !pool_link.cvec_set(want_cvec, err)) {   // the workers' layers switch with this PC's
+                std::printf("ERR pool: %s\n", err.c_str());
+                return 1;
+            }
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
             auto off_path = [&](const ConvCheckpoint& c) {

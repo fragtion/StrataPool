@@ -196,7 +196,10 @@ class Config(unittest.TestCase):
         pc = PoolConfig(None, {"role": "worker"})
         self.assertEqual(config_problems({"args": []}, pc), [])
         self.assertEqual(len(config_problems({"args": [], "vision": {"exe": "v"}}, pc)), 1)
-        self.assertEqual(len(config_problems({"args": ["--control-vector-scaled", "x:1"], "gpu": "0,1"}, pc)), 2)
+        self.assertEqual(len(config_problems({"args": ["--control-vector-scaled", "x:1"], "gpu": "0,1"}, pc)), 1)
+        # the speed projection (a control vector) runs in a split: the coordinator sends each worker its layers' rows
+        self.assertEqual(config_problems({"args": ["--control-vector-scaled", "x:1"]},
+                                         PoolConfig(None, {"role": "coordinator"})), [])
         self.assertEqual(config_problems({"args": [], "vision": {}}, PoolConfig(None, {"role": "off"})), [])
         # DeepSeek-V4.1 has its own engine (no layer split): the split roles refuse it with one line, routing takes it
         ds = {"args": [], "arch": "deepseek41", "exe": "engine-dsv41/strata-dsv41.exe"}

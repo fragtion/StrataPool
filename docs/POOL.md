@@ -95,6 +95,11 @@ every token.
 - StrataPool's engine on each PC. `START-HERE.bat` compiles it the first time (10-20 minutes, once; it installs the
   compiler and the CUDA toolkit itself): Strata's ready-made engines do not include the layer split. An engine
   without it says so in the Pool tab. Share requests (routing) works with any engine: only the server takes part.
+- The **experimental speed projection** (a control vector, `--control-vector-scaled`) works in a split (engines
+  built from 2026-11-17 on): set it in the **coordinator's** model config. The coordinator sends each worker the vector's
+  rows for its own layers, and switches it per request with the coordinator (`"experimental_speed_projection": false`
+  in a request's or the config's sampling turns it off). A worker's own vector arguments are ignored. Every worker needs
+  an engine that knows this: the coordinator refuses an older one and says which PC to update.
 
 ### Setting it up
 
@@ -348,8 +353,7 @@ out of the pool. The automatic split would give it as few layers as it can.
 
 ## What is not supported yet
 
-- **Images** (vision), the **experimental speed projection** (control vectors) and the **low-RAM modes**. The Pool tab
-  says when your setup has one of them on.
+- **Images** (vision) and the **low-RAM modes**. The Pool tab says when your setup has one of them on.
 - **Several GPUs in one pool PC.** Each pool PC uses one GPU, and the pool is the split.
 - From Strata 0.1.40: **`--kv-grow`** (the elastic K/V; off with a note - it also needs the whole K/V in VRAM, which a
   long context with `--kv-resident` does not have) and **session files** (`/slots/0?action=save|restore` answers that

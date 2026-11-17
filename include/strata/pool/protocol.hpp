@@ -65,6 +65,8 @@ enum class Msg : uint16_t {
     ConvRestore = 33,// u64 id: put that image back into the session                                     (ACK / Err)
     ConvRetain = 34, // u32 n, u64 ids[n]: drop every other image                                        (lazy ACK)
     ConvBorrow = 35, // u64 id, i64 n: the first n tokens' K/V from that image into the session; it stays (ACK / Err)
+    // a control vector (the speed projection): the tables come in CONFIG (cvec_* keys); this is the per-request switch
+    Cvec = 36,       // i32 on: the loaded vector on (1) or off (0) from the next message on   (lazy ACK)
     Ack = 30,
     Err = 31,        // message=<text>
     Bye = 40,        // the coordinator is leaving; the worker keeps its load for the next one
@@ -96,6 +98,10 @@ struct KV {
     static KV decode(const std::string& s);
     static KV decode(const std::vector<uint8_t>& b) { return decode(std::string(b.begin(), b.end())); }
 };
+
+/// Base64 (RFC 4648, padded) for binary data inside a KV value (CONFIG's control vector tables).
+std::string to_base64(const void* p, size_t n);
+bool from_base64(const std::string& s, std::vector<uint8_t>& out);
 
 /// Little-endian packing for the binary payloads.
 class Packer {

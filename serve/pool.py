@@ -319,8 +319,6 @@ def config_problems(cfg: dict, pc: PoolConfig) -> list[str]:
                    "version's engine with START-HERE.bat --build, or use Share requests, which works with any engine")
     if cfg.get("vision"):
         out.append("images (vision) are on: a pool runs text only for now - run setup again with images off")
-    if any(a in ("--control-vector", "--control-vector-scaled") for a in args):
-        out.append("the experimental speed projection is on: a pool does not support it yet")
     if any(a in ("--mmap-experts", "--resident-experts", "--resident-cpu-experts") for a in args):
         out.append("the low-RAM mode is on: a pool node holds only its own layers' experts instead")
     if len([g for g in str(cfg.get("gpu", "")).split(",") if g.strip()]) > 1:

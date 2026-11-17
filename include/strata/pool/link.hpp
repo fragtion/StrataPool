@@ -112,6 +112,15 @@ public:
     /// which falls back to the decode wire when a worker's HELLO does not say it takes it (an older engine).
     void set_prefill_wire(Wire w) { prefill_wire_ = w; }
     Wire prefill_wire() const { return prefill_wire_; }
+    /// A control vector (--control-vector-scaled: the speed projection), set before configure: the coordinator's
+    /// tables as kernels::cvec_upload takes them (dir n_layers x n_embd, s n_layers), mode, steered range and
+    /// digest.  Each worker's CONFIG carries the rows of its own layers (cvec_* keys, f32 in base64), so its graphs
+    /// steer the same layers; configure refuses a worker whose HELLO does not say cvec=1 (an older engine).
+    void set_cvec(std::vector<float> dir, std::vector<float> s, int mode, int first, int last, int64_t n_embd,
+                  uint64_t digest);
+    bool has_cvec() const { return !cvec_s_.empty(); }
+    /// The per-request switch of that vector on every worker (CVEC, lazy ACK); sends nothing when it is already so.
+    bool cvec_set(bool on, std::string& err);
 
     // ---- batch slots (several conversations at once): each worker is one stage of the pipeline that
     // --batch-groups runs (generate.cpp's pump).  A group's window: this PC's verifier runs its layers (batch_launch),
@@ -248,6 +257,11 @@ private:
     std::string secret_;
     ModelFingerprint fp_;
     KV common_;
+    std::vector<float> cvec_dir_, cvec_s_;   ///< set_cvec (empty: no vector)
+    int cvec_mode_ = 0, cvec_first_ = 0, cvec_last_ = -1;
+    int64_t cvec_n_ = 0;
+    uint64_t cvec_digest_ = 0;
+    bool cvec_on_ = true;                     ///< what the workers have (cvec_upload starts ON)
     uint64_t ckpt_seq_ = 0;
     uint64_t req_bytes0_ = 0;   ///< bytes on all channels when the request's counters were last reset
     struct BatchStage {

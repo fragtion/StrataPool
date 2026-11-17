@@ -50,6 +50,7 @@ const char* msg_name(Msg m) {
     case Msg::ConvRestore: return "CONV_RESTORE";
     case Msg::ConvRetain: return "CONV_RETAIN";
     case Msg::ConvBorrow: return "CONV_BORROW";
+    case Msg::Cvec: return "CVEC";
     case Msg::Ack: return "ACK";
     case Msg::Err: return "ERR";
     case Msg::Bye: return "BYE";
@@ -186,6 +187,50 @@ KV KV::decode(const std::string& s) {
         a = b + 1;
     }
     return kv;
+}
+
+std::string to_base64(const void* p, size_t n) {
+    static const char* d = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const uint8_t* b = (const uint8_t*) p;
+    std::string s;
+    s.reserve((n + 2) / 3 * 4);
+    for (size_t i = 0; i < n; i += 3) {
+        const uint32_t v = (uint32_t) b[i] << 16 | (i + 1 < n ? (uint32_t) b[i + 1] << 8 : 0) | (i + 2 < n ? b[i + 2] : 0);
+        s += d[v >> 18 & 63];
+        s += d[v >> 12 & 63];
+        s += i + 1 < n ? d[v >> 6 & 63] : '=';
+        s += i + 2 < n ? d[v & 63] : '=';
+    }
+    return s;
+}
+
+bool from_base64(const std::string& s, std::vector<uint8_t>& out) {
+    out.clear();
+    if (s.size() % 4 != 0) return false;
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    out.reserve(s.size() / 4 * 3);
+    for (size_t i = 0; i < s.size(); i += 4) {
+        const bool last = i + 4 == s.size();
+        int pad = 0;
+        if (last && s[i + 3] == '=') pad = s[i + 2] == '=' ? 2 : 1;
+        int q[4];
+        for (int k = 0; k < 4; ++k) {
+            q[k] = k >= 4 - pad ? 0 : val(s[i + k]);
+            if (q[k] < 0) return false;
+        }
+        const uint32_t v = (uint32_t) q[0] << 18 | (uint32_t) q[1] << 12 | (uint32_t) q[2] << 6 | (uint32_t) q[3];
+        out.push_back((uint8_t) (v >> 16));
+        if (pad < 2) out.push_back((uint8_t) (v >> 8));
+        if (pad < 1) out.push_back((uint8_t) v);
+    }
+    return true;
 }
 
 // ------------------------------------------------------------------------------------------------ Channel
