@@ -12929,6 +12929,7 @@ int main(int argc, char** argv) {
                         return pool_prefill_recv(toks, T, p0, e);
                     };
                 }
+                sp.remote_abort = [&](std::string& e) { return pool_link.prefill_abort(e); };
             } else if (pool_worker) {
                 sp.set_stage(node_lb, node_le, nullptr);
                 sp.set_headless(true);

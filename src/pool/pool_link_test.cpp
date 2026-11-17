@@ -46,6 +46,7 @@ struct FakeWorker {
     bool reload_first = false;     // answer the first CONFIG with "reload" (it had another range)
     bool wrong_model = false;
     bool knows_prefill_wire = true;   // false: an engine from before CONFIG prefill_wire (prompt rows on the decode wire)
+    int prefill_ms = 0;               // each prompt chunk takes this long (the coordinator's sends run ahead)
     int port = 0;
     std::atomic<bool> stop{false};
 
@@ -107,6 +108,7 @@ struct FakeWorker {
                         for (float& x : rows) x += add + (float) p0;   // + p0: which chunk this is, for the order checks
                         std::vector<uint8_t> out(n * wire_bytes(dwire));
                         encode_rows(dwire, rows.data(), n, out.data());
+                        if (prefill_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(prefill_ms));
                         if (ck) { std::lock_guard<std::mutex> g(mu); ckpts.insert(ck); }
                         ++prefills;
                         ch.send(Msg::PrefillRows, out, e);
@@ -479,6 +481,92 @@ static void test_prefill_pipelined(Wire wire, Wire pwire, bool old_second) {
     link.bye();
 }
 
+// The receiving side keeps a conversation checkpoint between chunks, as generate.cpp's checkpoint_at does, while the
+// sending side is chunks ahead: its retain lists must not drop the checkpoints of chunks still in flight, must not
+// break the stream (the ACKs come back between the chunks' rows), and must reach every worker.  Then a prompt cut
+// part-way: prefill_abort reads past what is still on the way, and the link answers the next call in step.
+static void test_prefill_retain_midway() {
+    FakeWorker a("pr", 1.0f), b("pr", 10.0f);
+    a.prefill_ms = 15;   // the first worker is the slow one: the sends queue up in front of it
+    a.run(1);
+    b.run(1);
+    PoolLink link;
+    std::string err;
+    CHECK(link.connect({"127.0.0.1:" + std::to_string(a.port), "127.0.0.1:" + std::to_string(b.port)}, "pr", fp(), 10.0,
+                       10.0, err));
+    KV common;
+    common.set("max_context", (int64_t) 4096);
+    link.set_prefill_wire(Wire::F16);
+    CHECK(link.configure({20, 34}, 48, common, Wire::F32, Wire::F32, err));
+    CHECK(link.wait_ready(10.0, err));
+    link.set_rows_geometry(8, 64);
+    CHECK(link.reset(err));               // an ACK owed before the prompt (the first send reads it)
+    CHECK(link.conv_retain({7}, err));
+    constexpr int kChunks = 10;
+    std::vector<float> rows(4 * 8, 0.5f);
+    std::vector<int64_t> toks(64, 5);
+    std::atomic<bool> send_ok{true};
+    std::atomic<int> sent{0}, received{0};
+    std::thread sender([&] {
+        for (int c = 0; c < kChunks; ++c) {
+            while (c - received.load() >= 3) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            std::string e;
+            if (!link.prefill_send(rows.data(), toks.data(), 4, 4 * c, 64, (uint64_t) (500 + c), e)) {
+                std::fprintf(stderr, "send %d: %s\n", c, e.c_str());
+                send_ok = false;
+                return;
+            }
+            ++sent;
+        }
+    });
+    std::vector<uint64_t> kept;   // the coordinator keeps every other chunk's checkpoint (a list as checkpoint_at sends)
+    for (int c = 0; c < kChunks; ++c) {
+        while (send_ok && sent.load() <= c) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const float* out = nullptr;
+        uint64_t ck = 0;
+        std::string e;
+        const bool ok = link.prefill_recv(4, &out, &ck, e);
+        CHECK(ok);
+        if (!ok) { std::fprintf(stderr, "recv %d: %s\n", c, e.c_str()); break; }
+        CHECK(ck == (uint64_t) (500 + c));
+        for (int i = 0; out && i < 32; ++i) CHECK(std::fabs(out[i] - (0.5f + 11.0f + 8.0f * (float) c)) < 2e-2f);
+        if (c % 2 == 0) kept.push_back(ck);
+        CHECK(link.ckpt_retain(kept, e));
+        CHECK(link.conv_retain({7}, e));
+        ++received;
+    }
+    sender.join();
+    CHECK(send_ok);
+    CHECK(a.prefills == kChunks && b.prefills == kChunks);
+    // every kept checkpoint is still on both workers (none dropped while its chunk was in flight), the rest are gone
+    const std::set<uint64_t> want(kept.begin(), kept.end());
+    CHECK(link.ckpt_restore(kept.back(), err));   // in step: the last list's ACKs are read first
+    {
+        std::lock_guard<std::mutex> g(a.mu);
+        CHECK(a.ckpts == want);
+        CHECK(a.convs.empty() || a.convs == std::set<uint64_t>{7});
+    }
+    {
+        std::lock_guard<std::mutex> g(b.mu);
+        CHECK(b.ckpts == want);
+    }
+    // a prompt cut part-way: three chunks out, one back, then the receiving side gives up
+    for (int c = 0; c < 3; ++c) CHECK(link.prefill_send(rows.data(), toks.data(), 4, 4 * c, 64, (uint64_t) (600 + c), err));
+    const float* out = nullptr;
+    uint64_t ck = 0;
+    CHECK(link.prefill_recv(4, &out, &ck, err) && ck == 600);
+    CHECK(link.ckpt_retain(kept, err));   // waits: two chunks are still in flight
+    CHECK(link.prefill_abort(err));
+    CHECK(link.ckpt_restore(kept.front(), err));   // the next call is answered in step
+    CHECK(link.prefill(rows.data(), toks.data(), 4, 0, 4, 0, &out, err));
+    for (int i = 0; out && i < 32; ++i) CHECK(std::fabs(out[i] - (0.5f + 11.0f)) < 2e-2f);
+    {
+        std::lock_guard<std::mutex> g(a.mu);
+        CHECK(a.ckpts == want);   // the cut prompt's checkpoints were dropped by the list sent after the abort
+    }
+    link.bye();
+}
+
 int main() {
     net_init();
     test_two_workers(Wire::F32);
@@ -486,6 +574,7 @@ int main() {
     test_prefill_pipelined(Wire::F32, Wire::F16, false);
     test_prefill_pipelined(Wire::F32, Wire::F32, false);
     test_prefill_pipelined(Wire::F32, Wire::F16, true);
+    test_prefill_retain_midway();
     test_refusals();
     test_reload_and_busy();
     if (failures) { std::fprintf(stderr, "%d check(s) failed\n", failures); return 1; }

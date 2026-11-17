@@ -582,6 +582,88 @@ void PoolLink::set_rows_geometry(int64_t d, int64_t max_chunk) {
     max_chunk_ = max_chunk;
 }
 
+bool PoolLink::send_counted(size_t i, const std::vector<std::pair<Msg, std::vector<uint8_t>>>& msgs, std::string& err) {
+    for (const auto& m : msgs) {
+        {   // counted first: the receiving side may read the ACK as soon as the frame is out
+            std::lock_guard<std::mutex> a(pf_ack_mu_);
+            ++ch_[i].pending;
+        }
+        if (!ch_[i].send(m.first, m.second, err)) { err = "pool worker " + workers_[i].addr + ": " + err; return false; }
+    }
+    return true;
+}
+
+std::vector<std::pair<Msg, std::vector<uint8_t>>> PoolLink::take_deferred_locked() {
+    std::vector<std::pair<Msg, std::vector<uint8_t>>> out;
+    auto frame = [](const std::vector<uint64_t>& ids) {
+        Packer pk;
+        pk.put<uint32_t>((uint32_t) ids.size());
+        for (const uint64_t id : ids) pk.put<uint64_t>(id);
+        return pk.b;
+    };
+    if (pf_def_ckpt_) {   // the chunks' checkpoints no list has covered yet stay
+        std::vector<uint64_t> ids = pf_def_ckpt_ids_;
+        for (const uint64_t id : pf_protect_)
+            if (std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
+        out.emplace_back(Msg::CkptRetain, frame(ids));
+        pf_def_ckpt_ = false;
+    }
+    if (pf_def_conv_) {
+        out.emplace_back(Msg::ConvRetain, frame(pf_def_conv_ids_));
+        pf_def_conv_ = false;
+    }
+    return out;
+}
+
+bool PoolLink::flush_deferred(std::string& err) {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<std::mutex> w(pf_wr_mu_);
+    std::vector<std::pair<Msg, std::vector<uint8_t>>> msgs;
+    {
+        std::lock_guard<std::mutex> q(pf_q_mu_);
+        if (pf_inflight_ > 0) return true;   // a chunk went out meanwhile: they go in front of the next one
+        msgs = take_deferred_locked();
+    }
+    for (size_t i = 0; i < ch_.size(); ++i)
+        if (!send_counted(i, msgs, err)) return false;
+    return true;
+}
+
+bool PoolLink::retain(Msg m, const std::vector<uint64_t>& ids, std::string& err) {
+    const bool ck = m == Msg::CkptRetain;
+    // the list as given now speaks for every chunk's checkpoint handed back so far (the caller kept it or not)
+    auto note = [&]() {
+        if (ck) {
+            for (const uint64_t id : pf_returned_)
+                pf_protect_.erase(std::remove(pf_protect_.begin(), pf_protect_.end(), id), pf_protect_.end());
+            pf_returned_.clear();
+            pf_def_ckpt_ = true;
+            pf_def_ckpt_ids_ = ids;
+        } else {
+            pf_def_conv_ = true;
+            pf_def_conv_ids_ = ids;
+        }
+    };
+    std::lock_guard<std::mutex> lk(mu_);
+    {
+        // chunks in flight: the receiving side calls this between them, and must not wait for the sending side's
+        // connection; the list waits and goes out in front of the next chunk (later lists replace it)
+        std::lock_guard<std::mutex> q(pf_q_mu_);
+        if (pf_inflight_ > 0) { note(); return true; }
+    }
+    std::lock_guard<std::mutex> w(pf_wr_mu_);
+    std::vector<std::pair<Msg, std::vector<uint8_t>>> msgs;
+    {
+        std::lock_guard<std::mutex> q(pf_q_mu_);
+        note();
+        if (pf_inflight_ > 0) return true;   // a chunk went out before this got the connection: in front of the next
+        msgs = take_deferred_locked();       // this list (and a waiting one of the other kind)
+    }
+    for (size_t i = 0; i < ch_.size(); ++i)
+        if (!send_counted(i, msgs, err)) return false;
+    return true;
+}
+
 bool PoolLink::prefill(const float* rows, const int64_t* tokens, int64_t T, int64_t p0, int64_t segment, uint64_t ckpt,
                        const float** out, std::string& err) {
     uint64_t ck = 0;
@@ -593,6 +675,10 @@ bool PoolLink::prefill_send(const float* rows, const int64_t* tokens, int64_t T,
     std::lock_guard<std::mutex> lk(pf_send_mu_);
     if (ch_.empty()) { err = "pool: no workers"; return false; }
     if (T < 1 || T > max_chunk_) { err = "pool: a prompt chunk of " + std::to_string(T) + " tokens is too long"; return false; }
+    {
+        std::lock_guard<std::mutex> a(pf_ack_mu_);
+        if (pf_rows_owed_.size() < ch_.size()) pf_rows_owed_.resize(ch_.size(), 0);
+    }
     PfInFlight f;
     f.t0 = Clock::now();
     f.T = T;
@@ -612,19 +698,57 @@ bool PoolLink::prefill_send(const float* rows, const int64_t* tokens, int64_t T,
         body = pf_enc_.data();
     }
     Channel& c = ch_[0];
+    std::lock_guard<std::mutex> w(pf_wr_mu_);   // the one writer of this connection until the chunk is out
+    bool reading = false;
+    std::vector<std::pair<Msg, std::vector<uint8_t>>> ahead;
     {
         std::lock_guard<std::mutex> q(pf_q_mu_);
-        // the receive side reads this connection while chunks are in flight: an ACK still owed here would be read
-        // by two threads (nothing lazily acknowledged is sent between a prompt's chunks, so this does not happen)
-        if (c.pending > 0 && !pf_q_.empty()) { err = "pool: an acknowledgement is owed while prompt chunks are in flight"; return false; }
         if (pf_q_.size() >= 4) { err = "pool: too many prompt chunks in flight"; return false; }
-        pf_q_.push_back(std::move(f));   // queued first: the reply may be read as soon as the bytes are out
+        reading = pf_inflight_ > 0;
+        ahead = take_deferred_locked();   // retain lists made while chunks were in flight: in front of this one
+        f.ahead = ahead;
+        if (ckpt != 0) pf_protect_.push_back(ckpt);
+        pf_q_.push_back(std::move(f));    // queued first: the reply may be read as soon as the bytes are out
+        ++pf_inflight_;
     }
-    if (!c.drain(err) || !c.send(Msg::Prefill, pk.b.data(), pk.b.size(), body, n * wire_bytes(prefill_wire_), err)) {
+    // ACKs still owed are read here only while nothing else reads this connection; else the receiving side reads
+    // them in front of the rows it waits for
+    if (!reading && !c.drain(err)) { err = "pool worker " + workers_[0].addr + ": " + err; return false; }
+    if (!send_counted(0, ahead, err)) return false;
+    {
+        std::lock_guard<std::mutex> a(pf_ack_mu_);
+        ++pf_rows_owed_[0];
+    }
+    if (!c.send(Msg::Prefill, pk.b.data(), pk.b.size(), body, n * wire_bytes(prefill_wire_), err)) {
         err = "pool worker " + workers_[0].addr + ": " + err;
         return false;
     }
     return true;
+}
+
+// one Prefill reply from connection i: the ACKs owed in front of it are read and counted off on the way
+static bool recv_rows(Channel& c, std::mutex& ack_mu, int& owed, std::vector<uint8_t>& in, const std::string& addr,
+                      std::string& err) {
+    for (;;) {
+        Msg t;
+        if (!c.recv(t, in, err, (uint64_t) 8 << 30)) { err = "pool worker " + addr + ": " + err; return false; }
+        // every frame read answers one frame sent (prefill_abort reads exactly the rest): an Err answers an ACK owed
+        // when one is, else this chunk
+        std::lock_guard<std::mutex> a(ack_mu);
+        if (t == Msg::PrefillRows) {
+            --owed;
+            return true;
+        }
+        if (t == Msg::Ack && c.pending > 0) {
+            --c.pending;
+            c.last_ack = in;
+            continue;
+        }
+        if (t == Msg::Err && c.pending > 0) --c.pending;
+        else --owed;
+        err = "pool worker " + addr + ": " + unexpected(t, Msg::PrefillRows, in);
+        return false;
+    }
 }
 
 bool PoolLink::prefill_recv(int64_t T, const float** out, uint64_t* ckpt, std::string& err) {
@@ -641,21 +765,23 @@ bool PoolLink::prefill_recv(int64_t T, const float** out, uint64_t* ckpt, std::s
     std::vector<uint8_t>* bufs[2] = {&buf_a_, &buf_b_};
     for (size_t i = 0; i < ch_.size(); ++i) {
         Channel& c = ch_[i];
-        if (i > 0) {   // the previous worker's rows (on the prompt wire) go on to this one
+        if (i > 0) {   // the previous worker's rows (on the prompt wire) go on to this one, behind the same retain lists
+            // this thread is the only one using connections after the first while a prompt is read
             const std::vector<uint8_t>& prev = *bufs[(i - 1) & 1];
-            if (!c.drain(err) || !c.send(Msg::Prefill, f.prefix.data(), f.prefix.size(), prev.data(), prev.size(), err)) {
+            if (!c.drain(err)) { err = "pool worker " + workers_[i].addr + ": " + err; return false; }
+            if (!send_counted(i, f.ahead, err)) return false;
+            {
+                std::lock_guard<std::mutex> a(pf_ack_mu_);
+                ++pf_rows_owed_[i];
+            }
+            if (!c.send(Msg::Prefill, f.prefix.data(), f.prefix.size(), prev.data(), prev.size(), err)) {
                 err = "pool worker " + workers_[i].addr + ": " + err;
                 return false;
             }
         }
         const bool last = i + 1 == ch_.size();
         std::vector<uint8_t>& in = last ? fin_ : *bufs[i & 1];
-        Msg t;
-        if (!c.recv(t, in, err, (uint64_t) 8 << 30)) { err = "pool worker " + workers_[i].addr + ": " + err; return false; }
-        if (t != Msg::PrefillRows) {
-            err = "pool worker " + workers_[i].addr + ": " + unexpected(t, Msg::PrefillRows, in);
-            return false;
-        }
+        if (!recv_rows(c, pf_ack_mu_, pf_rows_owed_[i], in, workers_[i].addr, err)) return false;
         const size_t expect = n * wire_bytes(last ? draft_wire_ : prefill_wire_);
         if (in.size() != expect) {
             err = "pool worker " + workers_[i].addr + " returned " + std::to_string(in.size()) + " bytes of rows, not " +
@@ -676,6 +802,56 @@ bool PoolLink::prefill_recv(int64_t T, const float** out, uint64_t* ckpt, std::s
     const auto from = f.t0 > pf_last_back_ ? f.t0 : pf_last_back_;
     ms_prefill_net += std::chrono::duration<double, std::milli>(now - from).count();
     pf_last_back_ = now;
+    bool flush = false;
+    {
+        std::lock_guard<std::mutex> q(pf_q_mu_);
+        if (f.ckpt != 0) pf_returned_.push_back(f.ckpt);
+        --pf_inflight_;
+        flush = pf_inflight_ == 0 && (pf_def_ckpt_ || pf_def_conv_);
+    }
+    // the last chunk is back and retain lists still wait: nobody reads the connections now, so they go out here
+    return !flush || flush_deferred(err);
+}
+
+bool PoolLink::prefill_abort(std::string& err) {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<std::mutex> w(pf_wr_mu_);
+    {
+        std::lock_guard<std::mutex> q(pf_q_mu_);
+        pf_q_.clear();
+        pf_inflight_ = 0;
+        pf_returned_.clear();
+        pf_protect_.clear();   // the next retain list drops what the cut prompt left on the workers
+    }
+    bool ok = true;
+    for (size_t i = 0; i < ch_.size() && ok; ++i) {
+        Channel& c = ch_[i];
+        int frames = 0;
+        {
+            std::lock_guard<std::mutex> a(pf_ack_mu_);
+            frames = (i < pf_rows_owed_.size() ? pf_rows_owed_[i] : 0) + c.pending;
+        }
+        std::vector<uint8_t> p;
+        for (; frames > 0; --frames) {   // in the order the worker answers: rows, ACKs and errors alike
+            Msg t;
+            if (!c.recv(t, p, err, (uint64_t) 8 << 30)) {
+                err = "pool worker " + workers_[i].addr + ": " + err;
+                ok = false;
+                break;
+            }
+        }
+        std::lock_guard<std::mutex> a(pf_ack_mu_);
+        if (i < pf_rows_owed_.size()) pf_rows_owed_[i] = 0;
+        c.pending = 0;
+    }
+    if (!ok) return false;
+    std::vector<std::pair<Msg, std::vector<uint8_t>>> msgs;
+    {
+        std::lock_guard<std::mutex> q(pf_q_mu_);
+        msgs = take_deferred_locked();
+    }
+    for (size_t i = 0; i < ch_.size(); ++i)
+        if (!send_counted(i, msgs, err)) return false;
     return true;
 }
 
@@ -967,15 +1143,7 @@ bool PoolLink::ckpt_restore(uint64_t id, std::string& err) {
 }
 
 bool PoolLink::ckpt_retain(const std::vector<uint64_t>& ids, std::string& err) {
-    std::lock_guard<std::mutex> lk(mu_);
-    Packer pk;
-    pk.put<uint32_t>((uint32_t) ids.size());
-    for (const uint64_t id : ids) pk.put<uint64_t>(id);
-    for (size_t i = 0; i < ch_.size(); ++i) {
-        if (!ch_[i].send(Msg::CkptRetain, pk.b, err)) { err = "pool worker " + workers_[i].addr + ": " + err; return false; }
-        ++ch_[i].pending;
-    }
-    return true;
+    return retain(Msg::CkptRetain, ids, err);   // while prompt chunks are in flight it waits for the sending side
 }
 
 // every worker answers before the next one is asked: a park or a restore that fails on one PC must not be taken as
@@ -1019,15 +1187,7 @@ bool PoolLink::conv_borrow(uint64_t id, int64_t n, std::string& err) {
 }
 
 bool PoolLink::conv_retain(const std::vector<uint64_t>& ids, std::string& err) {
-    std::lock_guard<std::mutex> lk(mu_);
-    Packer pk;
-    pk.put<uint32_t>((uint32_t) ids.size());
-    for (const uint64_t id : ids) pk.put<uint64_t>(id);
-    for (size_t i = 0; i < ch_.size(); ++i) {
-        if (!ch_[i].send(Msg::ConvRetain, pk.b, err)) { err = "pool worker " + workers_[i].addr + ": " + err; return false; }
-        ++ch_[i].pending;
-    }
-    return true;
+    return retain(Msg::ConvRetain, ids, err);   // while prompt chunks are in flight it waits for the sending side
 }
 
 bool PoolLink::all_ready(const char* key) const {

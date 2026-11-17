@@ -309,6 +309,9 @@ public:
     std::function<bool(const float* rows_host, const int64_t* tokens, int64_t T, int64_t pos0, std::string& err)>
         remote_send;
     std::function<bool(const int64_t* tokens, int64_t T, int64_t pos0, std::string& err)> remote_recv;
+    /// POOL coordinator: after a prompt that failed part-way (both threads joined), puts the link back in step
+    /// (the replies of chunks that went out and never came back are read past)
+    std::function<bool(std::string& err)> remote_abort;
     /// POOL worker: this stage's input rows for the next `run` (host, pinned, T x hc*n_embd).
     void set_hand_in(const float* rows_host) { hand_in_ = rows_host; }
     /// POOL worker: a stage that may end before the last layer but has no next stage - its rows go to

@@ -19,6 +19,7 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::core { class NativeHead; }
@@ -94,10 +95,17 @@ public:
     /// prompt path's pipelined hand-off): `prefill_send` puts the chunk on the first worker's connection,
     /// `prefill_recv` takes the oldest chunk sent and not yet received back (through every later worker) and gives its
     /// final rows (valid until the next prefill_recv) and the checkpoint id it was sent with.  One thread sends and
-    /// one receives, each in chunk order; they may run at the same time, and nothing else may use the link meanwhile.
+    /// one receives, each in chunk order; they may run at the same time.  Meanwhile only ckpt_retain / conv_retain
+    /// may be called (the receiving side's checkpoints do): while chunks are in flight their lists wait and go out on
+    /// the sending side, in front of the next chunk (or when the last chunk is back), and a checkpoint a worker
+    /// saved with a chunk stays kept until a retain list made after that chunk came back says otherwise.
     bool prefill_send(const float* rows, const int64_t* tokens, int64_t T, int64_t p0, int64_t segment, uint64_t ckpt,
                       std::string& err);
     bool prefill_recv(int64_t T, const float** out, uint64_t* ckpt, std::string& err);
+    /// After a prompt that failed part-way (both threads joined): reads past the rows of the chunks that were sent
+    /// and never received and the ACKs owed, so the next message's answer is the next frame.  False: the link is
+    /// lost (the next pool call fails too).
+    bool prefill_abort(std::string& err);
     /// The prompt rows' wire to the first worker and between workers (CONFIG prefill_wire).  Set before configure,
     /// which falls back to the decode wire when a worker's HELLO does not say it takes it (an older engine).
     void set_prefill_wire(Wire w) { prefill_wire_ = w; }
@@ -206,9 +214,29 @@ private:
         int64_t T = 0;
         uint64_t ckpt = 0;
         std::chrono::steady_clock::time_point t0;
+        /// retain lists that went to the first worker in front of this chunk: each later worker gets them in front of
+        /// it too, so every worker sees them at the same place in the prompt
+        std::vector<std::pair<Msg, std::vector<uint8_t>>> ahead;
     };
     std::deque<PfInFlight> pf_q_;
-    std::mutex pf_q_mu_, pf_send_mu_, pf_recv_mu_;
+    // Locks: mu_ (the other calls) before pf_wr_mu_ (writing to a connection while chunks may be in flight) before
+    // pf_q_mu_ (the bookkeeping below) before pf_ack_mu_ (Channel::pending and pf_rows_owed_ while a receive reads).
+    // The receiving thread never waits on pf_wr_mu_ while chunks are in flight: the sender may hold it through a long
+    // write that only ends once the receiver has read the worker's replies.
+    std::mutex pf_q_mu_, pf_send_mu_, pf_recv_mu_, pf_wr_mu_, pf_ack_mu_;
+    int pf_inflight_ = 0;                  ///< chunks sent whose rows are not all back (pf_q_ + the one being received)
+    std::vector<int> pf_rows_owed_;        ///< per connection: Prefill frames sent whose rows are not read yet
+    std::vector<uint64_t> pf_protect_;     ///< checkpoint ids sent with chunks that no retain list has covered yet
+    std::vector<uint64_t> pf_returned_;    ///< ... of them prefill_recv has handed back (the next list speaks for them)
+    bool pf_def_ckpt_ = false, pf_def_conv_ = false;   ///< a retain list waits for the sending side
+    std::vector<uint64_t> pf_def_ckpt_ids_, pf_def_conv_ids_;
+    bool retain(Msg m, const std::vector<uint64_t>& ids, std::string& err);
+    /// the waiting retain lists as frames (CKPT_RETAIN with the protected ids added); clears them.  Holds pf_q_mu_.
+    std::vector<std::pair<Msg, std::vector<uint8_t>>> take_deferred_locked();
+    /// send frames to connection i and count their ACKs (pf_ack_mu_)
+    bool send_counted(size_t i, const std::vector<std::pair<Msg, std::vector<uint8_t>>>& msgs, std::string& err);
+    /// the waiting retain lists to every worker, when no chunk is in flight (takes mu_ and pf_wr_mu_)
+    bool flush_deferred(std::string& err);
     std::vector<uint8_t> pf_enc_;   ///< the send side's encoded rows (the receive side has its own buffers)
     std::chrono::steady_clock::time_point pf_last_back_{};   ///< when the last chunk's rows came back
     double timeout_s_ = 300.0, wait_s_ = 900.0;

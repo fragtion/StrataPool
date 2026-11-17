@@ -9009,6 +9009,10 @@ bool Prefill::drain_pipeline(std::string& err) {
         }
         send_run_ = {};
     }
+    if (!ok && remote_abort) {   // POOL: chunks that went out may still have replies on the way
+        std::string abort_err;
+        if (!remote_abort(abort_err)) err += "; and the pool link did not recover: " + abort_err;
+    }
 
     if (next_ != nullptr) {
         std::string tail_err;
