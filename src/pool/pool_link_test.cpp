@@ -47,6 +47,7 @@ struct FakeWorker {
     bool wrong_model = false;
     bool knows_prefill_wire = true;   // false: an engine from before CONFIG prefill_wire (prompt rows on the decode wire)
     int prefill_ms = 0;               // each prompt chunk takes this long (the coordinator's sends run ahead)
+    int fail_prefill_at = -1;         // this prompt chunk (0-based, per session) is answered with an Err
     int port = 0;
     std::atomic<bool> stop{false};
 
@@ -109,6 +110,13 @@ struct FakeWorker {
                         std::vector<uint8_t> out(n * wire_bytes(dwire));
                         encode_rows(dwire, rows.data(), n, out.data());
                         if (prefill_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(prefill_ms));
+                        if (prefills.load() == fail_prefill_at) {
+                            ++prefills;
+                            KV no;
+                            no.set("message", std::string("a prompt chunk failed"));
+                            ch.send(Msg::Err, no, e);
+                            continue;
+                        }
                         if (ck) { std::lock_guard<std::mutex> g(mu); ckpts.insert(ck); }
                         ++prefills;
                         ch.send(Msg::PrefillRows, out, e);
@@ -508,8 +516,7 @@ static void test_prefill_retain_midway() {
     std::atomic<bool> send_ok{true};
     std::atomic<int> sent{0}, received{0};
     std::thread sender([&] {
-        for (int c = 0; c < kChunks; ++c) {
-            while (c - received.load() >= 3) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        for (int c = 0; c < kChunks; ++c) {   // as fast as it can: the link holds it to four chunks on the way
             std::string e;
             if (!link.prefill_send(rows.data(), toks.data(), 4, 4 * c, 64, (uint64_t) (500 + c), e)) {
                 std::fprintf(stderr, "send %d: %s\n", c, e.c_str());
@@ -567,6 +574,58 @@ static void test_prefill_retain_midway() {
     link.bye();
 }
 
+// A worker answers a chunk with an Err while the sender, faster than the worker, waits for room: the waiting send
+// gives up instead of hanging, prefill_abort reads past the rest, and the link answers the next calls in step.
+static void test_prefill_worker_error() {
+    FakeWorker a("pe", 1.0f);
+    a.prefill_ms = 10;
+    a.fail_prefill_at = 2;
+    a.run(1);
+    PoolLink link;
+    std::string err;
+    CHECK(link.connect({"127.0.0.1:" + std::to_string(a.port)}, "pe", fp(), 10.0, 10.0, err));
+    KV common;
+    common.set("max_context", (int64_t) 4096);
+    CHECK(link.configure({24}, 48, common, Wire::F32, Wire::F32, err));
+    CHECK(link.wait_ready(10.0, err));
+    link.set_rows_geometry(8, 64);
+    std::vector<float> rows(4 * 8, 0.5f);
+    std::vector<int64_t> toks(64, 5);
+    std::atomic<int> sent{0}, sends_done{0};
+    std::thread sender([&] {
+        for (int c = 0; c < 9; ++c) {
+            std::string e;
+            if (!link.prefill_send(rows.data(), toks.data(), 4, 4 * c, 64, 0, e)) break;
+            ++sent;
+        }
+        sends_done = 1;
+    });
+    int got = 0;
+    for (int c = 0; c < 9; ++c) {
+        while (sent.load() <= c && !sends_done.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (sent.load() <= c) break;
+        const float* out = nullptr;
+        uint64_t ck = 0;
+        std::string e;
+        if (!link.prefill_recv(4, &out, &ck, e)) {
+            CHECK(c == 2 && e.find("a prompt chunk failed") != std::string::npos);
+            break;
+        }
+        ++got;
+    }
+    sender.join();   // a send waiting for room ends: the failed receive woke it
+    CHECK(got == 2);
+    CHECK(sent.load() < 9);
+    CHECK(link.prefill_abort(err));
+    const float* out = nullptr;
+    CHECK(link.prefill(rows.data(), toks.data(), 4, 0, 4, 0, &out, err));   // the next prompt is answered in step
+    for (int i = 0; out && i < 32; ++i) CHECK(std::fabs(out[i] - (0.5f + 1.0f)) < 2e-2f);
+    CHECK(link.reset(err));
+    CHECK(link.ckpt_retain({}, err));
+    CHECK(link.prefill(rows.data(), toks.data(), 4, 4, 4, 0, &out, err));   // the ACKs owed are read first
+    link.bye();
+}
+
 int main() {
     net_init();
     test_two_workers(Wire::F32);
@@ -575,6 +634,7 @@ int main() {
     test_prefill_pipelined(Wire::F32, Wire::F32, false);
     test_prefill_pipelined(Wire::F32, Wire::F16, true);
     test_prefill_retain_midway();
+    test_prefill_worker_error();
     test_refusals();
     test_reload_and_busy();
     if (failures) { std::fprintf(stderr, "%d check(s) failed\n", failures); return 1; }

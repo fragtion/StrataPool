@@ -697,13 +697,19 @@ bool PoolLink::prefill_send(const float* rows, const int64_t* tokens, int64_t T,
         encode_rows(prefill_wire_, rows, n, pf_enc_.data());
         body = pf_enc_.data();
     }
+    {   // a coordinator faster than its workers waits here for the oldest chunk to come back (not while holding the
+        // connection: the receiving side may need it); a receive that failed ends the wait
+        std::unique_lock<std::mutex> q(pf_q_mu_);
+        pf_cv_.wait(q, [&] { return pf_inflight_ < kPfMaxInFlight || pf_failed_; });
+        if (pf_failed_) { err = "pool: an earlier prompt chunk did not come back from the workers"; return false; }
+    }
     Channel& c = ch_[0];
     std::lock_guard<std::mutex> w(pf_wr_mu_);   // the one writer of this connection until the chunk is out
     bool reading = false;
     std::vector<std::pair<Msg, std::vector<uint8_t>>> ahead;
     {
         std::lock_guard<std::mutex> q(pf_q_mu_);
-        if (pf_q_.size() >= 4) { err = "pool: too many prompt chunks in flight"; return false; }
+        if (pf_inflight_ >= kPfMaxInFlight) { err = "pool: too many prompt chunks in flight"; return false; }   // one sender: not reached
         reading = pf_inflight_ > 0;
         ahead = take_deferred_locked();   // retain lists made while chunks were in flight: in front of this one
         f.ahead = ahead;
@@ -760,6 +766,18 @@ bool PoolLink::prefill_recv(int64_t T, const float** out, uint64_t* ckpt, std::s
         f = std::move(pf_q_.front());
         pf_q_.pop_front();
     }
+    // from here a failure loses this chunk: a send waiting for room gives up instead of waiting forever
+    struct Done {
+        PoolLink* l;
+        bool ok = false;
+        ~Done() {
+            if (!ok) {
+                std::lock_guard<std::mutex> q(l->pf_q_mu_);
+                l->pf_failed_ = true;
+            }
+            l->pf_cv_.notify_all();
+        }
+    } done{this};
     if (f.T != T) { err = "pool: prompt chunks out of order"; return false; }
     const size_t n = (size_t) T * (size_t) d_;
     std::vector<uint8_t>* bufs[2] = {&buf_a_, &buf_b_};
@@ -810,7 +828,8 @@ bool PoolLink::prefill_recv(int64_t T, const float** out, uint64_t* ckpt, std::s
         flush = pf_inflight_ == 0 && (pf_def_ckpt_ || pf_def_conv_);
     }
     // the last chunk is back and retain lists still wait: nobody reads the connections now, so they go out here
-    return !flush || flush_deferred(err);
+    done.ok = !flush || flush_deferred(err);
+    return done.ok;
 }
 
 bool PoolLink::prefill_abort(std::string& err) {
@@ -820,6 +839,7 @@ bool PoolLink::prefill_abort(std::string& err) {
         std::lock_guard<std::mutex> q(pf_q_mu_);
         pf_q_.clear();
         pf_inflight_ = 0;
+        pf_failed_ = false;
         pf_returned_.clear();
         pf_protect_.clear();   // the next retain list drops what the cut prompt left on the workers
     }

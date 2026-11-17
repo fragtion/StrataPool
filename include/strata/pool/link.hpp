@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -98,7 +99,8 @@ public:
     /// one receives, each in chunk order; they may run at the same time.  Meanwhile only ckpt_retain / conv_retain
     /// may be called (the receiving side's checkpoints do): while chunks are in flight their lists wait and go out on
     /// the sending side, in front of the next chunk (or when the last chunk is back), and a checkpoint a worker
-    /// saved with a chunk stays kept until a retain list made after that chunk came back says otherwise.
+    /// saved with a chunk stays kept until a retain list made after that chunk came back says otherwise. At most kPfMaxInFlight
+    /// chunks are on the way: a send waits for the oldest to come back (or gives up when a receive failed).
     bool prefill_send(const float* rows, const int64_t* tokens, int64_t T, int64_t p0, int64_t segment, uint64_t ckpt,
                       std::string& err);
     bool prefill_recv(int64_t T, const float** out, uint64_t* ckpt, std::string& err);
@@ -225,6 +227,9 @@ private:
     // write that only ends once the receiver has read the worker's replies.
     std::mutex pf_q_mu_, pf_send_mu_, pf_recv_mu_, pf_wr_mu_, pf_ack_mu_;
     int pf_inflight_ = 0;                  ///< chunks sent whose rows are not all back (pf_q_ + the one being received)
+    static constexpr int kPfMaxInFlight = 4;   ///< a send waits while this many chunks are on the way
+    std::condition_variable pf_cv_;        ///< pf_q_mu_: a chunk came back, or a receive failed
+    bool pf_failed_ = false;               ///< a receive failed: a waiting send gives up (prefill_abort clears it)
     std::vector<int> pf_rows_owed_;        ///< per connection: Prefill frames sent whose rows are not read yet
     std::vector<uint64_t> pf_protect_;     ///< checkpoint ids sent with chunks that no retain list has covered yet
     std::vector<uint64_t> pf_returned_;    ///< ... of them prefill_recv has handed back (the next list speaks for them)
