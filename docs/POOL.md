@@ -173,7 +173,7 @@ POOL-SELFTEST.bat --split 30 --wire f16   other options: --ctx, --cache, --chunk
 | **Network precision** | *Exact* (f32) sends 32-bit rows, so the answers match one PC's exactly. *f16* / *bf16* halve the bytes on a slow network, with a small rounding difference. The last worker's prompt rows feed only the draft layer, so they always travel as f16. Drafts are only guesses that the model checks, so this never changes the output. |
 
 The settings live in `strata-<model>.pool.json` next to the model's config. The role is kept between starts.
-`run-<model>.bat --role off` (or `coordinator` / `worker`) overrides it for one start.
+`terminal\run-<model>.bat --role off` (or `coordinator` / `worker`) overrides it for one start.
 
 ## What each PC holds
 
@@ -361,7 +361,7 @@ out of the pool. The automatic split would give it as few layers as it can.
 
 ## Engine flags
 
-`run-<model>.bat` gets these from the Pool tab, so you do not normally type them.
+`terminal\run-<model>.bat` gets these from the Pool tab, so you do not normally type them.
 
 ```
 --pool-peers H:P[,H:P..]     coordinator: the workers, in layer order (default port 7701)
