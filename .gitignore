@@ -88,6 +88,8 @@ build-vision-cuda12.bat
 pool-split-measured.txt
 pool-split-measured.txt.tmp
 bench-results/
+# StrataPool: a learned expert profile (a model config's expert_profile_save)
+/terminal/expert-profile-learned-*.bin
 # Optional MCP raster cache
 *.tool-media/
 /terminal/.tool-media/
