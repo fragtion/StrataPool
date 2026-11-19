@@ -250,10 +250,15 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
 
-// STRATA_ROUTE_RESIDENT (EXPERIMENTAL, opt-in, changes the output): residency-biased routing for 512 x 10.
-// After the top-10: for the ranks lo..hi a non-resident expert is replaced by the best resident expert not already
+// STRATA_ROUTE_RESIDENT (EXPERIMENTAL, opt-in, changes the output): residency-biased routing for 512 x 10 and
+// (StrataPool) 256 x 10, the GSQ-RCO Coder's shape (qwen4exp: 256 experts, 10 used), and 256 x 8 (Qwen3.6-35B-A3B);
+// their routers also take the softmax over all experts and renormalise over the picks (layer.cpp moe_route).
+// After the top-K: for the ranks lo..hi a non-resident expert is replaced by the best resident expert not already
 // picked when its logit is within `margin` of the replaced one; the weights are then the softmax of the selected
 // logits (the router's renormalisation).  Tokens without a swap keep the router's exact bits.
+// `budget` > 0 (StrataPool, STRATA_ROUTE_RESIDENT_BUDGET; Strata-HotRod's confidence rule): a swap also needs the
+// replaced pick's router weight x the logit gap <= budget, so a heavy pick takes only a close stand-in and a light
+// one a farther one.  The weight is the router's own (before any swap of this token).  <= 0: the margin alone.
 // stats (device, 4 x uint64): [0] tail entries seen, [1] swaps, [2] non-resident entries before, [3] after.
 //
 // One warp per token.  This used to be one THREAD per token scanning all 512 experts (4 ranks x 512 x 12 scalar
@@ -262,29 +267,31 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
 // (a swap changes the set already picked), but the scan is coalesced (lane j reads f = j, j + 32, ...) and reduced
 // within the warp.  The bits are unchanged: a strictly greater logit wins, the smallest expert index breaks ties,
 // and the softmax is the same expression.
+template <int NE, int K>
 __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
                                  const int32_t* __restrict__ res, int n_tok, float margin, int lo, int hi,
-                                 unsigned long long* __restrict__ stats) {
+                                 unsigned long long* __restrict__ stats, float budget) {
+    static_assert(NE % 32 == 0 && K <= 32, "experts in whole warps");
     const int t = blockIdx.x;
     if (t >= n_tok) return;
     const int lane = (int) threadIdx.x;
-    const float* l = logits + (size_t) t * 512;
-    int32_t* id = ids + (size_t) t * 10;
-    int32_t my[10];
-    for (int r = 0; r < 10; ++r) my[r] = id[r];
+    const float* l = logits + (size_t) t * NE;
+    int32_t* id = ids + (size_t) t * K;
+    int32_t my[K];
+    for (int r = 0; r < K; ++r) my[r] = id[r];
     int swaps = 0, tail = 0, before = 0;
     if (lane == 0)
-        for (int r = 0; r < 10; ++r) before += res[my[r]] < 0;
-    for (int r = lo; r <= hi && r < 10; ++r) {
+        for (int r = 0; r < K; ++r) before += res[my[r]] < 0;
+    for (int r = lo; r <= hi && r < K; ++r) {
         const int e = my[r];
         if (res[e] >= 0) continue;                      // already resident: uniform across the warp
         if (lane == 0) ++tail;
         float bv = -INFINITY;
         int bi = -1;
-        for (int f = lane; f < 512; f += 32) {
+        for (int f = lane; f < NE; f += 32) {
             if (res[f] < 0) continue;
             bool used = false;
-            for (int q = 0; q < 10; ++q) used |= my[q] == f;
+            for (int q = 0; q < K; ++q) used |= my[q] == f;
             if (used) continue;
             if (l[f] > bv) { bv = l[f]; bi = f; }
         }
@@ -294,22 +301,25 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
             const int oi = __shfl_down_sync(0xffffffffu, bi, off);
             if (ov > bv || (ov == bv && oi >= 0 && (bi < 0 || oi < bi))) { bv = ov; bi = oi; }
         }
-        if (lane == 0 && bi >= 0 && l[e] - bv <= margin) { my[r] = bi; ++swaps; }
+        // the budget reads the router's weight of rank r: `weights` is only written below, after every rank is decided
+        if (lane == 0 && bi >= 0 && l[e] - bv <= margin &&
+            (budget <= 0.0f || weights[(size_t) t * K + r] * (l[e] - bv) <= budget)) { my[r] = bi; ++swaps; }
         my[r] = __shfl_sync(0xffffffffu, my[r], 0);     // all lanes keep the same picked set
     }
     int after = 0;
     if (lane == 0)
-        for (int r = 0; r < 10; ++r) after += res[my[r]] < 0;
+        for (int r = 0; r < K; ++r) after += res[my[r]] < 0;
     const int sw = __shfl_sync(0xffffffffu, swaps, 0);
     if (sw) {
         float m = -INFINITY;
-        for (int r = 0; r < 10; ++r) m = fmaxf(m, l[my[r]]);
-        float ex[10], sum = 0.0f;
-        for (int r = 0; r < 10; ++r) { ex[r] = expf(l[my[r]] - m); sum += ex[r]; }
-        for (int r = 0; r < 10; ++r) weights[(size_t) t * 10 + r] = ex[r] / sum;
+        for (int r = 0; r < K; ++r) m = fmaxf(m, l[my[r]]);
+        float ex[K], sum = 0.0f;
+        for (int r = 0; r < K; ++r) { ex[r] = expf(l[my[r]] - m); sum += ex[r]; }
+        __syncwarp();                                   // every lane has read the router's weights above (lane 0) first
+        for (int r = 0; r < K; ++r) weights[(size_t) t * K + r] = ex[r] / sum;
     }
     if (lane == 0) {
-        for (int r = 0; r < 10; ++r) id[r] = my[r];
+        for (int r = 0; r < K; ++r) id[r] = my[r];
         if (stats) {
             atomicAdd(stats + 0, (unsigned long long) tail);
             atomicAdd(stats + 1, (unsigned long long) sw);
@@ -318,11 +328,24 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
         }
     }
 }
+bool native_route_resident_shape(int n_expert, int k) {
+    return (n_expert == 512 && k == 10) || (n_expert == 256 && (k == 10 || k == 8));
+}
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok, float margin,
-                           int rank_lo, int rank_hi, unsigned long long* stats, void* stream) {
+                           int rank_lo, int rank_hi, unsigned long long* stats, void* stream, int n_expert, int k, float budget) {
     if (!stream || n_tok < 1 || !res_layer) throw std::invalid_argument("native_route_resident: bad arguments");
-    route_resident_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(
-        logits, ids, weights, res_layer, n_tok, margin, rank_lo, rank_hi, stats);
+    const auto s = static_cast<cudaStream_t>(stream);
+    if (n_expert == 512 && k == 10)
+        route_resident_k<512, 10><<<(unsigned) n_tok, 32, 0, s>>>(logits, ids, weights, res_layer, n_tok, margin, rank_lo,
+                                                                    rank_hi, stats, budget);
+    else if (n_expert == 256 && k == 10)
+        route_resident_k<256, 10><<<(unsigned) n_tok, 32, 0, s>>>(logits, ids, weights, res_layer, n_tok, margin, rank_lo,
+                                                                    rank_hi, stats, budget);
+    else if (n_expert == 256 && k == 8)
+        route_resident_k<256, 8><<<(unsigned) n_tok, 32, 0, s>>>(logits, ids, weights, res_layer, n_tok, margin, rank_lo,
+                                                                   rank_hi, stats, budget);
+    else
+        throw std::invalid_argument("native_route_resident: only 512 x 10, 256 x 10 and 256 x 8");
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

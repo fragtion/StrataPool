@@ -12,6 +12,10 @@
 // copy of the kernel that the parallel form replaced.  It runs on the device so that expf, and therefore the
 // softmax bits, are the same function in both.
 //
+// StrataPool: every shape the kernel takes (512 x 10 Flash-Next, 256 x 10 the GSQ-RCO Coder, 256 x 8) and the weight x gap budget
+// (STRATA_ROUTE_RESIDENT_BUDGET); the input weights are the router's renormalised softmax over the picks, which the
+// budget reads.
+//
 // Run: route_resident_parity   (ctest: route_resident_parity; GPU, synthetic, no model)
 #include "strata/kernels/native_router.hpp"
 
@@ -30,8 +34,8 @@ void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e)); std::exit(2); }
 }
 
-constexpr int kExperts = 512;
-constexpr int kTop = 10;
+constexpr int kMaxExperts = 512;
+constexpr int kMaxTop = 10;
 constexpr int kMaxTok = 8;
 // The weights are a softmax ratio (ten expf calls, a sum, one division).  The kernel is bit-identical to the
 // serial form it replaced - that was measured with both kernels side by side in one translation unit - but
@@ -43,9 +47,11 @@ constexpr int kWeightUlp = 8;
 // The spec.  One thread per token, serial scan of all 512 experts, the comparisons the warp form reduces to:
 // a strictly greater logit wins, so the smallest expert index keeps a tie, and the already-picked test runs
 // against the ids as they are at that rank (a swap changes the set).
+template <int kExperts, int kTop>
 __global__ void route_resident_ref_k(const float* __restrict__ logits, int32_t* __restrict__ ids,
                                      float* __restrict__ weights, const int32_t* __restrict__ res, int n_tok,
-                                     float margin, int lo, int hi, unsigned long long* __restrict__ stats) {
+                                     float margin, int lo, int hi, unsigned long long* __restrict__ stats,
+                                     float budget) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n_tok) return;
     const float* l = logits + (size_t) t * kExperts;
@@ -67,7 +73,8 @@ __global__ void route_resident_ref_k(const float* __restrict__ logits, int32_t* 
             if (used) continue;
             if (l[f] > bv) { bv = l[f]; bi = f; }
         }
-        if (bi >= 0 && l[e] - bv <= margin) { my[r] = bi; ++swaps; }
+        if (bi >= 0 && l[e] - bv <= margin &&
+            (budget <= 0.0f || weights[(size_t) t * kTop + r] * (l[e] - bv) <= budget)) { my[r] = bi; ++swaps; }
     }
     int after = 0;
     for (int r = 0; r < kTop; ++r) after += res[my[r]] < 0;
@@ -87,8 +94,8 @@ __global__ void route_resident_ref_k(const float* __restrict__ logits, int32_t* 
     }
 }
 
-// The router's top-10 of a row, ties to the smallest index - what the kernel is handed as `ids`.
-void top10(const float* l, int32_t* out) {
+// The router's top-k of a row, ties to the smallest index - what the kernel is handed as `ids`.
+void topk(const float* l, int32_t* out, int kExperts, int kTop) {
     for (int r = 0; r < kTop; ++r) {
         float bv = -INFINITY;
         int bi = -1;
@@ -106,17 +113,19 @@ void top10(const float* l, int32_t* out) {
 int main() {
     const float margins[] = {-0.5f, 0.0f, 0.05f, 0.25f, 0.5f, 1.0f, 1.5f};
     const int n_margins = (int) (sizeof(margins) / sizeof(margins[0]));
+    // 0 = no budget (upstream's rule); the others gate a swap on the replaced pick's weight x logit gap.
+    const float budgets[] = {0.0f, 0.0f, 0.02f, 0.1f, 0.3f};
+    const int n_budgets = (int) (sizeof(budgets) / sizeof(budgets[0]));
+    struct Shape { int experts, top; };
+    const Shape shapes[] = {{512, 10}, {256, 10}, {256, 8}};
     const int cases = 240;
     std::mt19937 rng(20261010u);
     std::uniform_real_distribution<float> ud(-3.0f, 3.0f);
     std::uniform_int_distribution<int> pick(0, 1);
     std::uniform_int_distribution<int> coin(0, 99);
 
-    std::vector<float> logits((size_t) kMaxTok * kExperts), weights((size_t) kMaxTok * kTop);
-    std::vector<int32_t> ids((size_t) kMaxTok * kTop), res(kExperts);
-    std::vector<float> sentinel(weights.size());
-    const uint32_t pattern = 0xA5A5A5A5u;
-    for (size_t i = 0; i < sentinel.size(); ++i) std::memcpy(&sentinel[i], &pattern, 4);
+    std::vector<float> logits((size_t) kMaxTok * kMaxExperts), weights((size_t) kMaxTok * kMaxTop);
+    std::vector<int32_t> ids((size_t) kMaxTok * kMaxTop), res(kMaxExperts);
 
     float* d_logits = nullptr;
     float* d_w_ref = nullptr;
@@ -135,20 +144,29 @@ int main() {
     cudaStream_t stream = nullptr;
     ck(cudaStreamCreate(&stream), "stream");
 
-    int bad = 0, swapped_cases = 0, stats_bad = 0, dumped = 0, worst_ulp = 0;
+    int bad = 0, stats_bad = 0, dumped = 0, worst_ulp = 0;
+    for (const Shape& sh : shapes) {
+    const int kExperts = sh.experts, kTop = sh.top;
+    if (!strata::kernels::native_route_resident_shape(kExperts, kTop)) {
+        std::printf("route_resident_parity: %d x %d is not a supported shape\n", kExperts, kTop);
+        ++bad;
+        continue;
+    }
+    int swapped_cases = 0, budget_cases = 0, budget_swapped = 0;
     unsigned long long swaps_total = 0;
     for (int c = 0; c < cases; ++c) {
         const int n_tok = 1 + (c % kMaxTok);
         const float margin = margins[c % n_margins];
+        const float budget = budgets[(c / n_margins) % n_budgets];
         // The rank window: what the profile marks as tail.  Sometimes the whole tail, sometimes a slice.
-        const int lo = pick(rng) ? 4 + (c % 4) : 0;
+        const int lo = pick(rng) ? (kTop - 6) + (c % 4) : 0;
         const int hi = pick(rng) ? kTop - 1 : lo + (c % (kTop - lo));
         const bool tie_heavy = pick(rng) != 0;          // half the cases round the logits onto a coarse grid
         const bool ids_from_router = pick(rng) != 0;    // the other half get ids with repeats instead
         const int resident_pct = 40 + coin(rng) % 45;   // 40-84% of the table resident
 
         for (int e = 0; e < kExperts; ++e) res[e] = (coin(rng) < resident_pct) ? (int32_t) (e % 7) : -1;
-        for (size_t i = 0; i < logits.size(); ++i) {
+        for (size_t i = 0; i < (size_t) n_tok * kExperts; ++i) {
             float v = ud(rng);
             if (tie_heavy) v = std::round(v * 2.0f) * 0.5f;   // many equal logits, so the tie rule gets used
             logits[i] = v;
@@ -156,37 +174,51 @@ int main() {
         for (int t = 0; t < n_tok; ++t) {
             int32_t* row = ids.data() + (size_t) t * kTop;
             if (ids_from_router) {
-                top10(logits.data() + (size_t) t * kExperts, row);
+                topk(logits.data() + (size_t) t * kExperts, row, kExperts, kTop);
             } else {
                 for (int r = 0; r < kTop; ++r) row[r] = (int32_t) (rng() % kExperts);   // repeats on purpose
             }
+            // The router's weights: softmax over the picks (what the budget reads); the kernel rewrites them on a swap.
+            float m = -INFINITY, sum = 0.0f;
+            for (int r = 0; r < kTop; ++r) m = std::fmax(m, logits[(size_t) t * kExperts + row[r]]);
+            for (int r = 0; r < kTop; ++r) sum += std::exp(logits[(size_t) t * kExperts + row[r]] - m);
+            for (int r = 0; r < kTop; ++r)
+                weights[(size_t) t * kTop + r] = std::exp(logits[(size_t) t * kExperts + row[r]] - m) / sum;
         }
+        const size_t n_l = (size_t) n_tok * kExperts, n_k = (size_t) n_tok * kTop;
 
-        ck(cudaMemcpy(d_logits, logits.data(), logits.size() * 4, cudaMemcpyHostToDevice), "up logits");
+        ck(cudaMemcpy(d_logits, logits.data(), n_l * 4, cudaMemcpyHostToDevice), "up logits");
         ck(cudaMemcpy(d_res, res.data(), res.size() * 4, cudaMemcpyHostToDevice), "up res");
 
-        // Reference, from the router's ids and a sentinel weight buffer, with its own counters.
-        ck(cudaMemcpy(d_ids_ref, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice), "up ids ref");
-        ck(cudaMemcpy(d_w_ref, sentinel.data(), sentinel.size() * 4, cudaMemcpyHostToDevice), "up w ref");
+        // Reference, from the router's ids and weights, with its own counters.
+        ck(cudaMemcpy(d_ids_ref, ids.data(), n_k * 4, cudaMemcpyHostToDevice), "up ids ref");
+        ck(cudaMemcpy(d_w_ref, weights.data(), n_k * 4, cudaMemcpyHostToDevice), "up w ref");
         ck(cudaMemset(d_stats, 0, 4 * sizeof(unsigned long long)), "zero stats");
-        route_resident_ref_k<<<(n_tok + 63) / 64, 64, 0, stream>>>(d_logits, d_ids_ref, d_w_ref, d_res, n_tok,
-                                                                   margin, lo, hi, d_stats);
+        if (kExperts == 512)
+            route_resident_ref_k<512, 10><<<(n_tok + 63) / 64, 64, 0, stream>>>(d_logits, d_ids_ref, d_w_ref, d_res,
+                                                                            n_tok, margin, lo, hi, d_stats, budget);
+        else if (kTop == 10)
+            route_resident_ref_k<256, 10><<<(n_tok + 63) / 64, 64, 0, stream>>>(d_logits, d_ids_ref, d_w_ref, d_res,
+                                                                            n_tok, margin, lo, hi, d_stats, budget);
+        else
+            route_resident_ref_k<256, 8><<<(n_tok + 63) / 64, 64, 0, stream>>>(d_logits, d_ids_ref, d_w_ref, d_res,
+                                                                           n_tok, margin, lo, hi, d_stats, budget);
         ck(cudaStreamSynchronize(stream), "sync ref");
         unsigned long long st_ref[4] = {0, 0, 0, 0};
         ck(cudaMemcpy(st_ref, d_stats, sizeof(st_ref), cudaMemcpyDeviceToHost), "down stats ref");
 
-        // The shipped kernel, same inputs, same sentinel.
-        ck(cudaMemcpy(d_ids_par, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice), "up ids par");
-        ck(cudaMemcpy(d_w_par, sentinel.data(), sentinel.size() * 4, cudaMemcpyHostToDevice), "up w par");
+        // The shipped kernel, same inputs.
+        ck(cudaMemcpy(d_ids_par, ids.data(), n_k * 4, cudaMemcpyHostToDevice), "up ids par");
+        ck(cudaMemcpy(d_w_par, weights.data(), n_k * 4, cudaMemcpyHostToDevice), "up w par");
         ck(cudaMemset(d_stats, 0, 4 * sizeof(unsigned long long)), "zero stats");
         strata::kernels::native_route_resident(d_logits, d_ids_par, d_w_par, d_res, n_tok, margin, lo, hi,
-                                               d_stats, (void*) stream);
+                                               d_stats, (void*) stream, kExperts, kTop, budget);
         ck(cudaStreamSynchronize(stream), "sync par");
         unsigned long long st_par[4] = {0, 0, 0, 0};
         ck(cudaMemcpy(st_par, d_stats, sizeof(st_par), cudaMemcpyDeviceToHost), "down stats par");
 
-        std::vector<int32_t> i_ref(ids.size()), i_par(ids.size());
-        std::vector<float> w_ref(weights.size()), w_par(weights.size());
+        std::vector<int32_t> i_ref(n_k), i_par(n_k);
+        std::vector<float> w_ref(n_k), w_par(n_k);
         ck(cudaMemcpy(i_ref.data(), d_ids_ref, i_ref.size() * 4, cudaMemcpyDeviceToHost), "down ids ref");
         ck(cudaMemcpy(i_par.data(), d_ids_par, i_par.size() * 4, cudaMemcpyDeviceToHost), "down ids par");
         ck(cudaMemcpy(w_ref.data(), d_w_ref, w_ref.size() * 4, cudaMemcpyDeviceToHost), "down w ref");
@@ -212,8 +244,8 @@ int main() {
         if (!ids_same || !w_same || !st_same) {
             ++bad;
             if (!st_same) ++stats_bad;
-            std::printf("  case %3d  n_tok %d  margin %.2f  ranks [%d,%d]  ties %d  ids %s  weights %s (%d ulp)  stats %s\n",
-                        c, n_tok, margin, lo, hi, (int) tie_heavy, ids_same ? "same" : "*** DIFFER ***",
+            std::printf("  %dx%d case %3d  n_tok %d  margin %.2f  budget %.2f  ranks [%d,%d]  ties %d  ids %s  weights %s (%d ulp)  stats %s\n",
+                        kExperts, kTop, c, n_tok, margin, budget, lo, hi, (int) tie_heavy, ids_same ? "same" : "*** DIFFER ***",
                         w_same ? "same" : "*** DIFFER ***", w_ulp, st_same ? "same" : "*** DIFFER ***");
             if (std::getenv("STRATA_PARITY_DUMP") && dumped < 2) {
                 ++dumped;
@@ -238,15 +270,19 @@ int main() {
             }
         }
         if (st_par[1]) { ++swapped_cases; swaps_total += st_par[1]; }
+        if (budget > 0.0f) { ++budget_cases; if (st_par[1]) ++budget_swapped; }
     }
 
-    std::printf("route_resident_parity: %d cases, %d with swaps (%llu swaps), %d mismatches, weights within %d ulp\n",
-                cases, swapped_cases, swaps_total, bad, worst_ulp);
-    if (stats_bad) std::printf("  (%d of them in the counters)\n", stats_bad);
-    if (swapped_cases == 0) {
-        std::printf("route_resident_parity: no case swapped anything - the test proved nothing\n");
+    std::printf("route_resident_parity %dx%d: %d cases, %d with swaps (%llu swaps; %d of %d budget cases swapped), "
+                "%d mismatches so far, weights within %d ulp\n",
+                kExperts, kTop, cases, swapped_cases, swaps_total, budget_swapped, budget_cases, bad, worst_ulp);
+    if (swapped_cases == 0 || budget_swapped == 0) {
+        std::printf("route_resident_parity %dx%d: no case (or no budget case) swapped anything - the test proved nothing\n",
+                    kExperts, kTop);
         ++bad;
     }
+    }
+    if (stats_bad) std::printf("  (%d of the mismatches in the counters)\n", stats_bad);
     std::printf(bad ? "route_resident_parity: %d FAILURES\n" : "route_resident_parity OK\n", bad);
     cudaFree(d_logits); cudaFree(d_w_ref); cudaFree(d_w_par);
     cudaFree(d_ids_ref); cudaFree(d_ids_par); cudaFree(d_res); cudaFree(d_stats);

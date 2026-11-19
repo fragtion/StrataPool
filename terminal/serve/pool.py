@@ -269,6 +269,11 @@ def pool_env(pc: PoolConfig, env: dict) -> dict:
     return env
 
 
+def env_switches(env: dict) -> dict:
+    """An engine's environment without the pool's identity (secret, name): what an Off / routing engine runs with."""
+    return {k: v for k, v in env.items() if k not in ("STRATA_POOL_SECRET", "STRATA_POOL_NAME")}
+
+
 # the engine's layer-split flags (the role adds its own).  Not every --pool-* flag: --pool-workers and --pool-affinity
 # are Strata's own, for its CPU expert pool, and stay as the config has them.
 POOL_FLAGS = ("--pool-peers", "--pool-split", "--pool-listen", "--pool-secret", "--pool-wire", "--pool-draft-wire",
@@ -774,9 +779,12 @@ class PoolManager:
                 self.worker.stop()
                 self.worker = None
             eng = self.svc.engine
-            # off <-> routing: the same engine (the whole model on this PC), so it keeps running
+            # off <-> routing: the same engine (the whole model on this PC), so it keeps running - unless the pool's
+            # "env" changed (an engine reads its switches at start: a change applied while Off restarts it).  The secret
+            # and the name are left out: the engine started with the server has the plain environment, without them
             if (role in ("off", "router") and old_role in ("off", "router") and hasattr(eng, "spawn") and
-                    eng.spawn[1] == self.engine_args() and self.svc.loaded()):
+                    eng.spawn[1] == self.engine_args() and env_switches(eng.spawn[4] or {}) == env_switches(self.engine_env())
+                    and self.svc.loaded()):
                 self.svc.pool_role = role
                 if role == "router":
                     self._start_router()

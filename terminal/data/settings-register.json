@@ -35894,6 +35894,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_ROUTE_RESIDENT_BUDGET",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/core/verify.cpp",
+     "line": 180,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "float",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "2026-11-19",
+   "since": null,
+   "last_commit": "",
+   "last_date": "2026-11-19",
+   "status": "opt-in",
+   "owner": "pool",
+   "note": "StrataPool: with STRATA_ROUTE_RESIDENT, swap a pick only if its router weight x logit gap to the stand-in is <= this (0 = no limit; Strata-HotRod's rule)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_ROUTE_RESIDENT_MTP",
    "backends": [
     "cuda-hip"

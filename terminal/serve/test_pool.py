@@ -658,6 +658,20 @@ class EndAStartThatWaits(unittest.TestCase):
         pm.apply({"role": "off"})                               # and that start can be ended too
         self.wait(lambda: svc.loaded())
 
+    def test_an_env_change_while_off_restarts_the_engine(self):
+        svc, pm = self.make(role="off")
+        sp = list(svc.engine.spawn)
+        sp[4] = pm.engine_env()                                 # the running engine: the model alone, today's env
+        svc.engine.spawn = tuple(sp)
+        svc.engine.running = True
+        pm.apply({"role": "off"})                               # nothing changed: the same engine keeps running
+        self.wait(lambda: pm.applying is None)
+        self.assertEqual(svc.starts, [])
+        pm.apply({"role": "off", "env": {"STRATA_ROUTE_RESIDENT": "1e30"}})   # a switch: read at start, so a restart
+        self.wait(lambda: pm.applying is None and svc.loaded())
+        self.assertEqual([how for _, how in svc.starts], ["ready"])
+        self.assertEqual(svc.engine.spawn[4].get("STRATA_ROUTE_RESIDENT"), "1e30")
+
     def test_a_change_behind_another_change_is_still_refused(self):
         svc, pm = self.make(role="off")
         pm.applying = "stopping the current engine"            # no start under way: an apply in progress

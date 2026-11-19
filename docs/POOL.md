@@ -385,8 +385,11 @@ Some of Strata's engine switches are off by default and can be tried on a pool. 
 ```
 
 The coordinator hands the pool-wide ones below to every worker when the split starts (a worker that sets one itself
-keeps its own; its log says `strata pool: from the coordinator: ...`). Restart the coordinator and the workers after a
-change. None of them has been measured on a pool yet, so compare a few replies or prompts with each one on and off.
+keeps its own; its log says `strata pool: from the coordinator: ...`). A change restarts the coordinator (Apply in the
+Pool tab); a worker that kept its layers loaded from the last coordinator sees the other switches and reloads itself
+(engine 0.1.62 StrataPool builds from 2026-11-20 on; an older worker keeps the switches it started with until it is
+restarted by hand). Most of them have not been measured on a pool yet, so compare a few replies or prompts with each one
+on and off.
 
 | Switch | What it does | Where |
 | --- | --- | --- |
@@ -398,6 +401,7 @@ change. None of them has been measured on a pool yet, so compare a few replies o
 | `STRATA_STAGE_RESIDENT=0` | back to the old prompt staging: since #2968 (by sergiywith) a PC with more than 10% of its experts unpinned (a worker that may pin only half its RAM) keeps the full streamed ring and gets 8 copy threads (RTX 5090, Windows: 32K prompts +13%, 2K 1-2.5% slower) | pool-wide |
 | `STRATA_PREFILL_CPU_SHARE_BATCH=1` | with Several chats: a prompt read uses the CPU expert share while no slot decodes (#3382, by Vop3p; 2x RTX 3090: follow-ups 19-49% faster) | coordinator only (a worker does not know which slots decode) |
 | `STRATA_ROUTE_PRIOR=1.5` | residency-biased routing (faster on 12 GB cards; off by default since Strata 0.2.8, #4402, because it was tied to repetition loops in long agent sessions): on every PC | pool-wide |
+| `STRATA_ROUTE_RESIDENT=M`, `STRATA_ROUTE_RESIDENT_RANKS=lo-hi`, `STRATA_ROUTE_RESIDENT_BUDGET=B` | stand-ins: after the router's pick, an expert at ranks lo..hi that is not in this PC's VRAM is replaced by the best one that is, if its logit is within M (`1e30` = any distance), and with a budget, only if the replaced pick's weight x logit gap is at most B (Strata-HotRod's rule; without it, ranks 3-9 at any distance gave malformed JSON / code there). Each PC swaps against its own cache, so a worker's layers use the worker's VRAM. StrataPool runs it on 512 x 10 (Flash-Next), 256 x 10 (the Coder) and 256 x 8; upstream only on 512 x 10. It changes the output | pool-wide |
 | `STRATA_PW_WITH_BATCH=1` | with Several chats: a chat that is alone keeps **Overlap the PCs** (the pipelined windows); the batch windows of several chats run without it (Vop3p's #3095, in Strata since 0.2.10; 2x RTX A6000: a lone request +14% on code, +3% on a long decode). On the desktop + laptop pool it was slower (a lone chat 39 against 42 tok/s, see "Which switches pay"), so the Pool tab does not set it. Without it, Several chats turns Overlap off | coordinator |
 | `STRATA_PIPE_ADAPT_EVERY=N` | with Several chats: the expert cache's swap round every N group windows (the pipeline empties for it; the workers already swap between the windows they serve) | coordinator |
 | `STRATA_PARK_VRAM_MIB=N`, `STRATA_CKPT_VRAM_SLOTS=N` | parked K/V and checkpoints kept in VRAM in front of the RAM copy: costs expert-cache room | each PC, in its own config |

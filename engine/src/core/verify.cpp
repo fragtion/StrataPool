@@ -125,6 +125,7 @@ RouteResidentCfg& route_resident_cfg();
 struct RouteResidentCfg {
     float margin = 0.0f;
     int lo = 6, hi = 9;
+    float budget = 0.0f;   // StrataPool: STRATA_ROUTE_RESIDENT_BUDGET=<b>, a swap needs weight x logit gap <= b (0: off)
     // #1578: one counter block per GPU.  A layer split inits a verifier per stage; a block allocated on whichever device
     // was current at the first init is unreachable from the other stage's kernels without P2P (illegal memory access).
     // The Verifier asks for its device's block in init (outside graph capture) and keeps the pointer: a launch never
@@ -160,10 +161,10 @@ struct RouteResidentCfg {
                     }
                     char who[32] = "";
                     if (c.blocks.size() > 1) std::snprintf(who, sizeof who, " (GPU %d)", kv.first);
-                    std::fprintf(stderr, "route-resident%s: margin=%g ranks=%d-%d windows T>8 (prompt reads): tail_nonres=%llu swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
-                                 who, c.margin, c.lo, c.hi, h[0], h[1], h[0] ? 100.0 * h[1] / h[0] : 0.0, h[2], h[3]);
-                    std::fprintf(stderr, "route-resident%s: margin=%g ranks=%d-%d windows T<=8 (decode): tail_nonres=%llu swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
-                                 who, c.margin, c.lo, c.hi, h[4], h[5], h[4] ? 100.0 * h[5] / h[4] : 0.0, h[6], h[7]);
+                    std::fprintf(stderr, "route-resident%s: margin=%g budget=%g ranks=%d-%d windows T>8 (prompt reads): tail_nonres=%llu swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
+                                 who, c.margin, c.budget, c.lo, c.hi, h[0], h[1], h[0] ? 100.0 * h[1] / h[0] : 0.0, h[2], h[3]);
+                    std::fprintf(stderr, "route-resident%s: margin=%g budget=%g ranks=%d-%d windows T<=8 (decode): tail_nonres=%llu swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
+                                 who, c.margin, c.budget, c.lo, c.hi, h[4], h[5], h[4] ? 100.0 * h[5] / h[4] : 0.0, h[6], h[7]);
                 }
             });
         }
@@ -176,6 +177,7 @@ RouteResidentCfg& route_resident_cfg() {
     static const bool parsed = [] {
         if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT")) c.margin = (float) std::atof(v);
         if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &c.lo, &c.hi);
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_BUDGET")) c.budget = std::max(0.0f, (float) std::atof(v));
         return true;
     }();
     (void) parsed;
@@ -2296,12 +2298,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const float route_prior = g_route_prior();
         if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
             route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
-        if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
-            // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
+        if (route_resident_cfg().margin > 0.0f && native_route_resident_shape((int) NE, (int) K) && hits_.d_res != nullptr) {
+            // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output).
+            // StrataPool: the Coder's 256 x 10 (and 256 x 8) too, and the weight x gap budget; on a pool node d_res is this PC's own
+            // residency, so each PC swaps against the experts on its own card (no protocol change)
             try {
                 native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
                                       route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
-                                      rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs);
+                                      rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs, (int) NE, (int) K,
+                                      route_resident_cfg().budget);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
         if (rs_on_ && G == 1 && n <= 16 && T <= 16)

@@ -505,6 +505,8 @@ const char* const kPoolForwardEnv[] = {
     "STRATA_PREFILL_COPY_EVENT_EVERY", "STRATA_PREFILL_COPY_WAIT_DEDUPE",   // #4005: the prompt walk's copy events
     "STRATA_PARK_ASYNC", "STRATA_CKPT_ASYNC", "STRATA_CKPT_GATHER",           // #3779 / #3712: parks and checkpoints
     "STRATA_ROUTE_PRIOR",                                                      // 0.2.7 residency-biased routing
+    "STRATA_ROUTE_RESIDENT", "STRATA_ROUTE_RESIDENT_RANKS",                   // stand-ins: each PC swaps against its own
+    "STRATA_ROUTE_RESIDENT_BUDGET",                                            //   card (read at its first verifier)
     "STRATA_PREFILL_ROUTED_STREAM", "STRATA_PREFILL_ROUTED_STREAM_DEPTH",     // #4283: unrouted streamed experts not copied
     "STRATA_PF_GROUP_SCRATCH", "STRATA_PF_HC_REGION",                         // #4039: smaller prompt scratch, bigger chunks
     "STRATA_STAGE_RESIDENT",                                                   // #2968: =0 the old staging sizing
@@ -5903,7 +5905,8 @@ int main(int argc, char** argv) {
         std::string e;
         for (const char* k : {"lb", "le", "max_context", "kv", "spec", "batch", "batch_mtp", "prefill_chunk", "prefill_auto", "rope_type",
                               "rope_freq_base", "rope_factor", "rope_freq_scale_in", "rope_orig_ctx", "rope_ext_factor",
-                              "rope_attn_factor", "rope_beta_fast", "rope_beta_slow", "cvec_id"})
+                              "rope_attn_factor", "rope_beta_fast", "rope_beta_slow", "cvec_id",
+                              "env", "tail_skip"})   // read once per process (the forwarded switches, the tail skip): another value reloads
             e += std::string(k) + "=" + c.str(k) + ";";
         return e;
     };
