@@ -30,10 +30,10 @@ Laptop GPU 8 GB, Core i7-14650HX, 32 GB), both on Windows 11 on a wired 1 Gbps L
 | **Reading a long prompt** | about **a third slower**: every chunk also passes through the slower PC's layers |
 | **Several chats at once** (batch slots in a split) | slower on a two-PC home pool; it is for pools that serve many agents at once |
 
-The ranges come from our runs on that pair with [tools/pool_bench.py](tools/pool_bench.py) (greedy decoding, the
+The ranges come from our runs on that pair with [terminal/tools/pool_bench.py](terminal/tools/pool_bench.py) (greedy decoding, the
 same text for every setup) in October 2026, on StrataPool versions from Strata 0.1.40 to 0.1.45. In long agent
 sessions on StrataPool with Strata 0.1.45 (100-170K tokens of context, temperature 0.6), the split wrote about 45-75
-tokens/s and read new prompt text at about 1,100 tokens/s. Your PCs will differ: `tools/pool_bench.py` sends the same
+tokens/s and read new prompt text at about 1,100 tokens/s. Your PCs will differ: `terminal/tools/pool_bench.py` sends the same
 requests to any server, so run it against each PC alone, the split and Share requests to measure your own pool.
 
 **Where the speed comes from:** memory, not compute. A 12 GB card holds a few thousand of the model's experts and

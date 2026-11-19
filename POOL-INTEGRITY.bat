@@ -6,14 +6,14 @@ rem A program starts at the LOWER of its parent's integrity and its file's manda
 rem sandbox (Claude's Cowork, some sync tools) can carry a "Low" label that every new file in it inherits; an engine
 rem started at Low gets "Lock pages in memory" stripped from its token, so large pages fail with error 1314 and Windows
 rem pins less RAM.  This script:
-rem   - relabels this folder's engine\*.exe (and engine-image\, and the DeepSeek engine in engine-dsv41\<version>\), its .venv's
-rem     Python and the Python that venv runs (pyvenv.cfg "home") to Medium,
+rem   - relabels this folder's terminal\engine\*.exe (and terminal\engine-image\), its terminal\.venv's Python and the
+rem     Python that venv runs (pyvenv.cfg "home") to Medium (an older install's engine\ and .venv at the top too),
 rem     plus the same for a Strata install next to this folder (..\strata) and any folder or .exe you name;
 rem   - removes the "downloaded from the internet" mark from the engine folder's files (copied from another PC);
 rem   - says whether this account holds "Lock pages in memory".
 rem
 rem   POOL-INTEGRITY.bat                          this folder (and ..\strata if it exists)
-rem   POOL-INTEGRITY.bat D:\ai\strata\.venv C:\x\y.exe   ... and these too (a venv folder, a folder or an .exe)
+rem   POOL-INTEGRITY.bat D:\ai\strata\terminal\.venv C:\x\y.exe   ... and these too (a venv folder, a folder or an .exe)
 rem
 rem Run it again after every rebuild or copy of the engine: a new strata.exe takes the folder's label again.
 rem Right-click, "Run as administrator".  The folders themselves are left as they are.
@@ -43,9 +43,9 @@ shift
 goto args
 
 :checks
-if exist "%ROOT%\engine\" (
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -LiteralPath '%ROOT%\engine' -File | Unblock-File" >nul 2>&1
-  echo Removed the downloaded-file mark from engine\ ^(if it had one^).
+if exist "%ROOT%\terminal\engine\" (
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -LiteralPath '%ROOT%\terminal\engine' -File | Unblock-File" >nul 2>&1
+  echo Removed the downloaded-file mark from terminal\engine\ ^(if it had one^).
 )
 echo.
 whoami /priv | findstr /i "SeLockMemoryPrivilege" >nul
@@ -62,16 +62,15 @@ echo refused ^(error 1314^).
 pause
 exit /b 0
 
-rem ---- one Strata / StrataPool folder: its engine, its venv, the image generator (engine-image) and the DeepSeek engine
-rem      packages (engine-dsv41\<version>\)
+rem ---- one Strata / StrataPool folder: its engine, its venv and the image generator (engine-image), in terminal\ (the
+rem      0.2.16 layout) and at the top (an install from before it)
 :install
+call :target "%~1\terminal\engine"
+call :target "%~1\terminal\.venv"
+call :target "%~1\terminal\engine-image"
 call :target "%~1\engine"
 call :target "%~1\.venv"
 call :target "%~1\engine-image"
-if exist "%~1\engine-dsv41\" (
-  call :target "%~1\engine-dsv41"
-  for /d %%v in ("%~1\engine-dsv41\*") do call :target "%%~fv"
-)
 exit /b 0
 
 rem ---- a folder (engine or venv), or one .exe

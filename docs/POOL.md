@@ -136,14 +136,14 @@ Windows starts a program at the lower of its parent's integrity and its file's m
 sandbox (Claude's Cowork, some sync tools) can carry a **Low** label that every file created in it inherits, and an
 engine running at Low has "Lock pages in memory" taken out of its token: large pages fail with error 1314, and the
 working-set lock that lets Windows pin more of the experts fails too. `POOL-INTEGRITY.bat` (as administrator, on each
-PC) relabels `engine\*.exe`, the image generator (`engine-image\`), the DeepSeek engine (`engine-dsv41\<version>\`),
-the `.venv`'s Python and the Python that venv runs to Medium, the same for a Strata install next to the folder
+PC) relabels `terminal\engine\*.exe`, the image generator (`terminal\engine-image\`), `terminal\.venv`'s Python and
+the Python that venv runs to Medium (an install from before Strata 0.2.16 keeps them at the top: those too), the same
+for a Strata install next to the folder
 (`..\strata`) and any venv, folder or `.exe` named on its command line; removes the downloaded-file mark from an
 engine copied from another PC; and says whether the account holds "Lock pages in memory" (granted in `secpol.msc`,
 effective at the next logon). A rebuilt, copied or updated engine takes the folder's label again, so run it after
-each one (setup updating the DeepSeek engine package counts). The folders themselves are left alone. The DeepSeek
-engine uses neither large pages nor the working-set lock, so its label does not change its speed; a Low program
-also cannot write outside Low-labelled folders, which is why the image generator could not save its pictures.
+each one. The folders themselves are left alone. A Low program also cannot write outside Low-labelled folders,
+which is why the image generator could not save its pictures.
 
 ## Testing it on one PC first
 
@@ -158,7 +158,7 @@ CPU-computed one, and the pair caches different experts than the single engine. 
 and mostly agree.
 
 ```
-POOL-SELFTEST.bat                         (or: .venv\Scripts\python tools\pool_selftest.py strata-<model>.json)
+POOL-SELFTEST.bat                         (or, in terminal\: .venv\Scripts\python tools\pool_selftest.py strata-<model>.json)
 POOL-SELFTEST.bat --split 30 --wire f16   other options: --ctx, --cache, --chunk, --max-new, --skip-single
 ```
 
@@ -223,7 +223,7 @@ strata pool:   this PC: its layers <A> ms + the head, sampling and the drafter <
 
 The head, the sampling and the draft layer always run on the coordinator, so no split moves that part. The
 coordinator compares each PC's measured layer time with what the built-in estimate predicted for that PC's layers,
-and keeps the ratio per pool in `pool-split-measured.txt`, in the engine's folder. One line per pool: the model, the
+and keeps the ratio per pool in `pool-split-measured.txt`, in the engine's working folder (`terminal\`). One line per pool: the model, the
 context, the KV format, the window, and the PCs' names. After 200 windows, the next **automatic** split predicts with
 the measured numbers instead of the estimate. One split's numbers cannot tell a PC's own layer time from what its
 cache misses cost, so the search moves at most 3 layers from a split it measured; each split it tries is measured in
@@ -417,15 +417,15 @@ exchange sums twice per layer, which needs the cards in one PC).
 
 | Part | Where |
 | --- | --- |
-| Frames, control messages, row codecs (f32/f16/bf16) | `include/strata/pool/protocol.hpp`, `src/pool/protocol.cpp` |
-| Sockets, SHA-256 / HMAC handshake | `include/strata/pool/net.hpp`, `src/pool/net.cpp` |
-| The worker's handshake and its "busy" answer | `src/pool/worker.cpp` |
-| The split search | `src/pool/split.cpp` |
-| The coordinator's link: workers, the head, prompt rows | `src/pool/link.cpp` |
+| Frames, control messages, row codecs (f32/f16/bf16) | `engine/include/strata/pool/protocol.hpp`, `engine/src/pool/protocol.cpp` |
+| Sockets, SHA-256 / HMAC handshake | `engine/include/strata/pool/net.hpp`, `engine/src/pool/net.cpp` |
+| The worker's handshake and its "busy" answer | `engine/src/pool/worker.cpp` |
+| The split search | `engine/src/pool/split.cpp` |
+| The coordinator's link: workers, the head, prompt rows | `engine/src/pool/link.cpp` |
 | The verifier's and prompt path's hand-off to the network | `Verifier::set_link` / `set_headless`, `Prefill::remote_next` / `set_headless` |
 | Each node's experts in RAM for its range only | `ArenaExpertSource::set_layer_range` |
-| The worker's serve loop, and the coordinator's hooks | `src/program/generate.cpp` (search for `POOL`) |
-| The server's side: roles, the worker supervisor, discovery | `serve/pool.py`; the Pool tab: `serve/web/pool.js` |
+| The worker's serve loop, and the coordinator's hooks | `engine/src/program/generate.cpp` (search for `POOL`) |
+| The server's side: roles, the worker supervisor, discovery | `terminal/serve/pool.py`; the Pool tab: `terminal/serve/web/pool.js` |
 
 Tests (no GPU needed): `strata-pool-test` covers hashing, the wire formats, frames, the handshake and the split
 search. `strata-pool-link-test` runs the coordinator against scripted workers: the secret, the model check,

@@ -1,7 +1,8 @@
 @echo off
 rem StrataPool: test the pool on this one PC (the model alone, then split between two engines on this GPU).
 rem Close Strata / StrataPool first: the GPU must be free.
-cd /d "%~dp0"
+rem (the Terminal and everything setup writes are in terminal\ since Strata 0.2.16)
+cd /d "%~dp0terminal"
 set CFG=
 for /f "delims=" %%f in ('dir /b /o-d strata-*.json 2^>NUL ^| findstr /v /i "pool shared"') do if not defined CFG set CFG=%%f
 if not defined CFG (
