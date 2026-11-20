@@ -7293,7 +7293,8 @@ def make_handler(svc: Service):
 
         def _post(self):
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
-            routed = bool(self.headers.get(pool_route.ROUTED_HEADER))
+            # (getattr: upstream's handler tests build a Handler with no request headers)
+            routed = bool((getattr(self, "headers", None) or {}).get(pool_route.ROUTED_HEADER))
             if path == "/pool/route/probe" or routed:
                 # Pool routing: another PC of the pool (its secret, not this server's API key)
                 if not self._pool_signed(path):

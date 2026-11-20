@@ -2566,7 +2566,10 @@ class OutputParser:
                 if self.lead:                                   # newlines right after </think> or a call
                     stripped = self.buf.lstrip("\n")
                     # Dropped newlines still separate Markdown lines before the next code fence.
-                    self._track(self.buf[:len(self.buf) - len(stripped)])
+                    if self._track(self.buf[:len(self.buf) - len(stripped)]):
+                        # ...but the client never sees them, so they are not a blank line: an indented call after them
+                        # is not an indented code block (#4703)
+                        self._prev_blank = False
                     if not stripped:
                         self.buf = ""
                         return out
