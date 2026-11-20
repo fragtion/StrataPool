@@ -28,7 +28,7 @@ concurrency:
 
 jobs:
   check:
-    if: github.event_name == 'issues' || github.event_name == 'pull_request_target'
+    if: github.repository == 'Niko1221/Strata' && (github.event_name == 'issues' || github.event_name == 'pull_request_target')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,7 +43,7 @@ jobs:
             await bot.intake({ github, context, core });
 
   sweep:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.repository == 'Niko1221/Strata' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

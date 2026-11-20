@@ -99,6 +99,9 @@ public:
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
     static void set_pinned_share(double share);
+    /// The unpinned experts lie in resident RAM (the expert arena), so staging them is a plain memcpy:
+    /// the ring keeps its pinned size and the stager gets more threads and buffers (STRATA_STAGE_RESIDENT=0/1 forces).
+    static void set_resident_stage(bool on);
     static double pinned_share();
     /// The chunk size from which a chunk streams every expert the GPU does not hold, routed or not; a smaller one
     /// stages only the experts it routes to.  1024, or STRATA_PREFILL_STREAM_MIN, or the CPU share's limit once that
@@ -293,6 +296,27 @@ public:
     /// the size where the measured share stops paying.  Opt-in: STRATA_PREFILL_HELP=1 (not bit-identical to the default).  Both stages must have
     /// run `init`.
     bool set_stage_helper(Prefill* helper, std::string& err);
+    /// POOL coordinator: the layers after this stage run on other PCs.  Called (on a thread, like a local next
+    /// stage, so this stage reads chunk c + 1 meanwhile) with the chunk's rows on the host (pinned, T x hc*n_embd),
+    /// its tokens, T and its first position; it sends them to the workers, gets the final rows back and does what
+    /// `on_chunk` does on a last stage.  Set before `init`, instead of a `next` stage.
+    std::function<bool(const float* rows_host, const int64_t* tokens, int64_t T, int64_t pos0, std::string& err)>
+        remote_next;
+    /// POOL coordinator, pipelined (both set: they replace remote_next): `remote_send` puts a chunk's rows on the
+    /// network and returns once they are out; `remote_recv` waits for that chunk's final rows and does what
+    /// remote_next does with them.  Chunk c + 1 then goes out while the workers still read chunk c.  Each runs on a
+    /// thread of its own, sends in chunk order and receives in chunk order (a chunk's receive starts after its send).
+    std::function<bool(const float* rows_host, const int64_t* tokens, int64_t T, int64_t pos0, std::string& err)>
+        remote_send;
+    std::function<bool(const int64_t* tokens, int64_t T, int64_t pos0, std::string& err)> remote_recv;
+    /// POOL coordinator: after a prompt that failed part-way (both threads joined), puts the link back in step
+    /// (the replies of chunks that went out and never came back are read past)
+    std::function<bool(std::string& err)> remote_abort;
+    /// POOL worker: this stage's input rows for the next `run` (host, pinned, T x hc*n_embd).
+    void set_hand_in(const float* rows_host) { hand_in_ = rows_host; }
+    /// POOL worker: a stage that may end before the last layer but has no next stage - its rows go to
+    /// `on_chunk` (and from there back over the network).  Set before `init`.
+    void set_headless(bool on) { headless_ = on; }
 
     /// The CPU expert pool (decode's, idle while a prompt is read). With STRATA_PREFILL_CPU_SHARE set, a chunk below
     /// stream_all_min() tokens - an agent's tool output - hands it the non-resident experts routed by at most MAXT of
@@ -383,6 +407,7 @@ private:
     int64_t force_chunk_ = 0;           ///< force_chunk, for the next run (0: none)
     bool force_single_ = false, force_planned_ = false;
     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens
+    bool headless_ = false;             ///< POOL worker: rows to on_chunk even before the last layer
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
     /// STRATA_HANDOFF_PIPE: the previous stage's per-piece "landed in hand_in_" events (cudaEvent_t[hand_pieces_],
     /// on its device) when it copies the chunk in pieces without a host wait; null with the one-copy hand-off
@@ -392,6 +417,9 @@ private:
     std::string next_err_;
     std::future<bool> next_run_;
     int hand_buf_ = 0;
+    // POOL, pipelined hand-off: the last chunk's send (its receive waits for it, and so does the next chunk's send)
+    std::string send_err_;
+    std::shared_future<bool> send_run_;
 
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)

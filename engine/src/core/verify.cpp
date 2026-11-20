@@ -17,6 +17,8 @@
 #include "strata/core/pin_budget.hpp"
 #if defined(STRATA_VERIFY_HGL)
 #include "strata/core/host_graph_launch.hpp"
+
+#include <optional>
 #endif
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/dma_batch.hpp"
@@ -125,6 +127,7 @@ RouteResidentCfg& route_resident_cfg();
 struct RouteResidentCfg {
     float margin = 0.0f;
     int lo = 6, hi = 9;
+    float budget = 0.0f;   // StrataPool: STRATA_ROUTE_RESIDENT_BUDGET=<b>, a swap needs weight x logit gap <= b (0: off)
     // #1578: one counter block per GPU.  A layer split inits a verifier per stage; a block allocated on whichever device
     // was current at the first init is unreachable from the other stage's kernels without P2P (illegal memory access).
     // The Verifier asks for its device's block in init (outside graph capture) and keeps the pointer: a launch never
@@ -160,10 +163,10 @@ struct RouteResidentCfg {
                     }
                     char who[32] = "";
                     if (c.blocks.size() > 1) std::snprintf(who, sizeof who, " (GPU %d)", kv.first);
-                    std::fprintf(stderr, "route-resident%s: margin=%g ranks=%d-%d windows T>8 (prompt reads): tail_nonres=%llu swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
-                                 who, c.margin, c.lo, c.hi, h[0], h[1], h[0] ? 100.0 * h[1] / h[0] : 0.0, h[2], h[3]);
-                    std::fprintf(stderr, "route-resident%s: margin=%g ranks=%d-%d windows T<=8 (decode): tail_nonres=%llu swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
-                                 who, c.margin, c.lo, c.hi, h[4], h[5], h[4] ? 100.0 * h[5] / h[4] : 0.0, h[6], h[7]);
+                    std::fprintf(stderr, "route-resident%s: margin=%g budget=%g ranks=%d-%d windows T>8 (prompt reads): tail_nonres=%llu swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
+                                 who, c.margin, c.budget, c.lo, c.hi, h[0], h[1], h[0] ? 100.0 * h[1] / h[0] : 0.0, h[2], h[3]);
+                    std::fprintf(stderr, "route-resident%s: margin=%g budget=%g ranks=%d-%d windows T<=8 (decode): tail_nonres=%llu swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
+                                 who, c.margin, c.budget, c.lo, c.hi, h[4], h[5], h[4] ? 100.0 * h[5] / h[4] : 0.0, h[6], h[7]);
                 }
             });
         }
@@ -176,6 +179,7 @@ RouteResidentCfg& route_resident_cfg() {
     static const bool parsed = [] {
         if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT")) c.margin = (float) std::atof(v);
         if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &c.lo, &c.hi);
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_BUDGET")) c.budget = std::max(0.0f, (float) std::atof(v));
         return true;
     }();
     (void) parsed;
@@ -991,7 +995,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     if (le_ < 0) le_ = g.n_layers;
     if (lb_ < 0 || lb_ >= le_ || le_ > g.n_layers || (lb_ > 0 && hand_in_ == nullptr) ||
-        (le_ < g.n_layers && hand_out_ == nullptr)) {
+        ((le_ < g.n_layers || headless_) && hand_out_ == nullptr)) {
         err = "verify: the stage's layer range or its hand-off buffers are wrong";
         return false;
     }
@@ -1416,7 +1420,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     return true;
 }
 
-const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) (g_->hc * g_->n_embd); }
+const float* Verifier::final_R(int t) const {
+    if (pr_ != nullptr) return pr_->pl_final_R(pr_par_, t);   // POOL: the rows came back to this PC's head
+    return R_ + (size_t) t * (size_t) (g_->hc * g_->n_embd);
+}
 
 // ================================ THE WINDOW, AS CAPTURED ================================
 //
@@ -2413,12 +2420,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const float route_prior = g_route_prior();
         if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
             route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
-        if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
-            // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
+        if (route_resident_cfg().margin > 0.0f && native_route_resident_shape((int) NE, (int) K) && hits_.d_res != nullptr) {
+            // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output).
+            // StrataPool: the Coder's 256 x 10 (and 256 x 8) too, and the weight x gap budget; on a pool node d_res is this PC's own
+            // residency, so each PC swaps against the experts on its own card (no protocol change)
             try {
                 native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
                                       route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
-                                      rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs);
+                                      rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs, (int) NE, (int) K,
+                                      route_resident_cfg().budget);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
         if (rs_on_ && G == 1 && n <= 16 && T <= 16)
@@ -2706,7 +2716,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (!post(l, grp)) return false;
             if (l + 1 < le_ && !pre(l + 1, grp)) return false;
         }
-    if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
+    if (le_ < g.n_layers || headless_) {   // a layer split's earlier stage (or a pool worker): hand on, no head
         float* hout = hand_out_ + (size_t) hrow0 * HB;
         if (hflag_out_d_ != nullptr && !batch_rec_) {   // the overlapped split: payload + the next stage's flag
             handoff_publish(hout, R_, (int64_t) T * HC * N, bo_, (int64_t) T * N, inj2_, (int64_t) T * HC, hcount_d_,
@@ -3508,6 +3518,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     return true;
 #endif
     using namespace strata::kernels;
+    const auto run_t0 = std::chrono::steady_clock::now();   // POOL: this stage's share of the window (stage_ms)
     const OnDevice on_device(device_);
     last_batch_ = false;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
@@ -3845,8 +3856,13 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
-    if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
+    if (le_ < g.n_layers || headless_) {   // a layer split's earlier stage: the hand-off is written (synced above)
         ++windows;
+        if (link_ != nullptr) {             // POOL: the rest of the model is on other PCs
+            progress_at("verify window: the pool's workers", (int64_t) T);
+            link_->stage_ms(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - run_t0).count());
+            return link_->run(T, tokens, pos0, out, err);
+        }
         if (next_ != nullptr && !next_->run(T, tokens, pos0, pool, next_user_, out, err)) return false;
         // a layer split's first stage owns STRATA_TAP_FILE: it writes once the rest of the chain has run
         if (tap_split_ && !batch_rec_) tap_write(T, tokens, pos0);
@@ -4193,6 +4209,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
             ss_->ple_prev[1] = last_tokens_[t];
         }
     ms_commit += ms_since(t0);
+    if (link_ != nullptr) return link_->commit(n_keep, err);   // POOL: the workers' stages
     return next_ == nullptr || next_->commit(n_keep, err);
 }
 
@@ -5044,7 +5061,15 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         cudaStreamSynchronize(copy_);
         if (prof_on_) collect_profile();
         ++windows;
-        if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
+        if (le_ < g.n_layers) {
+            if (link_ != nullptr) {   // POOL: the workers + head; a finished window is the watchdog's beat (#29)
+                if (!link_->run_rows(rows, S, tokens, pos, out, err)) return false;
+                progress_beat();
+                return true;
+            }
+            return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
+        }
+        if (headless_) return true;   // POOL worker: the rows go back over the network, the head is the coordinator's
         if (!sample_rows(S, err)) return false;
         for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
         note_nonfinite(S, last_pos_b_);
@@ -5109,7 +5134,15 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     cudaStreamSynchronize(copy_);
     if (prof_on_) collect_profile();
     ++windows;
-    if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
+    if (le_ < g.n_layers) {
+        if (link_ != nullptr) {   // POOL: the workers + head; a finished window is the watchdog's beat (#29)
+                if (!link_->run_rows(rows, S, tokens, pos, out, err)) return false;
+                progress_beat();
+                return true;
+            }
+        return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
+    }
+    if (headless_) return true;   // POOL worker: the rows go back over the network, the head is the coordinator's
     if (!sample_rows(S, err)) return false;
     for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     note_nonfinite(S, last_pos_b_);
@@ -5168,6 +5201,7 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
             }
         }
     ms_commit += ms_since(t0);
+    if (link_ != nullptr) return link_->commit_rows(keep, (int) slots_.size(), err);   // POOL: the workers' layers
     return next_ == nullptr || next_->commit_slot_prefixes(keep, err);
 }
 
@@ -5387,7 +5421,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     const cudaError_t qc = cudaStreamQuery(copy_);   // no host function of this window may raise flag B in the next
     if (qc == cudaErrorNotReady) return 0;
     if (prof_on_) collect_profile();
-    if (last_stage()) {
+    if (last_stage() && !headless_) {   // (a POOL worker's last layer hands its rows on: the head is elsewhere)
         if (!sample_rows(S, err)) { b_running_ = false; return -1; }
         for (int t = 0; t < S; ++t) b_out_[t] = ((volatile int32_t*) h_out_)[t];
         note_nonfinite(S, last_pos_b_);
@@ -5479,6 +5513,10 @@ double now_ms() { return std::chrono::duration<double, std::milli>(Clock::now().
 }  // namespace
 
 void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
+    if (pr_ != nullptr) {
+        std::fprintf(f, "  %s: the pool's workers, %s\n", name, pr_->pl_in_flight(pr_par_) ? "IN FLIGHT" : "idle");
+        return;
+    }
     auto rd = [](const uint32_t* p) { return p ? *(const volatile uint32_t*) p : 0u; };
     auto ev = [](cudaEvent_t e) {
         if (e == nullptr) return "none";
@@ -5492,6 +5530,7 @@ void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
 }
 
 bool Verifier::capture_all(std::string& err) {
+    if (pr_ != nullptr) return true;   // POOL: nothing to capture here (the workers run their own windows)
     const OnDevice on_device(device_);
     if (g_ == nullptr) { err = "verify: capture_all before init"; return false; }
     if (remote_opt_ != nullptr) { err = "verify: pipelined windows do not serve --remote-expert-opt"; return false; }
@@ -5546,6 +5585,7 @@ void Verifier::pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_
 }
 
 bool Verifier::prestage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err) {
+    if (pr_ != nullptr) return true;
     if (fl_active_) { err = "verify: a window is in flight on this verifier"; return false; }
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     if (pl_ple_rows_.empty()) { err = "verify: pipelined window not prepared (capture_all)"; return false; }
@@ -5557,6 +5597,11 @@ bool Verifier::prestage(int T, const int32_t* tokens, int64_t pos0, const int32_
 }
 
 bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
+    if (pr_ != nullptr) {
+        last_t_ = T;
+        last_pos0_ = pos0;
+        return pr_->pl_launch(pr_par_, T, tokens, pos0, err);
+    }
     const OnDevice on_device(device_);
     if (fl_active_) { err = "verify: a window is already in flight on this verifier"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
@@ -5598,7 +5643,11 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     return true;
 }
 
-int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
+int Verifier::service(PoolMultiFn pool, void* user, std::string& err, int max_layers) {
+    if (pr_ != nullptr) {   // POOL: the workers' replies are read (and the head launched) as they arrive
+        (void) pool; (void) user; (void) max_layers;
+        return pr_->pl_poll(pr_par_, err) < 0 ? -1 : 1;
+    }
     if (!fl_active_) return 1;
     if (fl_k_ >= fl_total_) return 1;
     // Nothing rang yet and neither the WDDM flush nor the timeout below is due: return before any CUDA call.  The
@@ -5634,7 +5683,9 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
     }
     const int G = groups_[T] > 0 ? groups_[T] : 1;
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
+    int served = 0;   // this call's layers (a layer's halves count apart when its window runs in two groups)
     while (fl_k_ < fl_total_) {
+        if (max_layers > 0 && served >= max_layers) return 0;
         const int64_t l = lb_ + fl_k_ / G;
         const uint32_t want = (uint32_t) (fl_k_ + 1);
         if (*(volatile uint32_t*) h_seq_ < want) {
@@ -5685,6 +5736,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         if (fl_k_ == 0 && !gather_ple()) return -1;
         *(volatile uint32_t*) h_flag_ = want;
         ++fl_k_;
+        ++served;
         ms_pool += ms_since(b);
         fl_since_ms_ = fl_flush_ms_ = now_ms();
     }
@@ -5692,6 +5744,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
 }
 
 bool Verifier::done(std::string& err) {
+    if (pr_ != nullptr) return pr_->pl_poll(pr_par_, err) == 1;
     if (!fl_active_ || fl_k_ < fl_total_) return false;
     const OnDevice on_device(device_);
     const cudaError_t q = cudaEventQuery(ev_done_);
@@ -5713,6 +5766,10 @@ bool Verifier::done(std::string& err) {
 
 bool Verifier::pl_finish(int32_t* out, std::string& err) {
     using namespace strata::kernels;
+    if (pr_ != nullptr) {
+        ++windows;
+        return pr_->pl_finish(pr_par_, out, err);
+    }
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
     fl_active_ = false;
@@ -5739,6 +5796,10 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
 }
 
 bool Verifier::pl_commit_async(int n_keep, std::string& err) {
+    if (pr_ != nullptr) {
+        if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
+        return pr_->pl_commit(pr_par_, n_keep, err);
+    }
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     if (commit_exec_ == nullptr || ev_commit_ == nullptr) { err = "verify: pipelined commit not prepared"; return false; }
@@ -5767,6 +5828,11 @@ bool Verifier::pl_commit_async(int n_keep, std::string& err) {
 }
 
 void Verifier::absorb_stats(Verifier& o) {
+    if (pr_ != nullptr || o.pr_ != nullptr) {   // POOL: the remote stage counts its windows in PoolLink
+        windows += o.windows;
+        o.windows = 0;
+        return;
+    }
     ms_wait += o.ms_wait; ms_pool += o.ms_pool; ms_host += o.ms_host; ms_commit += o.ms_commit;
     windows += o.windows;
     o.ms_wait = o.ms_pool = o.ms_host = o.ms_commit = 0;

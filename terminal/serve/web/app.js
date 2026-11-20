@@ -75,12 +75,13 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
 let tab = "chat";
 const bootHash = location.hash;                       // the tab asked for in the address, kept for a tab that shows later (Experts)
 function showTab(name) {
-  tab = ["chat", "images", "monitor", "experts", "about"].includes(name) ? name : "chat";
+  tab = ["chat", "images", "monitor", "experts", "pool", "about"].includes(name) ? name : "chat";
   if (tab === "experts" && $("tab-btn-experts").hidden) tab = "chat";          // only when the model saves its expert profile (#5723)
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
-  for (const v of ["chat", "images", "monitor", "experts", "about"]) $(`view-${v}`).hidden = v !== tab;
+  for (const v of ["chat", "images", "monitor", "experts", "pool", "about"]) $(`view-${v}`).hidden = v !== tab;
   if (tab === "experts") StrataExperts.start($("view-experts")); else StrataExperts.stop();
   if (tab === "images") $("img-prompt").focus();
+  window.dispatchEvent(new CustomEvent("strata:tab", {detail: tab}));   // the Pool tab's pool.js polls while shown
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
   if (tab === "monitor") loadMcp();

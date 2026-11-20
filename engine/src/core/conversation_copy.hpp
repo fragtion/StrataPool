@@ -196,6 +196,7 @@ inline ConversationCheckpoint copy_checkpoint_beating(const ConversationCheckpoi
     o.dead = copy_beating(c.dead);
     o.block_pos = copy_beating(c.block_pos);
     o.used = c.used;
+    o.pool_id = c.pool_id;   // POOL: the workers' part of it is kept under this id (lost, a parked checkpoint could not be mounted)
     o.pinned = c.pinned;
     o.plan = c.plan;
     o.stage_parts.reserve(c.stage_parts.size());

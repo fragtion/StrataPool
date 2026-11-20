@@ -1,7 +1,7 @@
 // include/strata/kernels/cpu/native_expert.hpp - plan v0.3 P6: one routed expert in its GGUF form on the CPU.
 //
-// The IQ2_XS / IQ3_XXS model files keep their experts in i-quant formats (IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
-// IQ3_S gate/up; Q2_0 or IQ4_NL down) whose values cannot be re-expressed in the Q2_0 pack form.  A native expert
+// The IQ2_XS / IQ3_XXS model files keep their experts in i-quant formats (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S,
+// IQ3_XXS, IQ3_S gate/up; Q2_0 or IQ4_NL down) whose values cannot be re-expressed in the Q2_0 pack form.  A native expert
 // blob is the three GGUF slices back to back, [gate rows | up rows | down rows]. Activations use the weight type's
 // ggml `vec_dot_type`; dispatch selects a format-specific kernel or ggml's per-token dot. The arithmetic mode
 // controls whether grouping tokens may change the selected row arithmetic.

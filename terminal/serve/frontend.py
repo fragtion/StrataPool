@@ -2565,6 +2565,11 @@ class OutputParser:
             elif self.state == "content":
                 if self.lead:                                   # newlines right after </think> or a call
                     stripped = self.buf.lstrip("\n")
+                    # Dropped newlines still separate Markdown lines before the next code fence.
+                    if self._track(self.buf[:len(self.buf) - len(stripped)]):
+                        # ...but the client never sees them, so they are not a blank line: an indented call after them
+                        # is not an indented code block (#4703)
+                        self._prev_blank = False
                     if not stripped:
                         self.buf = ""
                         return out
@@ -2847,8 +2852,8 @@ class OutputParser:
                     self.state, self.lead = "call", False
 
     def finish(self, reason: str | None = None) -> list[Event]:
-        """End of generation: flush whatever is held (an unterminated tool call is returned as content; one that was
-        already announced stays unfinished: its JSON is not closed and no "tool_call" follows it, #211).  `reason` is
+        """End of generation: an incomplete call in the visible answer is returned as content, even if announced.
+        Its streamed JSON stays incomplete and no "tool_call" follows it (#211). `reason` is
         how the turn ended: calls waiting from the reasoning become real calls only on a natural stop (None = stop);
         a turn cut by max tokens (or cancelled, or failed) keeps them as reasoning text (#1058)."""
         out = []

@@ -86,6 +86,12 @@ build-vision-cuda12.bat
 /terminal/.rocm-win/
 /.rocm-win/
 
+# StrataPool: the split's measured timings (written by the engine)
+pool-split-measured.txt
+pool-split-measured.txt.tmp
+bench-results/
+# StrataPool: a learned expert profile (a model config's expert_profile_save)
+/terminal/expert-profile-learned-*.bin
 # Optional MCP raster cache
 *.tool-media/
 /terminal/.tool-media/
