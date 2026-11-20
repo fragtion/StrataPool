@@ -17018,11 +17018,12 @@ int main(int argc, char** argv) {
                 if (pool_essentials(next) != pool_loaded) {
                     strata::pool::KV no;
                     no.set("reload", (int64_t) 1);
-                    no.set("message", "reloading for layers " + next.str("lb") + "-" + next.str("le"));
+                    const std::string last = std::to_string(next.i64("le", 0) - 1);   // le is exclusive: the last layer it loads
+                    no.set("message", "reloading for layers " + next.str("lb") + "-" + last);
                     pool_ch.send(strata::pool::Msg::Err, no, err);
                     pool_ch.close();
                     std::fprintf(stderr, "strata pool: the coordinator wants other settings (layers %s-%s): restarting "
-                                         "to load them\n", next.str("lb").c_str(), next.str("le").c_str());
+                                         "to load them\n", next.str("lb").c_str(), last.c_str());
                     std::printf("POOL RELOAD\n");
                     std::fflush(stdout);
                     return 3;
