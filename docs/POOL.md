@@ -323,6 +323,31 @@ another engine). Greedy replies differ from run to run even on one setting (draf
 the overlap's exactness is checked in `strata-pool-link-test` instead: with exact rows the same bytes go out and
 come back, in order.
 
+### Tuning your own pool
+
+Two tools in `terminal\tools\` help with tuning. Their method comes from
+[inference-optimisation-skill](https://github.com/sybil-solutions/inference-optimisation-skill) (MIT):
+
+- **`pool_ceiling.py` estimates how fast a decode window could be.** It reads the model's own files (the GGUF's tensor
+  sizes, the pack's expert blobs, the drafter and its draft vocabulary) and counts the bytes each PC must move per
+  window: dense weights, the cached experts and K/V on the GPU, the missed experts from RAM or over PCIe, and the rows
+  over the link. It divides each by that memory's speed, for each draft length.
+  - Set your PCs with `--pc name:gpu=,ram=,pcie=,hit=`, then `--split`, `--context`, and `--accepted` (measured
+    tokens per window).
+  - On the two PCs above at split 25 it gives 17.3 ms for the coordinator, 12.3 ms for the worker and 2.1 ms for the
+    link. The measured figures are 18.4, 12.2 and 2.2 ms. So this split is bound by memory bandwidth, and what pays now
+    is fewer bytes per window: fewer drafts, smaller dense weights, or more cache hits.
+  - The tool assumes perfect overlap and leaves out the engine's own overheads. A measured window well above its
+    figure means the time goes to overheads, not to bytes.
+- **`pool_hillclimb.py` is an A/B bench.** It uses a fixed panel of six prompts with the config's own sampling, and
+  6 passes by default; each result is a median.
+  - Run a control, then the candidate (one change), then the control again, and `compare` them. A candidate is
+    accepted only if it beats both controls and nothing else drops by more than 3%. The comparison prints a bootstrap
+    95% interval.
+  - `--needle 32000,120000` hides three codes in a long document and checks that all three come back exactly. Use it
+    for any setting that changes the output.
+  - Results go to `bench-results\hillclimb.jsonl`.
+
 ## Drafts in several chats
 
 **Drafts in several chats** (shown when Several chats at once is on; Strata's `--batch-mtp`) gives each chat's window
