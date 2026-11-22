@@ -150,6 +150,8 @@ measured on their own.
 | YusenZhang0601 - [#6545](https://github.com/Niko1221/Strata/pull/6545) (open PR) | `STRATA_PARK_ASYNC` sizes its VRAM stage by the bytes that are on the card when the K/V is streamed | with `--kv-resident` (both pool PCs) a long conversation's async park no longer asks ~9x the VRAM it uses, so it is no longer refused on a full card |
 | YusenZhang0601 - [#6544](https://github.com/Niko1221/Strata/pull/6544) (open PR) | the engine's input lines are read without rescanning (was O(N^2)) and a prompt line is not copied | long prompts reach the engine sooner |
 | YusenZhang0601 - [#6543](https://github.com/Niko1221/Strata/pull/6543) (open PR) | streamed-K/V attention kernels skip an unmapped page instead of reading out of bounds | |
+| gcp - [#6550](https://github.com/Niko1221/Strata/pull/6550) (open PR) | `STRATA_L3_PF=1` (opt-in): while the GPU works, each CPU worker reads its row slice of the next layer's likely CPU experts into its caches; output unchanged, +6% decode measured upstream | each pool PC predicts only its own layers; the coordinator forwards the switch to workers |
+| nmqx - [#6581](https://github.com/Niko1221/Strata/pull/6581) (open PR) | `STRATA_SM86_DOWN_WS=6` (opt-in): sm_86 decode down kernels without stack spills for IQ4_NL / Q2_0 down experts, bit-exact, +3.6% measured upstream | the Coder's down experts are those two formats; for an RTX 30 card (the desktop coordinator) |
 
 Strata 0.1.40.2 took in [#851](https://github.com/Niko1221/Strata/pull/851), [#789](https://github.com/Niko1221/Strata/pull/789),
 [#813](https://github.com/Niko1221/Strata/pull/813), [#1063](https://github.com/Niko1221/Strata/pull/1063),
