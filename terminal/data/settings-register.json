@@ -18331,6 +18331,76 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_L3_PF",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 10944,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/POOL.md"
+   ],
+   "first_commit": "",
+   "first_date": "",
+   "since": null,
+   "last_commit": "",
+   "last_date": "",
+   "status": "rollback",
+   "owner": "pool",
+   "note": "STRATA_L3_PF=1 (opt-in, upstream PR #6550 carried): the next layer's likely CPU experts read into the CPU caches; forwarded to pool workers. [docs/POOL.md]",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_L3_PF_TOP",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 10970,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/POOL.md"
+   ],
+   "first_commit": "",
+   "first_date": "",
+   "since": null,
+   "last_commit": "",
+   "last_date": "",
+   "status": "rollback",
+   "owner": "pool",
+   "note": "experts the L3 prefetch reads per layer (default 4, 1-16; PR #6550).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_LAUNCH_PROBE",
    "backends": [
     "cuda-hip",
@@ -32393,6 +32463,41 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_POOL_STATIC",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 10945,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/POOL.md"
+   ],
+   "first_commit": "",
+   "first_date": "",
+   "since": null,
+   "last_commit": "",
+   "last_date": "",
+   "status": "rollback",
+   "owner": "pool",
+   "note": "STRATA_POOL_STATIC=1: the L3 prefetch's static row slices alone (an A/B arm; PR #6550).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_POOL_TRACE",
    "backends": [
     "cuda-hip",
@@ -41528,6 +41633,34 @@
    "status": "opt-in",
    "owner": "core",
    "note": "[reviewed] Umbrella for 22 ported sm_75 commits; users run =1. [notes-145-perfprs.md:12]",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_SM86_DOWN_WS",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/POOL.md"
+   ],
+   "first_commit": "",
+   "first_date": "",
+   "since": null,
+   "last_commit": "",
+   "last_date": "",
+   "status": "rollback",
+   "owner": "pool",
+   "note": "STRATA_SM86_DOWN_WS=1|6 (opt-in, upstream PR #6581 carried): sm_86 down kernels without stack spills, IQ4_NL / Q2_0; =5 Q2_0 only.",
    "retire_after": "",
    "retired_in": ""
   },

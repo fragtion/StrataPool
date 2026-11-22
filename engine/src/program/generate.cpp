@@ -515,6 +515,7 @@ const char* const kPoolForwardEnv[] = {
     "STRATA_PREFILL_ROUTED_STREAM", "STRATA_PREFILL_ROUTED_STREAM_DEPTH",     // #4283: unrouted streamed experts not copied
     "STRATA_PF_GROUP_SCRATCH", "STRATA_PF_HC_REGION",                         // #4039: smaller prompt scratch, bigger chunks
     "STRATA_STAGE_RESIDENT",                                                   // #2968: =0 the old staging sizing
+    "STRATA_L3_PF", "STRATA_L3_PF_TOP", "STRATA_POOL_STATIC",                 // #6550: next layer's CPU experts into the caches
 };
 // STRATA_CKPT_POOL: unset = the engine's default (on in a single-stage serve with a conversation cache: park_pool_plan), 0 = off, any
 // other value = on.  -1 unset, 0 off, 1 on (read once)
@@ -1675,7 +1676,8 @@ void drive_pool_multi_impl(void* user, const float* x_f, const int32_t* ids, int
     ++t->calls;
     // STRATA_L3_PF: while the GPU runs the next layer's attention, the workers read the experts its router is likely to
     // pick from the RAM copy into their caches (a prediction moves no data the plan depends on)
-    if (!t->l3_routers.empty() && !t->d.failed && t->d.host_res != nullptr && layer + 1 < (int64_t) t->l3_routers.size()) {
+    if (!t->l3_routers.empty() && !t->d.failed && t->d.host_res != nullptr && layer + 1 < (int64_t) t->l3_routers.size() &&
+        !t->l3_routers[(size_t) (layer + 1)].empty()) {   // POOL: empty past this node's last layer (the next PC's)
         const int64_t nl = layer + 1;
         strata::kernels::cpu::ExpertPool::L3Prefetch q;
         q.router = t->l3_routers[(size_t) nl].data();
@@ -10953,7 +10955,7 @@ int main(int argc, char** argv) {
             auto* asrc = dynamic_cast<strata::core::ArenaExpertSource*>(srcp);
             std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
             bool ok = (fsrc != nullptr || asrc != nullptr) && strata::kernels::cpu::cpu_avx2_ok() && stages.empty();
-            for (int64_t l = 0; l < g.n_layers && ok; ++l) {
+            for (int64_t l = node_lb; l < node_le && ok; ++l) {   // POOL: only this node's layers (the others' routers are not here)
                 const strata::core::WeightRef* w = wt.find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
                 ok = w != nullptr && w->kind == strata::core::WeightKind::Bf16InF32 &&
                      w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
@@ -10967,7 +10969,7 @@ int main(int argc, char** argv) {
                 drive.l3_arena = fsrc == nullptr ? asrc : nullptr;
                 if (const char* v = std::getenv("STRATA_L3_PF_TOP")) drive.l3_top = std::max(1, std::min(16, std::atoi(v)));
                 std::fprintf(stderr, "strata generate: L3 prefetch on: the next layer's top %d non-resident experts, %lld MiB of routers in RAM\n",
-                             drive.l3_top, (long long) (g.n_layers * g.n_expert * g.n_embd * 2 >> 20));
+                             drive.l3_top, (long long) ((node_le - node_lb) * g.n_expert * g.n_embd * 2 >> 20));
             } else {
                 (void) cudaGetLastError();
                 std::fprintf(stderr, "strata generate: L3 prefetch off (needs the RAM copy, AVX2, one GPU and BF16 routers)\n");
