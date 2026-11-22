@@ -3915,6 +3915,17 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", what); std::exit(2); }
             return argv[++i];
         };
+        // POOL: StrataPool's options, ahead of the chain below (MSVC C1061: an else-if chain nests one block per branch,
+        // and upstream's chain is at the limit)
+        if (a == "--pool-peers") { o.pool_peers = next("--pool-peers"); continue; }
+        if (a == "--pool-split") { o.pool_split = next("--pool-split"); continue; }
+        if (a == "--pool-listen") { o.pool_listen = next("--pool-listen"); continue; }
+        if (a == "--pool-secret") { o.pool_secret = next("--pool-secret"); continue; }
+        if (a == "--pool-wire") { o.pool_wire = next("--pool-wire"); continue; }
+        if (a == "--pool-draft-wire") { o.pool_draft_wire = next("--pool-draft-wire"); continue; }
+        if (a == "--pool-prefill-wire") { o.pool_prefill_wire = next("--pool-prefill-wire"); continue; }
+        if (a == "--pool-timeout-s") { o.pool_timeout_s = std::atof(next("--pool-timeout-s")); continue; }
+        if (a == "--pool-wait-s") { o.pool_wait_s = std::atof(next("--pool-wait-s")); continue; }
         bool parsed = true;
         if (a == "--help" || a == "-h") { usage(); return 0; }
         else if (a == "--gpu") { (void) next("--gpu"); }   // applied at startup, before any CUDA call
@@ -4139,15 +4150,6 @@ int main(int argc, char** argv) {
         else if (a == "--split-skip-if-fits") o.split_skip_if_fits = true;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") { o.serve = true; strata::core::set_serve_error_line(true); }   // #6054: a check that fails ends at once, with an ERR line
-        else if (a == "--pool-peers") o.pool_peers = next("--pool-peers");
-        else if (a == "--pool-split") o.pool_split = next("--pool-split");
-        else if (a == "--pool-listen") o.pool_listen = next("--pool-listen");
-        else if (a == "--pool-secret") o.pool_secret = next("--pool-secret");
-        else if (a == "--pool-wire") o.pool_wire = next("--pool-wire");
-        else if (a == "--pool-draft-wire") o.pool_draft_wire = next("--pool-draft-wire");
-        else if (a == "--pool-prefill-wire") o.pool_prefill_wire = next("--pool-prefill-wire");
-        else if (a == "--pool-timeout-s") o.pool_timeout_s = std::atof(next("--pool-timeout-s"));
-        else if (a == "--pool-wait-s") o.pool_wait_s = std::atof(next("--pool-wait-s"));
         else if (a == "--vision") o.vision = true;
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
@@ -17227,7 +17229,7 @@ int main(int argc, char** argv) {
                         ++w_bwindows;
                         w_ms_batch += std::chrono::duration<double, std::milli>(Clock::now() - tv).count();
                         // the VRAM tier follows the conversations on this PC's layers, as after a solo window
-                        if (!drive.d.usage.empty() && o.adapt_every > 0 && ((++w_rounds) % o.adapt_every) == 0 && !adapt()) {
+                        if (!drive.d.usage.empty() && o.adapt_every > 0 && ((++w_rounds) % o.adapt_every) == 0 && !adapt(snapshot_usage())) {   // (0.2.20: adapt takes the usage snapshot)
                             fail("an adaptive refill failed");
                             fatal = true;
                             break;
@@ -17287,7 +17289,7 @@ int main(int argc, char** argv) {
                             fatal = true;
                             break;
                         }
-                        if (!drive.d.usage.empty() && o.adapt_every > 0 && ((++w_rounds) % o.adapt_every) == 0 && !adapt()) {
+                        if (!drive.d.usage.empty() && o.adapt_every > 0 && ((++w_rounds) % o.adapt_every) == 0 && !adapt(snapshot_usage())) {   // (0.2.20: adapt takes the usage snapshot)
                             fail("an adaptive refill failed");
                             fatal = true;
                             break;
@@ -17312,7 +17314,7 @@ int main(int argc, char** argv) {
                             break;
                         }
                         // the VRAM tier follows the conversation on this PC's layers, as the serve loop's does
-                        if (!drive.d.usage.empty() && o.adapt_every > 0 && ((++w_rounds) % o.adapt_every) == 0 && !adapt()) {
+                        if (!drive.d.usage.empty() && o.adapt_every > 0 && ((++w_rounds) % o.adapt_every) == 0 && !adapt(snapshot_usage())) {   // (0.2.20: adapt takes the usage snapshot)
                             fail("an adaptive refill failed");
                             fatal = true;
                             break;
