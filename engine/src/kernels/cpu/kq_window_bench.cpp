@@ -28,8 +28,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
+#endif
 #include <memory>
 #include <random>
 #include <string>
@@ -263,10 +265,12 @@ int main(int argc, char** argv) {
         double wall = 0, idle_wall = 0;
         auto work = [&](int tid) {
             if (pin || fixed) {
+#if defined(__linux__)
                 cpu_set_t cs;
                 CPU_ZERO(&cs);
                 CPU_SET(tid, &cs);
                 pthread_setaffinity_np(pthread_self(), sizeof cs, &cs);
+#endif
             }
             std::vector<float> ffb((size_t) kMaxT * kFF), outb((size_t) kMaxT * kH);
             float* ff[kMaxT];

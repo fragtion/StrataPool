@@ -143,13 +143,66 @@ static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affini
 // The fields the default worker count needs (pool_plan.hpp): the logical processors the process may use, the CPU
 // package of the host core and of every worker core, whether the OS told physical cores from SMT siblings, the
 // container CPU quota.  On a multi-socket CPU (not hybrid) the host package comes first in `worker_cores`.
+#if defined(_WIN32)
+// #6523: map a Windows encoded logical CPU (group * 64 + bit) to its NUMA node across ALL processor groups.
+static int cpu_numa_node_win(int cpu) {
+    if (cpu < 0) return -1;
+    static const std::vector<int> map = [] {
+        std::vector<int> m;
+        DWORD len = 0;
+        GetLogicalProcessorInformationEx(RelationNumaNode, nullptr, &len);
+        if (len == 0) return m;
+        std::vector<char> buf(len);
+        if (!GetLogicalProcessorInformationEx(RelationNumaNode,
+                                              reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()),
+                                              &len))
+            return m;
+        for (DWORD off = 0; off < len;) {
+            const auto* e = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + off);
+            if (e->Size == 0 || off + e->Size > len) break;
+            if (e->Relationship == RelationNumaNode) {
+                const int node = (int) e->NumaNode.NodeNumber;
+                const GROUP_AFFINITY& g = e->NumaNode.GroupMask;
+                const int base = (int) g.Group * 64;
+                if (g.Mask != 0 && base + 64 > (int) m.size()) m.resize((size_t) (base + 64), -1);
+                for (int bit = 0; bit < 64; ++bit)
+                    if (g.Mask & (KAFFINITY(1) << bit)) m[(size_t) (base + bit)] = node;
+            }
+            off += e->Size;
+        }
+        return m;
+    }();
+    return cpu < (int) map.size() ? map[(size_t) cpu] : -1;
+}
+#endif
+
 static void fill_plan_fields(CpuTopology& topo, bool skip_first) {
     topo.cpu_quota = container_cpu_quota();
     topo.worker_package.assign(topo.worker_cores.size(), -1);
 #if defined(_WIN32)
-    (void) skip_first;
     topo.logical = (int) GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
-    return;   // (the sockets of a Windows box are not told apart: one package)
+    // #6523: populate NUMA node / package per physical core across all processor groups so multi-socket servers
+    // (>64 logical CPUs) plan workers across both sockets instead of collapsing into a single group.
+    bool known = !topo.worker_cores.empty() || topo.host_core >= 0;
+    if (topo.host_core >= 0) {
+        topo.host_package = cpu_numa_node_win(topo.host_core);
+        if (topo.host_package < 0) known = false;
+    }
+    for (size_t i = 0; i < topo.worker_cores.size(); ++i) {
+        topo.worker_package[i] = cpu_numa_node_win(topo.worker_cores[i]);
+        if (topo.worker_package[i] < 0) known = false;
+    }
+    if (known && skip_first && !topo.is_hybrid && topo.host_core >= 0 && topo.host_package >= 0) {
+        std::vector<size_t> order(topo.worker_cores.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::stable_partition(order.begin(), order.end(),
+                              [&](size_t i) { return topo.worker_package[i] == topo.host_package; });
+        std::vector<int> cores, pkgs;
+        for (size_t i : order) { cores.push_back(topo.worker_cores[i]); pkgs.push_back(topo.worker_package[i]); }
+        topo.worker_cores = std::move(cores);
+        topo.worker_package = std::move(pkgs);
+    }
+    return;
 #elif defined(__APPLE__)
     (void) skip_first;
     topo.logical = (int) std::thread::hardware_concurrency();
@@ -615,17 +668,28 @@ int numa_node_count() {
 #endif
 }
 
-// The real-node split for threads on `thread_core` (numa_pool.hpp).  Linux only: the placement of the experts' memory
-// (first touch by threads pinned to a node, move_pages to check) has no Windows or macOS version.
+// The real-node split for threads on `thread_core` (numa_pool.hpp).  On Linux it runs whenever >=2 nodes exist;
+// on Windows (#6523/#6554) it runs across processor groups when STRATA_NUMA_ARENA=1 or explicit STRATA_NUMA_SPLIT=1.
 NumaSplitDecision decide_real_numa_split([[maybe_unused]] const std::vector<int>& thread_core, [[maybe_unused]] int n_workers,
                                          [[maybe_unused]] bool pinned) {
 #if defined(__linux__)
     // the expert source's own reading of it (expert_source.cpp): exactly "1"
     const char* rotate = std::getenv("STRATA_EXCHANGE_ROTATE");
     return decide_numa_split(thread_core, n_workers, pinned, rotate != nullptr && std::strcmp(rotate, "1") == 0, cpu_numa_node);
+#elif defined(_WIN32)
+    const char* arena = std::getenv("STRATA_NUMA_ARENA");
+    const char* split = std::getenv("STRATA_NUMA_SPLIT");
+    const bool win_numa_opt = (arena != nullptr && arena[0] == '1') || (split != nullptr && std::strcmp(split, "1") == 0);
+    if (!win_numa_opt) {
+        NumaSplitDecision d;
+        d.why = "on Windows, set STRATA_NUMA_ARENA=1 (or STRATA_NUMA_SPLIT=1) to enable multi-node pool split";
+        return d;
+    }
+    const char* rotate = std::getenv("STRATA_EXCHANGE_ROTATE");
+    return decide_numa_split(thread_core, n_workers, pinned, rotate != nullptr && std::strcmp(rotate, "1") == 0, cpu_numa_node_win);
 #else
     NumaSplitDecision d;
-    d.why = "the split needs Linux";
+    d.why = "the split needs Linux or Windows";
     return d;
 #endif
 }
@@ -784,6 +848,10 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
 #if defined(__linux__)
         std::vector<int> by_node;
         for (int c : topo_.worker_cores) by_node.push_back(cpu_numa_node(c));
+        if (std::none_of(by_node.begin(), by_node.end(), [](int n) { return n < 0; })) key = by_node;
+#elif defined(_WIN32)
+        std::vector<int> by_node;
+        for (int c : topo_.worker_cores) by_node.push_back(cpu_numa_node_win(c));
         if (std::none_of(by_node.begin(), by_node.end(), [](int n) { return n < 0; })) key = by_node;
 #endif
         std::vector<int> cores, pkgs;
@@ -1246,7 +1314,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     if (per_worker_) {   // task j on worker j, once per batch; the host has none (it never calls this for such a batch)
         if (id < 0 || id >= n_) return;
         wstate_[(size_t) id].store(id, std::memory_order_relaxed);
-        if (mode_ == 9) prefetch_task(id);   // 9: the L3 prefetch (8 is run_range since 0.2.19)
+        if (mode_ == 9) prefetch_task(id);
         else {
             const int per = mode_ == 5 ? (int) nfmt_->n_ff : (int) nfmt_->n_embd;
             const int r0 = (int) ((int64_t) per * id / n_), r1 = (int) ((int64_t) per * (id + 1) / n_);
@@ -1557,7 +1625,7 @@ void ExpertPool::prefetch_next(const L3Prefetch& q, const float* x, const int32_
     pf_res_.assign(res_row, res_row + q.n_expert);
     pf_logits_.resize((size_t) q.nt * (size_t) q.n_expert);
     pf_arrive_.store(0, std::memory_order_relaxed);
-    mode_ = 9;   // the L3 prefetch (drain: per_worker, prefetch_task)
+    mode_ = 9;
     njobs_ = n_;
     per_worker_ = true;
     pf_inflight_ = true;
@@ -1575,8 +1643,45 @@ void ExpertPool::prefetch_task(int j) {
         tmp.resize((size_t) ne * (size_t) q.nt);
         for (int t0 = 0; t0 < q.nt; t0 += 8) {
             const int nt = (std::min)(8, q.nt - t0);
-            bf16_rows_dot_multi(q.router + (size_t) e0 * (size_t) q.n_embd, ne, q.n_embd,
-                                pf_x_.data() + (size_t) t0 * (size_t) q.n_embd, nt, tmp.data());
+            const uint16_t* rw = q.router + (size_t) e0 * (size_t) q.n_embd;
+            const float* rx = pf_x_.data() + (size_t) t0 * (size_t) q.n_embd;
+#if defined(STRATA_NATIVE_EXPERTS)
+            if (cpu_avx2_ok()) {
+                bf16_rows_dot_multi(rw, ne, q.n_embd, rx, nt, tmp.data());
+            } else {
+                for (int t = 0; t < nt; ++t) {
+                    const float* xt = rx + (size_t) t * (size_t) q.n_embd;
+                    float* ot = tmp.data() + (size_t) t * (size_t) ne;
+                    for (int r = 0; r < ne; ++r) {
+                        const uint16_t* wr = rw + (size_t) r * (size_t) q.n_embd;
+                        float s = 0.0f;
+                        for (int k = 0; k < q.n_embd; ++k) {
+                            const uint32_t u = (uint32_t) wr[k] << 16;
+                            float wv;
+                            std::memcpy(&wv, &u, sizeof(wv));
+                            s += wv * xt[k];
+                        }
+                        ot[r] = s;
+                    }
+                }
+            }
+#else
+            for (int t = 0; t < nt; ++t) {
+                const float* xt = rx + (size_t) t * (size_t) q.n_embd;
+                float* ot = tmp.data() + (size_t) t * (size_t) ne;
+                for (int r = 0; r < ne; ++r) {
+                    const uint16_t* wr = rw + (size_t) r * (size_t) q.n_embd;
+                    float s = 0.0f;
+                    for (int k = 0; k < q.n_embd; ++k) {
+                        const uint32_t u = (uint32_t) wr[k] << 16;
+                        float wv;
+                        std::memcpy(&wv, &u, sizeof(wv));
+                        s += wv * xt[k];
+                    }
+                    ot[r] = s;
+                }
+            }
+#endif
             for (int t = 0; t < nt; ++t)
                 std::memcpy(pf_logits_.data() + (size_t) (t0 + t) * (size_t) q.n_expert + (size_t) e0,
                             tmp.data() + (size_t) t * (size_t) ne, (size_t) ne * sizeof(float));
