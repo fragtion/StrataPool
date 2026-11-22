@@ -146,6 +146,10 @@ measured on their own.
 | Vop3p - [#3382](https://github.com/Niko1221/Strata/pull/3382) (in Strata since 0.2.10) | `STRATA_PREFILL_CPU_SHARE_BATCH` (opt-in) | coordinator only |
 | Stefano Sinden (bitaccesscomau) - [#4283](https://github.com/Niko1221/Strata/pull/4283) (in Strata since 0.2.10) | `STRATA_PREFILL_ROUTED_STREAM` (opt-in): unrouted streamed experts not copied | forwarded to the workers |
 | Vop3p - [#3095](https://github.com/Niko1221/Strata/pull/3095) (in Strata since 0.2.10) | `STRATA_PW_WITH_BATCH`: a request that is alone keeps the pipelined windows beside batch slots | **Overlap the PCs** with **Several chats** on: a chat that is alone keeps the overlap (set by the Pool tab when both are ticked) |
+| sangharshadhyeta - [Strata-HotRod](https://github.com/sangharshadhyeta/Strata-HotRod) (ported, not merged) | the stand-ins' budget rule: a missed expert is replaced by a resident one only when the pick's weight x logit gap is small (`STRATA_ROUTE_RESIDENT_BUDGET`) | stand-ins on the Coder (256 experts) and across a split, forwarded to the workers |
+| YusenZhang0601 - [#6545](https://github.com/Niko1221/Strata/pull/6545) (open PR) | `STRATA_PARK_ASYNC` sizes its VRAM stage by the bytes that are on the card when the K/V is streamed | with `--kv-resident` (both pool PCs) a long conversation's async park no longer asks ~9x the VRAM it uses, so it is no longer refused on a full card |
+| YusenZhang0601 - [#6544](https://github.com/Niko1221/Strata/pull/6544) (open PR) | the engine's input lines are read without rescanning (was O(N^2)) and a prompt line is not copied | long prompts reach the engine sooner |
+| YusenZhang0601 - [#6543](https://github.com/Niko1221/Strata/pull/6543) (open PR) | streamed-K/V attention kernels skip an unmapped page instead of reading out of bounds | |
 
 Strata 0.1.40.2 took in [#851](https://github.com/Niko1221/Strata/pull/851), [#789](https://github.com/Niko1221/Strata/pull/789),
 [#813](https://github.com/Niko1221/Strata/pull/813), [#1063](https://github.com/Niko1221/Strata/pull/1063),
