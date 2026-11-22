@@ -520,6 +520,7 @@ const char* const kPoolForwardEnv[] = {
     "STRATA_PF_GROUP_SCRATCH", "STRATA_PF_HC_REGION",                         // #4039: smaller prompt scratch, bigger chunks
     "STRATA_STAGE_RESIDENT",                                                   // #2968: =0 the old staging sizing
     "STRATA_L3_PF", "STRATA_L3_PF_TOP", "STRATA_POOL_STATIC",                 // #6550: next layer's CPU experts into the caches
+    "STRATA_PCIE_EARLY",                                                       // Strata-HotRod 07f52d929: the PCIe share's fetch beside the VRAM experts
 };
 // STRATA_CKPT_POOL: unset = the engine's default (on in a single-stage serve with a conversation cache: park_pool_plan), 0 = off, any
 // other value = on.  -1 unset, 0 off, 1 on (read once)

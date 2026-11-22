@@ -27794,6 +27794,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PCIE_EARLY",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/core/verify.cpp",
+     "line": 129,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "2026-11-23",
+   "since": null,
+   "last_commit": "",
+   "last_date": "2026-11-23",
+   "status": "opt-in",
+   "owner": "pool",
+   "note": "StrataPool (from Strata-HotRod 07f52d929): =1 runs the PCIe share's fetch kernel (pcie mode 2) on its own stream beside the layer's VRAM experts",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_PCIE_FRAC_DEFAULT",
    "backends": [
     "cuda-hip",

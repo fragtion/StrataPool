@@ -124,6 +124,9 @@ constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
+// STRATA_PCIE_EARLY=1 (opt-in; from Strata-HotRod 07f52d929): the PCIe share's fetch kernel runs on its own stream beside the VRAM groups
+// (Verifier::pf_cs_).  HotRod measured about 7% off the window on an RTX 3060 that streams experts from a drive; not measured on a pool
+inline bool pcie_early_env() { static const bool on = [] { const char* v = std::getenv("STRATA_PCIE_EARLY"); return v != nullptr && v[0] == '1'; }(); return on; }
 inline bool g_lfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE"); return v != nullptr && v[0] == '1'; }(); return on; }
 // STRATA_ROUTE_RESIDENT=<margin logits> (+ STRATA_ROUTE_RESIDENT_RANKS=lo-hi, default 6-9): residency-biased routing.
 struct RouteResidentCfg;
@@ -784,6 +787,7 @@ Verifier::~Verifier() {
     }
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
+    if (pf_cs_) cudaStreamSynchronize(pf_cs_);
     for (auto& row : exec_)
         for (auto& e : row)
             if (e) cudaGraphExecDestroy(e);
@@ -815,6 +819,9 @@ Verifier::~Verifier() {
     if (slot_hist_d_) cudaFree(slot_hist_d_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
+    if (pf_cs_) cudaStreamDestroy(pf_cs_);
+    if (ev_pf_fork_) cudaEventDestroy(ev_pf_fork_);
+    if (ev_pf_join_) cudaEventDestroy(ev_pf_join_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (side_) cudaStreamDestroy(side_);
     if (side2_) cudaStreamDestroy(side2_);
@@ -1364,6 +1371,18 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess) {
         err = "verify: event create failed";
         return false;
+    }
+    if (pcie_early_env() && pf_cs_ == nullptr) {   // optional: on any failure it stays off (pf_cs_ nullptr) and the fetch stays on cs
+        if (make_stream(&pf_cs_, gp_mid) != cudaSuccess || cudaEventCreateWithFlags(&ev_pf_fork_, cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&ev_pf_join_, cudaEventDisableTiming) != cudaSuccess) {
+            (void) cudaGetLastError();
+            if (pf_cs_) { cudaStreamDestroy(pf_cs_); pf_cs_ = nullptr; }
+            if (ev_pf_fork_) { cudaEventDestroy(ev_pf_fork_); ev_pf_fork_ = nullptr; }
+            if (ev_pf_join_) { cudaEventDestroy(ev_pf_join_); ev_pf_join_ = nullptr; }
+            std::fprintf(stderr, "strata verify: STRATA_PCIE_EARLY: the side stream could not be made, the PCIe fetch stays on the window's stream\n");
+        } else {
+            std::fprintf(stderr, "strata verify: STRATA_PCIE_EARLY: the PCIe share's fetch overlaps the VRAM experts (own stream, pcie mode 2)\n");
+        }
     }
     {   // STRATA_DF_BRANCH=1 (opt-in): the mixer's side branches.  Off by default: on Linux (open modules, GSP) a
         // stage's window with the branches stopped inside its graph when an NVML query (nvidia-smi) came between
@@ -2885,6 +2904,22 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
                 }
             }
+            // STRATA_PCIE_EARLY (from Strata-HotRod 07f52d929): the PCIe share's fetch starts on pf_cs_ once the plan is on the device and the
+            // host has published the share (flag B), while cs runs the VRAM groups; the join below makes the PCIe groups wait for it.  cs keeps
+            // its own (stamped) wait on flag B.  The staging region is this group's, reused only by the same group of the next layer, whose
+            // fork comes after this layer's PCIe groups on cs
+            const bool pf_early = pf_cs_ != nullptr && sink_.pcie_mode == 2 && !device_plan_ && !prof_on_;
+            if (pf_early) {
+                cudaEventRecord(ev_pf_fork_, cs);
+                cudaStreamWaitEvent(pf_cs_, ev_pf_fork_, 0);
+                wait_flag_ge(m_flagB_, ring, pf_cs_);
+                const int64_t per_e = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                uint8_t* stage_e = staging_ + (size_t) (grp * per_e) * lay.max_blob;
+                const unsigned long long* p_dst2e = (const unsigned long long*) (pl + dst2_off_);   // STRATA_ADAPT_FETCH
+                fetch_blobs(p_ptr2, p_counts + 2, stage_e, (int64_t) lay.blob_bytes(l), (int) per_e, pf_cs_, p_dst2e);
+                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage_e, (int64_t) lay.blob_bytes(l), pf_cs_, p_dst2e);
+                cudaEventRecord(ev_pf_join_, pf_cs_);
+            }
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, hit_out, true);
             stamp(l, 20, grp);
@@ -2892,7 +2927,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
                 wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
             else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
-            if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
+            if (pf_early) {
+                cudaStreamWaitEvent(cs, ev_pf_join_, 0);           // STRATA_PCIE_EARLY: the fetch ran beside the VRAM groups
+            } else if (sink_.pcie_mode == 2) {                     // stage it with a copy kernel, then point at staging
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
                 uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
                 const unsigned long long* p_dst2 = (const unsigned long long*) (pl + dst2_off_);   // STRATA_ADAPT_FETCH

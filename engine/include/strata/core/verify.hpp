@@ -743,6 +743,10 @@ private:
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
+    // STRATA_PCIE_EARLY=1 (from Strata-HotRod 07f52d929; pcie mode 2, the missed experts fetched by a copy kernel): the fetch runs on
+    // pf_cs_, forked from cs once the layer's plan is on the device and joined back before the PCIe groups, so it overlaps the VRAM groups
+    cudaStream_t pf_cs_ = nullptr;
+    cudaEvent_t ev_pf_fork_ = nullptr, ev_pf_join_ = nullptr;
     // STRATA_DF_BRANCH: a layer's mixer work that reads only the layer's input, captured as parallel graph branches
     // on these side streams (record_window); the same kernels on the same inputs, only their order is freer
     bool df_branch_ = false;
