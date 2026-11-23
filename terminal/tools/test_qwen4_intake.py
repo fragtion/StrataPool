@@ -535,7 +535,8 @@ class TablesMatchTheSources(unittest.TestCase):
         self.assertRegex(_read("CMakeLists.txt"), r'option\(STRATA_Q6K_EXPERTS "[^"]*" ON\)')
 
     def test_mmvq_lists(self):
-        for be, rel in (("cuda", "src/kernels/cuda/native_mmvq.cu"), ("sycl", "sycl/src/kernels/cuda/native_mmvq.dp.cpp"),
+        for be, rel in (("cuda", "src/kernels/cuda/native_mmvq.cu"),
+                        ("sycl", "sycl/src/kernels/cuda/native_mmvq.dp.cpp"),
                         ("metal", "metal/src/engine/mmvq_host.cpp")):   # StrataPool: CUDA's list also has IQ1_S
             with self.subTest(rel):
                 self.assertEqual(_ints(_func(_read(rel), "bool native_mmvq_supported"), r"ggml_type == (\d+)"),
