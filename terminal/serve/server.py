@@ -809,6 +809,8 @@ class StrataEngine:
             self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
             self.info["version"] = None
+        if "wlock" not in self.__dict__:                 # F-04: made before the lazy return, so an engine not started yet has it
+            self.wlock = threading.Lock()
         if lazy:
             return
         self.unloaded = False            # `ended` stays True until READY (below): not alive while starting (#344)
@@ -1032,7 +1034,8 @@ class StrataEngine:
             self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
-        self.wlock = threading.Lock()                   # stdin writes from several request threads
+        if "wlock" not in self.__dict__:                 # stdin writes from several request threads, all through _write_line
+            self.wlock = threading.Lock()               # (from Strata-HotRod 815dbbf43, F-04); kept across restart()
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
 
@@ -1314,8 +1317,7 @@ class StrataEngine:
         if device is not None and reserve_mib is None:   # per-GPU (#533): a device only makes sense with an explicit reserve.
             raise ValueError("VRAM with a device needs an explicit reserve_mib")
         cmd = "VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}" + (f" {int(device)}" if device is not None else ""))
-        self.proc.stdin.write(cmd + "\n")
-        self.proc.stdin.flush()
+        self._write_line(cmd)
         deadline = time.time() + timeout
         while True:
             try:
@@ -1467,12 +1469,22 @@ class StrataEngine:
         on = sampling.get("experimental_speed_projection")
         return f" cvec={int(on)}" if isinstance(on, bool) else ""
 
+    def _write_line(self, text: str, proc=None):
+        """One command line to the engine, written whole under wlock: several request threads write to its stdin, and a
+        line must never interleave with another (from Strata-HotRod 815dbbf43, F-04: VRAM, GEN, STOP and SAVE/RESTORE wrote
+        without it).  The lock covers the write and flush only, never a wait for output."""
+        lock = self.__dict__.get("wlock")
+        if lock is None:                                 # (an engine built without __init__, as test fixtures do)
+            lock = self.__dict__.setdefault("wlock", threading.Lock())
+        with lock:
+            p = self.proc if proc is None else proc
+            p.stdin.write(text + "\n")
+            p.stdin.flush()
+
     def _send(self, text: str):
         btrace("send>", text[:60])
         try:
-            with self.wlock:
-                self.proc.stdin.write(text + "\n")
-                self.proc.stdin.flush()
+            self._write_line(text)
         except (OSError, AttributeError, ValueError):    # the pipe is gone (or a restart's close() took the process;
             # #6055: close() closed stdin - a write then raises ValueError, which reached the client as a 400 "malformed")
             if getattr(self, "closing", False):
@@ -2675,8 +2687,7 @@ class StrataEngine:
             head = "GEN 0 prefill=1"
         line = f"{head} {','.join(str(int(t)) for t in ids)}\n"   # (a bad id stays the request's own ValueError)
         try:
-            self.proc.stdin.write(line)
-            self.proc.stdin.flush()
+            self._write_line(line[:-1])
         except (OSError, ValueError, AttributeError, EngineDied):   # the pipe is gone: the engine died (not the client)
             if getattr(self, "closing", False):         # #6055: or close() closed it (a write then raises ValueError)
                 raise EngineClosing("this instance is draining; retry against the next instance") from None
@@ -2782,8 +2793,7 @@ class StrataEngine:
                     proc = None
                 if self.can_stop and proc is not None:
                     try:
-                        proc.stdin.write(stop_line)
-                        proc.stdin.flush()
+                        self._write_line(stop_line.rstrip("\n"), proc)
                     except (OSError, ValueError):
                         pass
                 # #481: never an untimed wait here - it holds the request FIFO, and an engine that lost step never
@@ -2909,8 +2919,7 @@ class StrataEngine:
         if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
         try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
-            self.proc.stdin.flush()
+            self._write_line(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}")
         except OSError:
             raise self._engine_died() from None
         silence = float(self.silence_s or 0)
