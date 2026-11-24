@@ -3,6 +3,7 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "conversation_copy.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -471,7 +472,23 @@ void swap_transfer_failure() {
 #endif
 }
 
+// POOL: a parked conversation's checkpoints keep their pool_id through the watchdog-beating copy (0.1.43.1 #2049
+// copies them field by field; a lost id made every checkpoint resume of a parked conversation end the engine)
+void checkpoint_copy_keeps_fields() {
+    strata::core::ConversationCheckpoint c;
+    c.ids = {1, 2, 3};
+    c.gdn.assign(3u << 20, 7);   // more than one 1 MiB slice
+    c.used = 9; c.pool_id = 42; c.pinned = true;
+    c.stage_parts.push_back(c);
+    c.stage_parts[0].pool_id = 43;
+    const auto o = strata::core::conversation_detail::copy_checkpoint_beating(c);
+    check(o.ids == c.ids && o.gdn == c.gdn, "checkpoint copy: data");
+    check(o.used == 9 && o.pool_id == 42 && o.pinned, "checkpoint copy: used, pool_id, pinned");
+    check(o.stage_parts.size() == 1 && o.stage_parts[0].pool_id == 43, "checkpoint copy: stage parts");
+}
+
 int main() {
+    checkpoint_copy_keeps_fields();
 #if defined(CONVERSATION_TEST_TRANSFERS) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
     swap_transfer_failure();
 #endif

@@ -48,6 +48,9 @@ NETWORK_ALLOWED = {
     ("strata_control/tune_session.py", "urlopen"): "the loopback engine (127.0.0.1) the auto-tuner a user started measures",
     ("strata_control/loopback.py", "urlopen"): "the one opener for this computer's own servers (no proxy); any other address is passed on unchanged",
     ("strata_control/components.py", "urlopen"): "the component fetcher: only `strata install`/UPDATE call it",
+    # StrataPool: the pool's own HTTP between the PCs of one LAN, never an installer or a download
+    ("serve/pool.py", "urlopen"): "StrataPool: a pool PC asks the other PCs the user named (or that answered its LAN beacon) for their state",
+    ("serve/route.py", "urlopen"): "StrataPool: Share requests forwards a chat request to the pool PC that holds its conversation",
 }
 #: Modules that import the installer on purpose, with the explicit command that reaches them.
 INSTALLER_IMPORT_ALLOWED = {

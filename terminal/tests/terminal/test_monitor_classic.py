@@ -129,8 +129,11 @@ class SolidLook(unittest.TestCase):
 
 class SeveralCards(unittest.TestCase):
     def test_one_card_looks_exactly_as_before(self):
-        base = metrics("generating")
-        one = metrics("generating")
+        # one clock for both: the requests table shows each request's wall-clock time, so a second ticking over between
+        # the two metrics() calls made the drawings differ (seen on a CI runner)
+        with mock.patch.object(time, "time", return_value=time.time()):
+            base = metrics("generating")
+            one = metrics("generating")
         one["hardware"]["gpus"] = [{"index": 0, "name": "NVIDIA GeForce RTX 5070", "util": 88, "mem_used": 11.2 * GIB, "mem_total": 12 * GIB, "temp": 54, "power": 114}]
         for glyphs in ("unicode", "ascii", "solid"):
             self.assertEqual(draw(overview.build(base), glyphs=glyphs, now=1.0), draw(overview.build(one), glyphs=glyphs, now=1.0), glyphs)

@@ -537,7 +537,7 @@ class TablesMatchTheSources(unittest.TestCase):
     def test_mmvq_lists(self):
         for be, rel in (("cuda", "src/kernels/cuda/native_mmvq.cu"),
                         ("sycl", "sycl/src/kernels/cuda/native_mmvq.dp.cpp"),
-                        ("metal", "metal/src/engine/mmvq_host.cpp")):
+                        ("metal", "metal/src/engine/mmvq_host.cpp")):   # StrataPool: CUDA's list also has IQ1_S
             with self.subTest(rel):
                 self.assertEqual(_ints(_func(_read(rel), "bool native_mmvq_supported"), r"ggml_type == (\d+)"),
                                  Q.BACKEND_LISTS[be]["mmvq"])

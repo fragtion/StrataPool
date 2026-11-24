@@ -16,6 +16,21 @@ macro(strata_cpu_kernels)
 #     test drivers must NOT be in it - otherwise the fallback is not a fallback, it is the same bet with
 #     worse opt-out.  `cpu_require_expert_support()` therefore refuses at startup on a CPU without the
 #     features, and the fallback exists for tests, exactly as P2.S3 specifies.
+# POOL: the network between pool nodes (sockets, the handshake, the wire formats, the split search).  No GPU.
+add_library(strata_pool STATIC src/pool/net.cpp src/pool/protocol.cpp src/pool/split.cpp src/pool/worker.cpp)
+target_include_directories(strata_pool PUBLIC include)
+find_package(Threads REQUIRED)
+target_link_libraries(strata_pool PUBLIC Threads::Threads)
+if(WIN32)
+  target_link_libraries(strata_pool PUBLIC ws2_32)
+endif()
+add_executable(strata-pool-test src/pool/pool_test.cpp)
+target_link_libraries(strata-pool-test PRIVATE strata_pool)
+if(STRATA_BUILD_TESTS)
+  enable_testing()
+  add_test(NAME strata_pool_test COMMAND strata-pool-test)
+endif()
+
 # Plan v0.3 P6: speculation components that need no GPU.
 add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp
             src/spec/draft_source.cpp)
