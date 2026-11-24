@@ -95,7 +95,7 @@ SQ-20 está pensado para una tarjeta gráfica de 24 GiB, SQ-15 para 16 GiB y SQ-
 
 Instala la aplicación, elige un modelo y empieza a chatear. Hay un instalador por sistema. En el primer arranque, la aplicación descarga el motor para tu tarjeta gráfica. [Ayuda con el instalador](../INSTALL.md#the-app).
 
-<sub>Archivos: `Strata-0.2.20-windows-x64-setup.exe` · `Strata-0.2.20-linux-x86_64.AppImage` · `Strata-0.2.20-macos-arm64.dmg`</sub>
+<sub>Archivos: `Strata-0.2.21-windows-x64-setup.exe` · `Strata-0.2.21-linux-x86_64.AppImage` · `Strata-0.2.21-macos-arm64.dmg`</sub>
 
 <p align="center">
   <img src="../media/app-chat.png" width="900" alt="Aplicación de escritorio de Strata con un chat y una vista previa del código en vivo, una junto a otra">
@@ -178,7 +178,9 @@ Ejecuta **`strata connect`** para ver las instrucciones de tu herramienta. [Guí
 
 <!-- Sponsor logos: one centred row with room for five, each 130 px wide. Add the next sponsor after Olares, with &nbsp;&nbsp;&nbsp;&nbsp; between two logos. -->
 <p align="center">
-  <a href="https://www.olares.com/one"><picture><source media="(prefers-color-scheme: dark)" srcset="../media/sponsors/olares-logo-white.svg"><img src="../media/sponsors/olares-logo-color.svg" alt="Olares" title="Olares" width="130"></picture></a>
+  <a href="https://heylinger.com"><picture><source media="(prefers-color-scheme: dark)" srcset="../media/sponsors/linger-logo-white.svg"><img src="../media/sponsors/linger-logo-color.svg" alt="Linger" title="Linger" width="130" align="middle"></picture></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://www.olares.com/one"><picture><source media="(prefers-color-scheme: dark)" srcset="../media/sponsors/olares-logo-white.svg"><img src="../media/sponsors/olares-logo-color.svg" alt="Olares" title="Olares" width="130" align="middle"></picture></a>
 </p>
 
 ## Apoya Strata

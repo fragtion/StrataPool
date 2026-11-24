@@ -96,7 +96,7 @@ Nie wiesz, co się zmieści? [Wybierz model do swojego komputera](../MODELS.md#p
 Zainstaluj aplikację, wybierz model i zacznij rozmawiać. Dla każdego systemu jest jeden instalator. Przy pierwszym
 uruchomieniu aplikacja pobiera silnik dla twojej karty graficznej. [Pomoc z instalatorem](../INSTALL.md#the-app).
 
-<sub>Pliki: `Strata-0.2.20-windows-x64-setup.exe` · `Strata-0.2.20-linux-x86_64.AppImage` · `Strata-0.2.20-macos-arm64.dmg`</sub>
+<sub>Pliki: `Strata-0.2.21-windows-x64-setup.exe` · `Strata-0.2.21-linux-x86_64.AppImage` · `Strata-0.2.21-macos-arm64.dmg`</sub>
 
 <p align="center">
   <img src="../media/app-chat.png" width="900" alt="Aplikacja Strata na komputer: czat i podgląd kodu na żywo obok siebie">
@@ -179,7 +179,9 @@ Uruchom **`strata connect`**, aby zobaczyć instrukcję konfiguracji dla swojego
 
 <!-- Sponsor logos: one centred row with room for five, each 130 px wide. Add the next sponsor after Olares, with &nbsp;&nbsp;&nbsp;&nbsp; between two logos. -->
 <p align="center">
-  <a href="https://www.olares.com/one"><picture><source media="(prefers-color-scheme: dark)" srcset="../media/sponsors/olares-logo-white.svg"><img src="../media/sponsors/olares-logo-color.svg" alt="Olares" title="Olares" width="130"></picture></a>
+  <a href="https://heylinger.com"><picture><source media="(prefers-color-scheme: dark)" srcset="../media/sponsors/linger-logo-white.svg"><img src="../media/sponsors/linger-logo-color.svg" alt="Linger" title="Linger" width="130" align="middle"></picture></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://www.olares.com/one"><picture><source media="(prefers-color-scheme: dark)" srcset="../media/sponsors/olares-logo-white.svg"><img src="../media/sponsors/olares-logo-color.svg" alt="Olares" title="Olares" width="130" align="middle"></picture></a>
 </p>
 
 ## Wesprzyj Stratę

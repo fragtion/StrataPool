@@ -538,15 +538,37 @@ public:
     // checkpoints older than that one.  A subagent's successive turns parked one such copy each, and make_room's
     // oldest-first eviction then pushed the parent conversation out after `slots` turns.  Also superseded: an older,
     // shorter state of this conversation with at most a tenth of its tokens not in the outgoing ones (rewritten turns
-    // back, when the chain's spread checkpoints no longer hold one near its end).  An entry without checkpoints, or
-    // another conversation that only shares the system prompt's root with it, is kept.  Returns how many were dropped.
+    // back, when the chain's spread checkpoints no longer hold one near its end; #3404 carried).  An entry without
+    // checkpoints, or another conversation that only shares the system prompt's root with it, is kept.  Returns how
+    // many were dropped.
+    // An entry whose LIVE tokens are a prefix of (or equal to) `ids` (same pictures, same steering, no pinned shared
+    // prefix) is superseded as well: the conversation only appends, so the longer snapshot serves every resume the older
+    // one could.  Without this the older snapshots of a long agent conversation (whose deepest checkpoint the new chain
+    // does not hold) were evicted oldest-first and spilled to the SSD tier, one whole snapshot per turn, for nothing.
+    // `dropped_tokens`, when given, receives the token count of each dropped entry.
+    bool live_extended_by(const SavedConversation& e, const std::vector<int32_t>& ids,
+                          const std::vector<ConversationImageKey>& images) const {
+        const size_t n = e.live.ids.size();
+        if (n == 0 || n > ids.size() || e.pinned() || !std::equal(e.live.ids.begin(), e.live.ids.end(), ids.begin())) return false;
+        size_t within = 0;
+        for (const auto& m : images) if (m.start < (int64_t) n) ++within;
+        if (within != e.live.imgs.size()) return false;
+        for (const auto& k : e.live.imgs) {
+            bool found = false;
+            for (const auto& m : images) if (m == k) { found = true; break; }
+            if (!found) return false;
+        }
+        return true;
+    }
     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
-                           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
+                           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec,
+                           std::vector<size_t>* dropped_tokens = nullptr) {
         size_t dropped = 0;
         for (size_t i = 0; i < entries_.size();) {
             const auto& e = entries_[i];
-            if (superseded_at(e, ids, images, checkpoints, cvec) > 0 &&
-                !(guarded_ != 0 && serials_[i] == guarded_)) {
+            if (!(guarded_ != 0 && serials_[i] == guarded_) &&
+                (superseded_at(e, ids, images, checkpoints, cvec) > 0 || (e.cvec == cvec && live_extended_by(e, ids, images)))) {
+                if (dropped_tokens) dropped_tokens->push_back(e.live.ids.size());
                 bytes_ -= e.bytes();
                 erase(i);
                 ++dropped;
@@ -592,7 +614,11 @@ public:
     size_t parked_prefix_tokens(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
                                 const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) const {
         size_t longest = 0;
-        for (const auto& e : entries_) longest = std::max(longest, superseded_at(e, ids, images, checkpoints, cvec));
+        for (const auto& e : entries_) {
+            const size_t at = superseded_at(e, ids, images, checkpoints, cvec);   // its checkpoint chain (#342 / #3404) first, as upstream
+            if (at > 0) longest = std::max(longest, at);
+            else if (e.cvec == cvec && live_extended_by(e, ids, images)) longest = std::max(longest, e.live.ids.size());   // (no checkpoint chain to report)
+        }
         return longest;
     }
 
